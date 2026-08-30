@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "parquet.mojo"
-version = "0.3.1"
+version = "0.3.2"
 description = "Native pure-Mojo Apache Parquet — footer, pages, every encoding, and Arrow output over the C Data Interface."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -39,7 +39,7 @@ test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I sr
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
 [package]
 name = "parquet-mojo"
-version = "0.3.1"
+version = "0.3.2"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }

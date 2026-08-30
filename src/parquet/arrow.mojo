@@ -416,36 +416,39 @@ struct ArrayArena(Copyable, Defaultable, Movable):
 # ── typed views over a values buffer ───────────────────────────────────────
 
 
+# Arrow buffers are little-endian and densely packed, which is exactly the
+# layout the target already uses, so element `i` is one unaligned load. These
+# used to assemble each value a byte at a time; on a column scan that cost
+# eight bounds-checked loads and eight shifts per value, and it showed —
+# comparing a million `int64`s took 8 ns each instead of 1.
+#
+# `alignment=1` is not optional: a values buffer starts wherever its `List`
+# was allocated and a page boundary need not be 8-byte aligned.
+
+
+@always_inline
 def load_i32(buf: Span[UInt8, _], i: Int) -> Int32:
-    var v: UInt32 = 0
-    for k in range(4):
-        v |= UInt32(buf[i * 4 + k]) << UInt32(8 * k)
-    return bitcast[DType.int32](v)
+    return buf.unsafe_ptr().bitcast[Int32]().load[alignment=1](i)
 
 
+@always_inline
 def load_i64(buf: Span[UInt8, _], i: Int) -> Int64:
-    var v: UInt64 = 0
-    for k in range(8):
-        v |= UInt64(buf[i * 8 + k]) << UInt64(8 * k)
-    return bitcast[DType.int64](v)
+    return buf.unsafe_ptr().bitcast[Int64]().load[alignment=1](i)
 
 
+@always_inline
 def load_u64(buf: Span[UInt8, _], i: Int) -> UInt64:
-    var v: UInt64 = 0
-    for k in range(8):
-        v |= UInt64(buf[i * 8 + k]) << UInt64(8 * k)
-    return v
+    return buf.unsafe_ptr().bitcast[UInt64]().load[alignment=1](i)
 
 
+@always_inline
 def load_f32(buf: Span[UInt8, _], i: Int) -> Float32:
-    var v: UInt32 = 0
-    for k in range(4):
-        v |= UInt32(buf[i * 4 + k]) << UInt32(8 * k)
-    return bitcast[DType.float32](v)
+    return buf.unsafe_ptr().bitcast[Float32]().load[alignment=1](i)
 
 
+@always_inline
 def load_f64(buf: Span[UInt8, _], i: Int) -> Float64:
-    return bitcast[DType.float64](load_u64(buf, i))
+    return buf.unsafe_ptr().bitcast[Float64]().load[alignment=1](i)
 
 
 def store_u32(mut buf: List[UInt8], v: UInt32):
