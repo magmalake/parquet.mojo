@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        env: [default, stable]
+    steps:
+      # Sibling magmalake tins are consumed by source path (`-I ../x.mojo/src`),
+      # so CI has to lay them out next to this repository.
+      - uses: actions/checkout@v4
+        with:
+          path: parquet.mojo
+
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/thrift.mojo
+          path: thrift.mojo
+
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/hashes.mojo
+          path: hashes.mojo
+
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/snappy.mojo
+          path: snappy.mojo
+
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/avro.mojo
+          path: avro.mojo
+
+      - uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          # Pinned: pixi.lock is written by this version, and a newer pixi
+          # rejects the committed lock with "lock file not up-to-date".
+          pixi-version: v0.71.1
+          manifest-path: parquet.mojo/pixi.toml
+          environments: ${{ matrix.env }}
+
+      - name: Unit tests and CLI build
+        working-directory: parquet.mojo
+        run: pixi run -e ${{ matrix.env }} check
+
+      - name: CLI smoke
+        working-directory: parquet.mojo
+        run: |
+          ./build/parquet-mojo schema tests/fixtures/nested.parquet
+          ./build/parquet-mojo meta tests/fixtures/pageindex.parquet
+          ./build/parquet-mojo cat tests/fixtures/primitives.parquet --limit 3
+          ./build/parquet-mojo cat tests/fixtures/fieldids.parquet --columns id,name --json
+
+  codecs:
+    # ZSTD and LZ4 are FFI tins: the pixi git source dependencies install
+    # libzstd / liblz4 and their dlopen shims, while the Mojo sources come
+    # from the checkouts next door (their shipped .mojopkg is built with
+    # stable 1.0.0 and nightly refuses to load it).
+    name: codecs ${{ matrix.env == 'codecs' && 'nightly' || 'stable' }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        env: [codecs, codecs-stable]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: parquet.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/thrift.mojo
+          path: thrift.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/hashes.mojo
+          path: hashes.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/snappy.mojo
+          path: snappy.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/avro.mojo
+          path: avro.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/zstd.mojo
+          path: zstd.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/lz4.mojo
+          path: lz4.mojo
+
+      - uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          pixi-version: v0.71.1
+          manifest-path: parquet.mojo/pixi.toml
+          environments: ${{ matrix.env }}
+
+      - name: Codec tests
+        working-directory: parquet.mojo
+        run: pixi run -e ${{ matrix.env }} test-codecs

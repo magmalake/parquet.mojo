@@ -1,0 +1,80 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "parquet.mojo"
+version = "0.1.0"
+description = "Native pure-Mojo Apache Parquet — footer, pages, every encoding, and Arrow output over the C Data Interface."
+preview = ["pixi-build"]
+platforms = ["osx-arm64", "linux-64"]
+
+# Sibling magmalake tins are consumed by *source path* (`-I ../x.mojo/src`),
+# never as built `.mojopkg`: pixi-build-mojo emits a package compiled with
+# mojo-compiler 1.0.0 and the nightly compiler refuses to load it. CI checks
+# each sibling out next to this repository.
+[tasks]
+test = { cmd = "mkdir -p build && mojo build tests/test_parquet.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-test && ./build/parquet-test" }
+check = { depends-on = ["test", "cli"] }
+cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-mojo" }
+bench = { cmd = "mkdir -p build && mojo build bench/bench_parquet.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-bench && ./build/parquet-bench" }
+fmt = { cmd = "mojo format src tests bench" }
+format-check = { cmd = "mojo format --check src tests bench" }
+# Regenerate tests/fixtures/*.parquet and their pyarrow oracles (needs `uv`).
+fixtures = { cmd = "bash tools/gen_fixtures.sh" }
+
+# The ZSTD / LZ4 codecs are FFI tins, so they live in their own environments:
+# `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.0.0).
+[feature.codecs.tasks]
+test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
+
+# ── pixi-build: consumable as a pixi source dependency ──────────────────────
+# Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
+[package]
+name = "parquet-mojo"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.build.config.pkg]
+path = "src/parquet"
+name = "parquet"
+
+[package.host-dependencies]
+mojo-compiler = "==1.0.0"
+thrift-mojo = { path = "../thrift.mojo" }
+hashes-mojo = { path = "../hashes.mojo" }
+snappy-mojo = { path = "../snappy.mojo" }
+avro-mojo = { path = "../avro.mojo" }
+
+[package.build-dependencies]
+mojo-compiler = "==1.0.0"
+
+[package.run-dependencies]
+mojo-compiler = ">=1.0.0,<2"
+thrift-mojo = { path = "../thrift.mojo" }
+hashes-mojo = { path = "../hashes.mojo" }
+snappy-mojo = { path = "../snappy.mojo" }
+avro-mojo = { path = "../avro.mojo" }
+
+[feature.nightly.dependencies]
+modular = ">=26.6.0.dev2026082605,<27"
+
+[feature.stable.dependencies]
+mojo-compiler = "==1.0.0"
+
+# ── optional codecs ─────────────────────────────────────────────────────────
+# ZSTD and LZ4 are FFI tins; these git source dependencies are what put
+# libzstd / liblz4 and their dlopen shims into the environment. The Mojo code
+# still comes from `-I ../zstd.mojo/src -I ../lz4.mojo/src` because the
+# shipped `.mojopkg`s are built with stable 1.0.0 and nightly cannot load
+# them. Path dependencies would break `pixi install` for a bare clone, since
+# pixi solves every environment even when it installs one.
+[feature.codecs.dependencies]
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo" }
+
+[environments]
+default = ["nightly"]
+stable = ["stable"]
+codecs = ["nightly", "codecs"]
+codecs-stable = ["stable", "codecs"]
