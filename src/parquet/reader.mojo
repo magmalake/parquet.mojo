@@ -39,6 +39,7 @@ from parquet.arrow import (
     load_i64,
 )
 from parquet.assemble import LeafSlice, build_field, first_leaf
+from parquet.carrow import ExportedArray, export_c
 from parquet.codec import CodecSet, DefaultCodecs
 from parquet.page import ColumnData, read_column_chunk
 from parquet.schema import ArrowField, LeafColumn, ParquetSchema, build_schema
@@ -194,6 +195,23 @@ struct RecordBatch(Copyable, Movable, Defaultable):
 
     def type(self, i: Int) -> ArrowType:
         return self.arena.nodes[self.roots[i]].type.copy()
+
+    def export_c(self, i: Int) raises -> ExportedArray:
+        """Column `i` over the Arrow C Data Interface. The result owns copies
+        of every buffer, so it outlives this batch."""
+        return export_c(self.arena, self.roots[i])
+
+    def column_i64(self, i: Int) raises -> Tuple[List[Int64], List[Bool]]:
+        return array_i64(self.column(i))
+
+    def column_f64(self, i: Int) raises -> Tuple[List[Float64], List[Bool]]:
+        return array_f64(self.column(i))
+
+    def column_bool(self, i: Int) raises -> Tuple[List[Bool], List[Bool]]:
+        return array_bool(self.column(i))
+
+    def column_str(self, i: Int) raises -> Tuple[List[String], List[Bool]]:
+        return array_str(self.column(i))
 
 
 def _append_validity(a: ArrayData, mut out: List[Bool]):

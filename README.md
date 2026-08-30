@@ -99,9 +99,9 @@ pruning, so the last batch of each range can be shorter than `batch_size`.
 ### `RecordBatch` and `Table`
 
 `RecordBatch` has `num_rows`, `num_columns()`, `name(i)`, `type(i)`,
-`column(i) -> ArrayData` and `arena` / `roots` for the nested case. `Table` is
-the list of batches a read produced, with accessors that run across all of
-them:
+`column(i) -> ArrayData`, `export_c(i)`, the four typed accessors below, and
+`arena` / `roots` for the nested case. `Table` is the list of batches a read
+produced, with the same accessors running across all of them:
 
 ```mojo
 t.column_i64(i)   -> (List[Int64],   List[Bool])   # any integer/date/time/timestamp
@@ -118,9 +118,7 @@ the values.
 ### Arrow C Data Interface — the output contract
 
 ```mojo
-from parquet import export_c
-
-var e = export_c(batch.arena, batch.roots[0])
+var e = batch.export_c(0)            # or export_c(batch.arena, batch.roots[0])
 # e.array and e.schema are the addresses of a C ArrowArray and ArrowSchema
 var raw = e.into_raw()          # hand ownership to the consumer
 ```
@@ -292,7 +290,7 @@ which returns how many row groups survived.
 
 ## Tests
 
-`pixi run test` — **44 tests**, on `default` (nightly) and `stable` (Mojo
+`pixi run test` — **45 tests**, on `default` (nightly) and `stable` (Mojo
 1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 6 more for ZSTD
 and LZ4, including a write/read round trip through each and the
 ZSTD-compressed Iceberg fixtures.
@@ -381,9 +379,9 @@ CRC verification off on both sides:
 
 | file | parquet.mojo | pyarrow 25.0.1 | ratio |
 |---|---|---|---|
-| 1M rows × (int64, double, dictionary int64, dictionary string), 18 MiB | 78.7 ms — 12.7 M rows/s, 236 MB/s | 8.2 ms — 122 M rows/s, 2.3 GB/s | pyarrow 9.6× |
-| 100k rows × 5 mixed types incl. a list column, snappy, 1.3 MiB | 19.5 ms — 5.1 M rows/s, 72 MB/s | 2.4 ms — 42 M rows/s, 585 MB/s | pyarrow 8.1× |
-| 1,000 rows × 3 columns, 20 KiB | 0.26 ms — 3.9 M rows/s | 0.37 ms | **parquet.mojo 1.4×** |
+| 1M rows × (int64, double, dictionary int64, dictionary string), 18 MiB | 78.8 ms — 12.7 M rows/s, 235 MB/s | 8.1 ms — 123 M rows/s, 2.3 GB/s | pyarrow 9.7× |
+| 100k rows × 5 mixed types incl. a list column, snappy, 1.3 MiB | 19.8 ms — 5.0 M rows/s, 70 MB/s | 2.3 ms — 44 M rows/s, 614 MB/s | pyarrow 8.7× |
+| 1,000 rows × 3 columns, 20 KiB | 0.26 ms — 3.9 M rows/s | 0.36 ms | **parquet.mojo 1.4×** |
 | 400 rows × 12 columns, every encoding, 19 KiB | 0.19 ms — 2.1 M rows/s | 0.17 ms | pyarrow 1.1× |
 | 500 rows, v2 pages, 13 KiB | 0.16 ms — 3.2 M rows/s | 0.18 ms | **parquet.mojo 1.2×** |
 

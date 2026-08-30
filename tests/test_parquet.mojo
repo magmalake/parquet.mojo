@@ -885,6 +885,22 @@ def test_c_data_interface_extension_metadata() raises:
     e.release()
 
 
+def test_record_batch_export_and_accessors() raises:
+    var r = _reader("primitives")
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var e = batch.export_c(4)  # i64
+    assert_equal(_cstring(Int(_word(e.schema, 0))), "l")
+    assert_equal(_word(e.array, 0), 12)
+    e.release()
+    var got = batch.column_i64(4)
+    assert_equal(got[0][0], -9223372036854775808)
+    assert_false(got[1][5])
+    assert_equal(batch.column_f64(10)[0][2], 1.5)
+    assert_true(batch.column_bool(0)[0][0])
+    assert_equal(batch.column_str(11)[0][2], "hello world")
+
+
 def test_c_data_interface_release_is_idempotent() raises:
     var r = _reader("nested")
     var t = r.read_table()
