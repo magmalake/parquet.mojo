@@ -11,7 +11,8 @@ hands its reader a `pa.py_buffer` over the same bytes every time and does not
 copy either.
 """
 
-from parquet import DefaultCodecs, ParquetReader
+from parquet import DefaultCodecs, ParquetReader, ParquetWriter, WriterOptions
+from thrift import CompressionCodec
 from std.time import perf_counter_ns
 from thrift import read_parquet_file
 
@@ -50,6 +51,45 @@ def _bench(path: StringSlice, label: StringSlice, repeats: Int) raises:
     )
 
 
+def _bench_write(path: StringSlice, label: StringSlice, repeats: Int) raises:
+    """Read a file in, then time writing the same Arrow data back out."""
+    var r = ParquetReader[DefaultCodecs](read_parquet_file(String(path)))
+    r.verify_crc = False
+    var t = r.read_table()
+    var rows = t.num_rows
+    var best = 1.0e30
+    var size = 0
+    for _ in range(repeats):
+        var t0 = perf_counter_ns()
+        var opts = WriterOptions()
+        opts.codec = CompressionCodec.UNCOMPRESSED.value
+        var w = ParquetWriter[DefaultCodecs](opts^)
+        for b in t.batches:
+            w.write_batch(b.arena, b.roots)
+        var bytes = w^.finish()
+        var t1 = perf_counter_ns()
+        size = len(bytes)
+        var secs = Float64(t1 - t0) / 1e9
+        if secs < best:
+            best = secs
+    print(
+        String(
+            label,
+            ": ",
+            rows,
+            " rows -> ",
+            size // 1024,
+            " KiB in ",
+            Int(best * 1e6),
+            " us -> ",
+            Int(Float64(rows) / best),
+            " rows/s, ",
+            Int(Float64(size) / best / 1e6),
+            " MB/s",
+        )
+    )
+
+
 def main() raises:
     print("parquet.mojo decode benchmark (single threaded)\n")
     _bench(
@@ -76,3 +116,11 @@ def main() raises:
             "bench-wide.parquet: not built — run"
             " `python tools/bench_pyarrow.py --make` first"
         )
+    print("\nparquet.mojo encode benchmark (single threaded)\n")
+    try:
+        _bench_write(wide, "bench-wide.parquet (1M rows int64/double/dict)", 3)
+    except:
+        print("bench-wide.parquet: not built")
+    _bench_write(
+        "tests/fixtures/big.parquet", "big.parquet (100k rows, 5 mixed cols)", 3
+    )

@@ -666,6 +666,135 @@ def append_physical(
     out.count += 1
 
 
+def shred_flat(
+    s: WriteSchema,
+    w: Int,
+    arena: ArrayArena,
+    node: Int,
+    r0: Int,
+    r1: Int,
+    mut cols: List[LeafBuffer],
+) raises -> Bool:
+    """Shred a whole run of rows of an unnested column in one pass per buffer.
+
+    A top-level primitive column has one slot per row and no repetition, so
+    its definition levels are a fill (with the null slots knocked back to
+    zero) and its values are a copy. Returns `False` for anything that needs
+    the recursive path — a nested column, or an Arrow type whose bytes are not
+    the Parquet bytes.
+    """
+    if s.nodes[w].kind != WN_PRIM:
+        return False
+    var n = r1 - r0
+    if n < 0:
+        return False
+    ref a = arena.nodes[node]
+    var id = a.type.id
+    if id == AT_DECIMAL128 or id == AT_LARGE_UTF8 or id == AT_LARGE_BINARY:
+        return False
+    var leaf_i = s.nodes[w].leaf
+    var var_len = id == AT_UTF8 or id == AT_BINARY
+    var aw = a.type.fixed_width()
+    if var_len:
+        if cols[leaf_i].values.kind != PK_VAR or len(a.offsets) < r1 + 1:
+            return False
+    elif id == AT_BOOL:
+        if cols[leaf_i].values.kind != PK_BOOL:
+            return False
+    elif (
+        aw == 0
+        or cols[leaf_i].values.kind != PK_FIXED
+        or cols[leaf_i].values.width != aw
+    ):
+        return False
+
+    # ── definition levels ─────────────────────────────────────────────────
+    var d = s.nodes[w].def_level
+    var nullable = a.nullable and len(a.validity) > 0
+    var base = len(cols[leaf_i].defs)
+    cols[leaf_i].defs.resize(base + n, UInt16(d))
+    var present = n
+    if nullable:
+        var valid = a.validity.unsafe_ptr()
+        var dp = cols[leaf_i].defs.unsafe_ptr()
+        present = 0
+        for k in range(n):
+            var at = r0 + k
+            if ((valid.unsafe_load(at >> 3) >> UInt8(at & 7)) & 1) == 1:
+                present += 1
+            else:
+                dp.unsafe_store(base + k, 0)
+
+    # ── values ────────────────────────────────────────────────────────────
+    var dp2 = cols[leaf_i].defs.unsafe_ptr()
+    if var_len:
+        var off = a.offsets.unsafe_ptr()
+        var vbase = len(cols[leaf_i].values.bytes)
+        if present == n:
+            var lo = Int(off.unsafe_load(r0))
+            var hi = Int(off.unsafe_load(r1))
+            cols[leaf_i].values.bytes.extend(Span(a.values)[lo:hi])
+            for k in range(n):
+                cols[leaf_i].values.offsets.append(
+                    Int32(vbase + Int(off.unsafe_load(r0 + k + 1)) - lo)
+                )
+        else:
+            for k in range(n):
+                if Int(dp2.unsafe_load(base + k)) != d:
+                    continue
+                var lo = Int(off.unsafe_load(r0 + k))
+                var hi = Int(off.unsafe_load(r0 + k + 1))
+                cols[leaf_i].values.bytes.extend(Span(a.values)[lo:hi])
+                cols[leaf_i].values.offsets.append(
+                    Int32(len(cols[leaf_i].values.bytes))
+                )
+        cols[leaf_i].values.count += present
+        return True
+
+    if id == AT_BOOL:
+        var bits = a.values.unsafe_ptr()
+        for k in range(n):
+            if nullable and Int(dp2.unsafe_load(base + k)) != d:
+                continue
+            var at = r0 + k
+            cols[leaf_i].values.append_bool(
+                ((bits.unsafe_load(at >> 3) >> UInt8(at & 7)) & 1) == 1
+            )
+        return True
+
+    var vbase = len(cols[leaf_i].values.bytes)
+    if present == n:
+        cols[leaf_i].values.bytes.extend(Span(a.values)[r0 * aw : r1 * aw])
+        cols[leaf_i].values.count += n
+        return True
+    cols[leaf_i].values.bytes.resize(vbase + present * aw, 0)
+    var dst = cols[leaf_i].values.bytes.unsafe_ptr().unsafe_offset(vbase)
+    var src = a.values.unsafe_ptr().unsafe_offset(r0 * aw)
+    var vi = 0
+    if aw == 8:
+        var d8 = dst.bitcast[UInt64]()
+        var s8 = src.bitcast[UInt64]()
+        for k in range(n):
+            if Int(dp2.unsafe_load(base + k)) == d:
+                d8.unsafe_store(vi, s8.unsafe_load[alignment=1](k))
+                vi += 1
+    elif aw == 4:
+        var d4 = dst.bitcast[UInt32]()
+        var s4 = src.bitcast[UInt32]()
+        for k in range(n):
+            if Int(dp2.unsafe_load(base + k)) == d:
+                d4.unsafe_store(vi, s4.unsafe_load[alignment=1](k))
+                vi += 1
+    else:
+        for k in range(n):
+            if Int(dp2.unsafe_load(base + k)) == d:
+                for b in range(aw):
+                    dst.unsafe_store(vi * aw + b, src.unsafe_load(k * aw + b))
+                vi += 1
+    cols[leaf_i].values.count += present
+    return True
+
+
 def _emit_missing(
     s: WriteSchema, w: Int, def_level: Int, rep: Int, mut cols: List[LeafBuffer]
 ):
@@ -789,6 +918,148 @@ def _is_nan(leaf: WLeaf, v: Span[UInt8, _]) -> Bool:
     return False
 
 
+@always_inline
+def _var_less(values: PhysBuffer, i: Int, j: Int) -> Bool:
+    """Is byte-array value `i` below value `j`, unsigned lexicographically?"""
+    var off = values.offsets.unsafe_ptr()
+    var bp = values.bytes.unsafe_ptr()
+    var ai = Int(off.unsafe_load(i))
+    var na = Int(off.unsafe_load(i + 1)) - ai
+    var bi = Int(off.unsafe_load(j))
+    var nb = Int(off.unsafe_load(j + 1)) - bi
+    var n = na if na < nb else nb
+    for k in range(n):
+        var x = bp.unsafe_load(ai + k)
+        var y = bp.unsafe_load(bi + k)
+        if x != y:
+            return x < y
+    return na < nb
+
+
+def _min_max_numeric(
+    leaf: WLeaf, values: PhysBuffer, start: Int, count: Int
+) raises -> Tuple[Int, Int, Bool]:
+    """The indices of the smallest and largest of `count` values, for the
+    physical types that fit in a register. Returns `(lo, hi, handled)`;
+    `handled` is `False` for the types that need the generic comparator.
+    """
+    var phys = leaf.physical
+    var id = leaf.arrow.id
+    if values.kind == PK_VAR and id != AT_DECIMAL128:
+        # BYTE_ARRAY sorts unsigned lexicographically, and no byte array is a
+        # NaN, so the whole scan is one comparison per value.
+        var lo = start
+        var hi = start
+        for i in range(start + 1, start + count):
+            if _var_less(values, i, lo):
+                lo = i
+            elif _var_less(values, hi, i):
+                hi = i
+        return (lo, hi, True)
+    var raw = values.bytes.unsafe_ptr()
+    if phys == Type.INT64.value and values.width == 8:
+        var p = raw.bitcast[Int64]()
+        var lo = start
+        var hi = start
+        if id == AT_UINT64:
+            var mn = bitcast[DType.uint64](p.unsafe_load[alignment=1](start))
+            var mx = mn
+            for i in range(start + 1, start + count):
+                var v = bitcast[DType.uint64](p.unsafe_load[alignment=1](i))
+                if v < mn:
+                    mn = v
+                    lo = i
+                elif v > mx:
+                    mx = v
+                    hi = i
+        else:
+            var mn = p.unsafe_load[alignment=1](start)
+            var mx = mn
+            for i in range(start + 1, start + count):
+                var v = p.unsafe_load[alignment=1](i)
+                if v < mn:
+                    mn = v
+                    lo = i
+                elif v > mx:
+                    mx = v
+                    hi = i
+        return (lo, hi, True)
+    if phys == Type.INT32.value and values.width == 4:
+        var p = raw.bitcast[Int32]()
+        var lo = start
+        var hi = start
+        if id == AT_UINT8 or id == AT_UINT16 or id == AT_UINT32:
+            var mn = bitcast[DType.uint32](p.unsafe_load[alignment=1](start))
+            var mx = mn
+            for i in range(start + 1, start + count):
+                var v = bitcast[DType.uint32](p.unsafe_load[alignment=1](i))
+                if v < mn:
+                    mn = v
+                    lo = i
+                elif v > mx:
+                    mx = v
+                    hi = i
+        else:
+            var mn = p.unsafe_load[alignment=1](start)
+            var mx = mn
+            for i in range(start + 1, start + count):
+                var v = p.unsafe_load[alignment=1](i)
+                if v < mn:
+                    mn = v
+                    lo = i
+                elif v > mx:
+                    mx = v
+                    hi = i
+        return (lo, hi, True)
+    if phys == Type.DOUBLE.value and values.width == 8:
+        var p = raw.bitcast[Float64]()
+        var lo = -1
+        var hi = -1
+        var mn = Float64(0)
+        var mx = Float64(0)
+        for i in range(start, start + count):
+            var v = p.unsafe_load[alignment=1](i)
+            if v != v:  # NaN never becomes a bound
+                continue
+            if lo < 0:
+                lo = i
+                hi = i
+                mn = v
+                mx = v
+                continue
+            if v < mn:
+                mn = v
+                lo = i
+            elif v > mx:
+                mx = v
+                hi = i
+        return (lo, hi, True)
+    if phys == Type.FLOAT.value and values.width == 4:
+        var p = raw.bitcast[Float32]()
+        var lo = -1
+        var hi = -1
+        var mn = Float32(0)
+        var mx = Float32(0)
+        for i in range(start, start + count):
+            var v = p.unsafe_load[alignment=1](i)
+            if v != v:
+                continue
+            if lo < 0:
+                lo = i
+                hi = i
+                mn = v
+                mx = v
+                continue
+            if v < mn:
+                mn = v
+                lo = i
+            elif v > mx:
+                mx = v
+                hi = i
+        return (lo, hi, True)
+    return (-1, -1, False)
+
+
 def min_max(
     leaf: WLeaf, values: PhysBuffer, start: Int, count: Int
 ) raises -> Tuple[List[UInt8], List[UInt8], Bool]:
@@ -811,19 +1082,24 @@ def min_max(
         return (mn^, mx^, True)
     var lo = -1
     var hi = -1
-    for k in range(count):
-        var i = start + k
-        var v = values.value_span(i)
-        if _is_nan(leaf, v):
-            continue
-        if lo < 0:
-            lo = i
-            hi = i
-            continue
-        if _stat_less(leaf, v, values.value_span(lo)):
-            lo = i
-        if _stat_less(leaf, values.value_span(hi), v):
-            hi = i
+    var fast = _min_max_numeric(leaf, values, start, count)
+    if fast[2]:
+        lo = fast[0]
+        hi = fast[1]
+    else:
+        for k in range(count):
+            var i = start + k
+            var v = values.value_span(i)
+            if _is_nan(leaf, v):
+                continue
+            if lo < 0:
+                lo = i
+                hi = i
+                continue
+            if _stat_less(leaf, v, values.value_span(lo)):
+                lo = i
+            if _stat_less(leaf, values.value_span(hi), v):
+                hi = i
     if lo < 0:
         return (mn^, mx^, False)
     mn.extend(values.value_span(lo))
@@ -848,6 +1124,7 @@ def column_statistics(
 # ── dictionaries ───────────────────────────────────────────────────────────
 
 
+@always_inline
 def _hash_bytes(v: Span[UInt8, _]) -> UInt64:
     var h: UInt64 = 0xCBF29CE484222325
     for b in v:
@@ -855,40 +1132,138 @@ def _hash_bytes(v: Span[UInt8, _]) -> UInt64:
     return h
 
 
+@always_inline
+def _mix(h: UInt64) -> UInt64:
+    """A finaliser, so the low bits of a hash are usable as a bucket index."""
+    var x = h
+    x ^= x >> 33
+    x *= 0xFF51AFD7ED558CCD
+    x ^= x >> 33
+    return x
+
+
 struct DictBuilder(Defaultable, Movable):
+    """Distinct values in first-seen order, with an open-addressed index.
+
+    The index is a flat power-of-two table of `Int32` dictionary indices with
+    linear probing — one array, no per-bucket allocation, no `Dict` and no
+    `List` of collisions.
+
+    A 4- or 8-byte fixed-width column sets `key_width` and is indexed by the
+    integer value itself: the hash is a multiply-shift of the key and the
+    comparison is an integer compare, so a value costs no span construction
+    and no byte loop at all. Everything else hashes and compares bytes.
+    """
+
     var values: PhysBuffer
-    var buckets: Dict[UInt64, List[Int]]
+    var slots: List[Int32]
+    var mask: UInt64
+    var used: Int
+    var key_width: Int
+    """4 or 8 for the integer-keyed mode, 0 for the byte-keyed one."""
 
     def __init__(out self):
-        self.values = PhysBuffer()
-        self.buckets = Dict[UInt64, List[Int]]()
+        self = Self(PK_FIXED, 0, 0)
 
-    def __init__(out self, kind: Int, width: Int):
+    def __init__(out self, kind: Int, width: Int, expect: Int = 0):
         self.values = PhysBuffer(kind, width)
-        self.buckets = Dict[UInt64, List[Int]]()
+        var cap = 1024
+        while cap < expect * 2 and cap < (1 << 20):
+            cap <<= 1
+        self.slots = List[Int32](length=cap, fill=-1)
+        self.mask = UInt64(cap - 1)
+        self.used = 0
+        self.key_width = (
+            width if kind == PK_FIXED and (width == 4 or width == 8) else 0
+        )
 
     def __init__(out self, *, deinit move: Self):
         self.values = move.values^
-        self.buckets = move.buckets^
+        self.slots = move.slots^
+        self.mask = move.mask
+        self.used = move.used
+        self.key_width = move.key_width
+
+    @always_inline
+    def _stored_key(self, at: Int) -> UInt64:
+        var p = self.values.bytes.unsafe_ptr().unsafe_offset(
+            at * self.key_width
+        )
+        if self.key_width == 8:
+            return p.bitcast[UInt64]().unsafe_load[alignment=1](0)
+        return UInt64(p.bitcast[UInt32]().unsafe_load[alignment=1](0))
+
+    def _grow(mut self) raises:
+        var cap = (Int(self.mask) + 1) * 2
+        var fresh = List[Int32](length=cap, fill=-1)
+        var mask = UInt64(cap - 1)
+        var dst = fresh.unsafe_ptr()
+        for k in range(self.values.count):
+            var h: UInt64
+            if self.key_width:
+                h = _mix(self._stored_key(k)) & mask
+            else:
+                h = _mix(_hash_bytes(self.values.value_span(k))) & mask
+            while dst.unsafe_load(Int(h)) >= 0:
+                h = (h + 1) & mask
+            dst.unsafe_store(Int(h), Int32(k))
+        self.slots = fresh^
+        self.mask = mask
+
+    def index_of_key(mut self, key: UInt64) raises -> Int:
+        """The dictionary index of an integer-keyed value, adding it if new."""
+        var h = _mix(key) & self.mask
+        var table = self.slots.unsafe_ptr()
+        while True:
+            var at = Int(table.unsafe_load(Int(h)))
+            if at < 0:
+                break
+            if self._stored_key(at) == key:
+                return at
+            h = (h + 1) & self.mask
+        var idx = self.values.count
+        for b in range(self.key_width):
+            self.values.bytes.append(UInt8((key >> UInt64(8 * b)) & 0xFF))
+        self.values.count += 1
+        self.slots[Int(h)] = Int32(idx)
+        self.used += 1
+        if self.used * 4 > (Int(self.mask) + 1) * 3:
+            self._grow()
+        return idx
 
     def index_of(mut self, v: Span[UInt8, _]) raises -> Int:
-        var h = _hash_bytes(v)
-        if h in self.buckets:
-            ref bucket = self.buckets[h]
-            for k in bucket:
-                if compare_bytes(self.values.value_span(k), v) == 0:
-                    return k
+        var vp = v.unsafe_ptr()
+        var nv = len(v)
+        var raw: UInt64 = 0xCBF29CE484222325
+        for k in range(nv):
+            raw = (raw ^ UInt64(vp.unsafe_load(k))) * 0x100000001B3
+        var h = _mix(raw) & self.mask
+        var table = self.slots.unsafe_ptr()
+        while True:
+            var at = Int(table.unsafe_load(Int(h)))
+            if at < 0:
+                break
+            var e = self.values.value_span(at)
+            if len(e) == nv:
+                var ep = e.unsafe_ptr()
+                var same = True
+                for k in range(nv):
+                    if ep.unsafe_load(k) != vp.unsafe_load(k):
+                        same = False
+                        break
+                if same:
+                    return at
+            h = (h + 1) & self.mask
         var idx = self.values.count
         if self.values.kind == PK_VAR:
             self.values.append_bytes(v)
         else:
             self.values.bytes.extend(v)
             self.values.count += 1
-        if h in self.buckets:
-            self.buckets[h].append(idx)
-        else:
-            var fresh: List[Int] = [idx]
-            self.buckets[h] = fresh^
+        self.slots[Int(h)] = Int32(idx)
+        self.used += 1
+        if self.used * 4 > (Int(self.mask) + 1) * 3:
+            self._grow()
         return idx
 
 
@@ -986,6 +1361,10 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             )
             cols.append(b^)
         for k in range(len(roots)):
+            if shred_flat(
+                self.schema, self.schema.roots[k], arena, roots[k], r0, r1, cols
+            ):
+                continue
             for i in range(r0, r1):
                 shred(
                     self.schema,
@@ -1026,8 +1405,13 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         var n_slots = len(buf.defs)
         var n_values = buf.values.count
         var null_count = n_slots - n_values
+        var want_bounds = (
+            self.options.write_statistics or self.options.write_page_index
+        )
 
-        # Dictionary, if it pays for itself.
+        # Dictionary, if it pays for itself. The build stops the moment the
+        # dictionary is too big to be worth it, rather than indexing the whole
+        # chunk and throwing the answer away.
         var use_dict = (
             self.options.use_dictionary
             and buf.values.kind != PK_BOOL
@@ -1039,18 +1423,42 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         var dict_uncompressed: Int64 = 0
         var dict_compressed: Int64 = 0
         if use_dict:
-            var builder = DictBuilder(buf.values.kind, buf.values.width)
-            var raw = List[Int]()
+            var cap = 65535
+            if n_values // 2 < cap:
+                cap = n_values // 2
+            if cap < 64:
+                cap = 64
+            var builder = DictBuilder(buf.values.kind, buf.values.width, cap)
+            indices.resize(n_values, 0)
+            var out_idx = indices.unsafe_ptr()
+            var kw = builder.key_width
+            var src = buf.values.bytes.unsafe_ptr()
             for i in range(n_values):
-                raw.append(builder.index_of(buf.values.value_span(i)))
-            dict = builder.values.copy()
-            if dict.count > 65535 or (
-                dict.count * 2 > n_values and dict.count > 64
-            ):
-                use_dict = False
+                var k: Int
+                if kw == 8:
+                    k = builder.index_of_key(
+                        src.unsafe_offset(i * 8)
+                        .bitcast[UInt64]()
+                        .unsafe_load[alignment=1](0)
+                    )
+                elif kw == 4:
+                    k = builder.index_of_key(
+                        UInt64(
+                            src.unsafe_offset(i * 4)
+                            .bitcast[UInt32]()
+                            .unsafe_load[alignment=1](0)
+                        )
+                    )
+                else:
+                    k = builder.index_of(buf.values.value_span(i))
+                if k > cap:
+                    use_dict = False
+                    break
+                out_idx.unsafe_store(i, UInt16(k))
+            if use_dict:
+                dict = builder.values.copy()
             else:
-                for v in raw:
-                    indices.append(UInt16(v))
+                indices.clear()
         var encoding = (
             Encoding.RLE_DICTIONARY.value if use_dict else Encoding.PLAIN.value
         )
@@ -1075,13 +1483,19 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             dict_uncompressed = Int64(len(body))
             dict_compressed = Int64(hlen + len(compressed))
 
-        # Data pages, split at record boundaries by target page size.
+        # Data pages, split at record boundaries by target page size. A flat
+        # column has one slot per record, so its record starts are the slot
+        # numbers and the list never has to be built.
         var data_offset = Int64(len(self.out))
+        var flat = leaf.max_rep == 0
         var starts = List[Int]()
-        for i in range(n_slots):
-            if leaf.max_rep == 0 or buf.reps[i] == 0:
-                starts.append(i)
-        starts.append(n_slots)
+        var n_records = n_slots
+        if not flat:
+            for i in range(n_slots):
+                if buf.reps[i] == 0:
+                    starts.append(i)
+            starts.append(n_slots)
+            n_records = len(starts) - 1
         var oi = OffsetIndex()
         var ci = ColumnIndex()
         var page_nulls = List[Int64]()
@@ -1091,47 +1505,53 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         var rec = 0
         var first_row: Int64 = 0
         var value_cursor = 0
-        while rec < len(starts) - 1:
+        var def_width = _bit_width(leaf.max_def)
+        var rep_width = _bit_width(leaf.max_rep)
+        var chunk_lo = List[UInt8]()
+        var chunk_hi = List[UInt8]()
+        var have_chunk_bounds = False
+        while rec < n_records:
             var rec_end = rec
             var bytes_so_far = 0
-            while rec_end < len(starts) - 1:
-                var slots = starts[rec_end + 1] - starts[rec_end]
+            while rec_end < n_records:
+                var slots = 1 if flat else starts[rec_end + 1] - starts[rec_end]
                 bytes_so_far += slots * value_width
                 rec_end += 1
                 if bytes_so_far >= self.options.data_page_size:
                     break
-            var s0 = starts[rec]
-            var s1 = starts[rec_end]
-            var page_values = 0
-            for i in range(s0, s1):
-                if Int(buf.defs[i]) == leaf.max_def:
-                    page_values += 1
+            var s0 = rec if flat else starts[rec]
+            var s1 = rec_end if flat else starts[rec_end]
+            var page_values = s1 - s0
+            if leaf.max_def > 0:
+                page_values = 0
+                var dp = buf.defs.unsafe_ptr()
+                for i in range(s0, s1):
+                    if Int(dp.unsafe_load(i)) == leaf.max_def:
+                        page_values += 1
             var body = List[UInt8]()
             if leaf.max_rep > 0:
-                var reps = List[UInt16]()
-                for i in range(s0, s1):
-                    reps.append(buf.reps[i])
-                body.extend(Span(encode_levels(reps, _bit_width(leaf.max_rep))))
+                body.extend(
+                    Span(encode_levels(Span(buf.reps)[s0:s1], rep_width))
+                )
             if leaf.max_def > 0:
-                var defs = List[UInt16]()
-                for i in range(s0, s1):
-                    defs.append(buf.defs[i])
-                body.extend(Span(encode_levels(defs, _bit_width(leaf.max_def))))
+                body.extend(
+                    Span(encode_levels(Span(buf.defs)[s0:s1], def_width))
+                )
             if use_dict:
-                var page_idx = List[UInt16]()
-                for k in range(value_cursor, value_cursor + page_values):
-                    page_idx.append(indices[k])
                 var width = _bit_width(dict.count - 1)
                 body.append(UInt8(width))
-                body.extend(Span(encode_hybrid(page_idx, width)))
-            else:
                 body.extend(
                     Span(
-                        _plain_slice(
-                            leaf, buf.values, value_cursor, page_values
+                        encode_hybrid(
+                            Span(indices)[
+                                value_cursor : value_cursor + page_values
+                            ],
+                            width,
                         )
                     )
                 )
+            else:
+                _plain_into(body, leaf, buf.values, value_cursor, page_values)
             value_cursor += page_values
             var compressed = Self.Codecs.compress(codec, Span(body))
             var ph = PageHeader()
@@ -1151,12 +1571,31 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             loc.compressed_page_size = Int32(header_len + len(compressed))
             loc.first_row_index = first_row
             oi.page_locations.append(loc^)
-            var bounds = min_max(
-                leaf, buf.values, value_cursor - page_values, page_values
-            )
-            ci.null_pages.append(not bounds[2])
-            ci.min_values.append(bounds[0].copy())
-            ci.max_values.append(bounds[1].copy())
+            var has_bounds = False
+            var page_lo = List[UInt8]()
+            var page_hi = List[UInt8]()
+            if want_bounds:
+                var bounds = min_max(
+                    leaf, buf.values, value_cursor - page_values, page_values
+                )
+                page_lo = bounds[0].copy()
+                page_hi = bounds[1].copy()
+                has_bounds = bounds[2]
+                # The chunk's own bounds are the bounds of its pages, so the
+                # values are never scanned a second time.
+                if has_bounds:
+                    if not have_chunk_bounds:
+                        chunk_lo = page_lo.copy()
+                        chunk_hi = page_hi.copy()
+                        have_chunk_bounds = True
+                    else:
+                        if _stat_less(leaf, Span(page_lo), Span(chunk_lo)):
+                            chunk_lo = page_lo.copy()
+                        if _stat_less(leaf, Span(chunk_hi), Span(page_hi)):
+                            chunk_hi = page_hi.copy()
+            ci.null_pages.append(not has_bounds)
+            ci.min_values.append(page_lo^)
+            ci.max_values.append(page_hi^)
             page_nulls.append(Int64(s1 - s0 - page_values))
             total_uncompressed += Int64(len(body))
             total_compressed += Int64(header_len + len(compressed))
@@ -1179,7 +1618,14 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         cm.total_uncompressed_size = total_uncompressed
         cm.total_compressed_size = total_compressed
         if self.options.write_statistics:
-            cm.statistics = column_statistics(leaf, buf, null_count)
+            var st = Statistics()
+            st.null_count = Int64(null_count)
+            if have_chunk_bounds:
+                st.min_value = chunk_lo^
+                st.max_value = chunk_hi^
+                st.is_min_value_exact = True
+                st.is_max_value_exact = True
+            cm.statistics = st^
         var chunk = ColumnChunk()
         chunk.file_offset = Int64(chunk_start)
         chunk.meta_data = cm^
@@ -1245,6 +1691,42 @@ def _write_page(
 
 def _plain_bytes(leaf: WLeaf, values: PhysBuffer) raises -> List[UInt8]:
     return _plain_slice(leaf, values, 0, values.count)
+
+
+def _plain_into(
+    mut out: List[UInt8],
+    leaf: WLeaf,
+    values: PhysBuffer,
+    start: Int,
+    count: Int,
+) raises:
+    """PLAIN-encode `count` values straight onto the end of `out`, with no
+    intermediate buffer."""
+    if values.kind == PK_BOOL:
+        var base = len(out)
+        for k in range(count):
+            var i = start + k
+            if k % 8 == 0:
+                out.append(0)
+            if values.bool_at(i):
+                out[base + k // 8] |= UInt8(1) << UInt8(k % 8)
+        return
+    if values.kind == PK_VAR:
+        var off = values.offsets.unsafe_ptr()
+        var total = Int(off.unsafe_load(start + count)) - Int(
+            off.unsafe_load(start)
+        )
+        out.reserve(len(out) + total + 4 * count)
+        for k in range(count):
+            var lo = Int(off.unsafe_load(start + k))
+            var hi = Int(off.unsafe_load(start + k + 1))
+            var n = UInt32(hi - lo)
+            for b in range(4):
+                out.append(UInt8((n >> UInt32(8 * b)) & 0xFF))
+            out.extend(Span(values.bytes)[lo:hi])
+        return
+    var w = values.width
+    out.extend(Span(values.bytes)[start * w : (start + count) * w])
 
 
 def _plain_slice(

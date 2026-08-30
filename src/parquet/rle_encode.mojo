@@ -2,42 +2,54 @@
 
 
 struct BitPacker(Copyable, Defaultable, Movable):
-    """Packs values of a fixed bit width, least-significant bit first."""
+    """Packs values of a fixed bit width, least-significant bit first.
+
+    Bits go into a 64-bit accumulator and leave it eight at a time, so a value
+    costs a shift, an or and at most a few byte stores — not a loop over its
+    bits with a bounds-checked list grow inside it.
+    """
 
     var out: List[UInt8]
-    var bit: Int
+    var acc: UInt64
+    var bits: Int
 
     def __init__(out self):
         self.out = List[UInt8]()
-        self.bit = 0
+        self.acc = 0
+        self.bits = 0
 
     def __init__(out self, *, copy: Self):
         self.out = copy.out.copy()
-        self.bit = copy.bit
+        self.acc = copy.acc
+        self.bits = copy.bits
 
     def __init__(out self, *, deinit move: Self):
         self.out = move.out^
-        self.bit = move.bit
+        self.acc = move.acc
+        self.bits = move.bits
 
+    def reserve(mut self, count: Int, width: Int):
+        self.out.reserve((count * width + 7) // 8 + 8)
+
+    @always_inline
     def put(mut self, value: UInt64, width: Int):
-        var written = 0
-        while written < width:
-            var byte = self.bit // 8
-            while len(self.out) <= byte:
-                self.out.append(0)
-            var off = self.bit % 8
-            var room = 8 - off
-            var take = width - written
-            if take > room:
-                take = room
-            var mask = (UInt64(1) << UInt64(take)) - 1
-            var chunk = (value >> UInt64(written)) & mask
-            self.out[byte] |= UInt8(chunk << UInt64(off))
-            written += take
-            self.bit += take
+        if width == 0:
+            return
+        var mask = (
+            ~UInt64(0) if width >= 64 else (UInt64(1) << UInt64(width)) - 1
+        )
+        self.acc |= (value & mask) << UInt64(self.bits)
+        self.bits += width
+        while self.bits >= 8:
+            self.out.append(UInt8(self.acc & 0xFF))
+            self.acc >>= 8
+            self.bits -= 8
 
     def align(mut self):
-        self.bit = ((self.bit + 7) // 8) * 8
+        if self.bits > 0:
+            self.out.append(UInt8(self.acc & 0xFF))
+            self.acc = 0
+            self.bits = 0
 
 
 def write_uleb128(mut out: List[UInt8], value: UInt64):
@@ -52,7 +64,7 @@ def write_uleb128(mut out: List[UInt8], value: UInt64):
             return
 
 
-def encode_hybrid(values: List[UInt16], width: Int) raises -> List[UInt8]:
+def encode_hybrid(values: Span[UInt16, _], width: Int) raises -> List[UInt8]:
     """The RLE / bit-packed hybrid: repeated runs of eight or more values, and
     bit-packed groups for everything else."""
     var out = List[UInt8]()
@@ -91,6 +103,7 @@ def encode_hybrid(values: List[UInt16], width: Int) raises -> List[UInt8]:
         var groups = (count + 7) // 8
         write_uleb128(out, (UInt64(groups) << 1) | 1)
         var packer = BitPacker()
+        packer.reserve(groups * 8, width)
         for g in range(groups * 8):
             var idx = i + g
             packer.put(UInt64(values[idx]) if idx < n else 0, width)
@@ -100,7 +113,7 @@ def encode_hybrid(values: List[UInt16], width: Int) raises -> List[UInt8]:
     return out^
 
 
-def encode_levels(values: List[UInt16], width: Int) raises -> List[UInt8]:
+def encode_levels(values: Span[UInt16, _], width: Int) raises -> List[UInt8]:
     """Levels as a v1 data page wants them: a 4-byte length, then the hybrid."""
     var body = encode_hybrid(values, width)
     var out = List[UInt8](capacity=len(body) + 4)

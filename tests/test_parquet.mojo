@@ -1297,7 +1297,7 @@ def test_single_entry_dictionary() raises:
     # A column whose values are all the same gives a one-entry dictionary and
     # therefore a bit width of zero: the RLE run header still has to be there.
     var one: List[UInt16] = [0, 0, 0]
-    var enc = encode_hybrid(one, 0)
+    var enc = encode_hybrid(Span(one), 0)
     assert_equal(len(enc), 1)
     var dec = HybridDecoder(Span(enc), 0)
     assert_equal(dec.next(), 0)

@@ -62,3 +62,25 @@ for path, repeats in CASES:
         f"{best*1000:.2f} ms -> {int(rows/best):,} rows/s, "
         f"{len(raw)/best/1e6:.1f} MB/s"
     )
+
+
+print("\npyarrow encode benchmark (single threaded)\n")
+for path, repeats in [(WIDE, 3), ("tests/fixtures/big.parquet", 3)]:
+    if not os.path.exists(path):
+        print(f"{path}: missing")
+        continue
+    table = pq.read_table(path, use_threads=False)
+    best = 1e30
+    size = 0
+    for _ in range(repeats):
+        sink = pa.BufferOutputStream()
+        t0 = time.perf_counter()
+        pq.write_table(table, sink, compression="none")
+        t1 = time.perf_counter()
+        size = sink.getvalue().size
+        best = min(best, t1 - t0)
+    print(
+        f"{os.path.basename(path)}: {table.num_rows:,} rows -> {size//1024} KiB in "
+        f"{best*1000:.2f} ms -> {int(table.num_rows/best):,} rows/s, "
+        f"{size/best/1e6:.1f} MB/s"
+    )
