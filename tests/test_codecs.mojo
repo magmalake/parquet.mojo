@@ -6,8 +6,10 @@ installed, which the `codecs` environment does.
 """
 
 from fixtures_list import core_fixtures, full_codec_columns
-from parity import check_fixture
-from parquet import ParquetReader
+from oracle import load_oracle
+from parity import check_fixture, check_table
+from parquet import ParquetReader, ParquetWriter, WriterOptions
+from thrift import CompressionCodec
 from parquet.ext_full import AllCodecs
 from std.testing import TestSuite, assert_equal, assert_raises, assert_true
 
@@ -36,6 +38,29 @@ def test_zstd_and_lz4_columns_match_one_by_one() raises:
     assert_true(check_fixture[AllCodecs](String("codecs"), only, 65536) > 300)
     var lz: List[String] = [String("lz4")]
     assert_true(check_fixture[AllCodecs](String("codecs"), lz, 65536) > 300)
+
+
+def test_write_and_read_back_with_zstd_and_lz4() raises:
+    var codecs: List[Int32] = [
+        CompressionCodec.ZSTD.value,
+        CompressionCodec.LZ4_RAW.value,
+    ]
+    var total = 0
+    for c in codecs:
+        var r = ParquetReader[AllCodecs].open("tests/fixtures/nested.parquet")
+        var t = r.read_table()
+        var opts = WriterOptions()
+        opts.codec = c
+        opts.row_group_size = 4
+        var w = ParquetWriter[AllCodecs](opts^)
+        for b in t.batches:
+            w.write_batch(b.arena, b.roots)
+        var bytes = w^.finish()
+        var back = ParquetReader[AllCodecs](bytes^)
+        var t2 = back.read_table()
+        var doc = load_oracle("tests/fixtures/nested.parquet.oracle.json")
+        total += check_table(doc, t2, "nested", List[String]())
+    assert_true(total > 100, String("only ", total, " values round-tripped"))
 
 
 def main() raises:

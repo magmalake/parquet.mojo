@@ -38,6 +38,8 @@ for i in range(len(ids[0])):
   `column op literal` predicate, and **probes bloom filters** for equality.
 * **Exports Arrow** over the C Data Interface, with a real `release` callback —
   `pyarrow.Array._import_from_c` takes the result directly.
+* **Writes Parquet** back out — `PLAIN` and `RLE_DICTIONARY`, all the codecs,
+  statistics, field ids and a page index — and pyarrow reads what it writes.
 
 ## Install
 
@@ -287,9 +289,9 @@ which returns how many row groups survived.
 
 ## Tests
 
-`pixi run test` — **35 tests**, on `default` (nightly) and `stable` (Mojo
-1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 4 more for ZSTD
-and LZ4.
+`pixi run test` — **40 tests**, on `default` (nightly) and `stable` (Mojo
+1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 5 more for ZSTD
+and LZ4, including a write/read round trip through each.
 
 **pyarrow is the oracle.** `tools/gen_fixtures.py` writes 23 fixtures with
 pyarrow 25.0.1 and `tools/oracle_pyarrow.py` reads each one back and dumps
@@ -326,6 +328,9 @@ Beyond value parity the suite covers:
 - unit tests for bit widths, ULEB128, zigzag, hybrid RLE runs, legacy
   `BIT_PACKED`, PLAIN, dictionary gather, `BYTE_STREAM_SPLIT` and
   `DELTA_BINARY_PACKED` headers;
+- the writer: every fixture through write → read → the original oracle, at
+  four different option sets, and the schema shape, field ids, statistics,
+  split offsets, page index and key/value metadata of what it wrote;
 - **hostile input**: an empty file, a 7-byte file, bad leading and trailing
   magic, every one of 23 truncations of a real file, a flipped byte inside a
   checksummed page, eleven single-byte corruptions of a page header, a
@@ -399,7 +404,52 @@ vectorised level decoder.
 
 ## Writer
 
-Stage 2. `ParquetWriter` is not in this release; the reader is.
+`ParquetWriter` takes exactly what the reader produces — an `ArrayArena` and
+the indices of the top-level arrays in it — so a round trip is four lines:
+
+```mojo
+from parquet import ParquetReader, ParquetWriter, WriterOptions
+
+var r = ParquetReader.open("in.parquet")
+var t = r.read_table()
+
+var opts = WriterOptions()
+opts.codec = CompressionCodec.ZSTD.value   # with parquet.ext_full.AllCodecs
+opts.row_group_size = 100_000
+var w = ParquetWriter[AllCodecs](opts^)
+w.add_metadata("iceberg.schema", schema_json)
+for b in t.batches:
+    w.write_batch(b.arena, b.roots)
+var bytes = w^.finish()
+```
+
+`WriterOptions` carries `codec`, `row_group_size`, `data_page_size`,
+`use_dictionary`, `write_statistics`, `write_page_index` and `created_by`.
+
+What it writes:
+
+| | |
+|---|---|
+| metadata | Parquet 2.6 `FileMetaData`, `created_by`, key/value metadata |
+| pages | v1 data pages, split at record boundaries by `data_page_size`; a dictionary page when the dictionary pays for itself |
+| values | `PLAIN` and `RLE_DICTIONARY` (the dictionary is dropped for a column where it would be bigger than the data) |
+| levels | `RLE`, with the 4-byte length prefix a v1 page wants |
+| types | every type the reader maps, written back to the physical type it came from; decimals as `FIXED_LEN_BYTE_ARRAY(16)`, which is legal at any precision Arrow can hold |
+| nesting | three-level lists, `key_value` maps, structs — the compliant layouts |
+| **field ids** | on every schema element that has one, which is what Iceberg needs |
+| statistics | `min_value` / `max_value` / `null_count` per chunk, in the sort order each logical type requires (unsigned integers unsigned, decimals by sign then magnitude, NaNs excluded) |
+| page index | an `OffsetIndex` and a `ColumnIndex` per chunk, with per-page bounds and null counts |
+
+Not written: v2 data pages, the delta and byte-stream-split encodings, page
+CRC32s, `INT96`, bloom filters, and encryption.
+
+**pyarrow reads what we write.** `pixi run verify-written` writes all 22
+fixtures back out through our writer — plus three of them again with the
+dictionary off, uncompressed, and with GZIP at a 4-row row group and a 32-byte
+page — then has pyarrow read every one and compare it with the original.
+**28 files, 172 columns, all equal.** In the Mojo suite,
+`test_write_round_trip` sends every fixture through write → read and checks the
+result against the *original* pyarrow oracle, value by value.
 
 ## Tasks
 
@@ -412,6 +462,7 @@ Stage 2. `ParquetWriter` is not in this release; the reader is.
 | `pixi run bench-pyarrow` | pyarrow's numbers for the same files (needs `uv`) |
 | `pixi run cli schema f.parquet` | build and run the CLI |
 | `pixi run verify-c` | import the C Data Interface export into pyarrow |
+| `pixi run verify-written` | write every fixture back out and have pyarrow read it |
 | `pixi run fixtures` | regenerate the fixtures and their oracles |
 
 ## License

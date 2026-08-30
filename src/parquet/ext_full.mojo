@@ -12,8 +12,15 @@ Everything `DefaultCodecs` handles is handled here too.
 
 import lz4
 import zstd
-from parquet.codec import CodecSet, DefaultCodecs, copy_of, gunzip, unsupported_codec
-from snappy import decompress as snappy_decompress
+from parquet.codec import (
+    CodecSet,
+    DefaultCodecs,
+    copy_of,
+    gunzip,
+    gzip_wrap,
+    unsupported_codec,
+)
+from snappy import compress as snappy_compress, decompress as snappy_decompress
 from thrift import CompressionCodec
 
 
@@ -48,4 +55,18 @@ struct AllCodecs(CodecSet):
             # The deprecated Hadoop framing: repeated
             # <big-endian uncompressed size><big-endian block size><block>.
             return lz4.decompress_hadoop(data, uncompressed_size)
+        raise unsupported_codec(codec)
+
+    @staticmethod
+    def compress(codec: Int32, data: Span[UInt8, _]) raises -> List[UInt8]:
+        if codec == CompressionCodec.UNCOMPRESSED.value:
+            return copy_of(data)
+        if codec == CompressionCodec.SNAPPY.value:
+            return snappy_compress(data)
+        if codec == CompressionCodec.GZIP.value:
+            return gzip_wrap(data)
+        if codec == CompressionCodec.ZSTD.value:
+            return zstd.compress(data)
+        if codec == CompressionCodec.LZ4_RAW.value:
+            return lz4.compress_block(data)
         raise unsupported_codec(codec)

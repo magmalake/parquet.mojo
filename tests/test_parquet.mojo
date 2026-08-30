@@ -8,7 +8,7 @@ from the same file, both one value at a time and as a CRC32 over the lot.
 from avro.json import JsonDoc
 from fixtures_list import core_fixtures, default_codec_columns
 from oracle import decimal_string, double_bits, hex_of, load_oracle
-from parity import check_fixture
+from parity import check_fixture, check_table
 from parquet import (
     AT_BINARY,
     AT_BOOL,
@@ -50,9 +50,12 @@ from parquet import (
     ParquetReader,
     Predicate,
     ScalarValue,
+    ParquetWriter,
+    WriterOptions,
     build_schema,
     export_c,
 )
+from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.bitio import (
     HybridDecoder,
     bit_width,
@@ -74,6 +77,7 @@ from parquet.encoding import (
 from parquet.schema import REP_OPTIONAL, REP_REPEATED, REP_REQUIRED
 from std.testing import TestSuite, assert_equal, assert_false, assert_raises, assert_true
 from thrift import (
+    CompressionCodec,
     ConvertedType,
     FieldRepetitionType,
     ListType,
@@ -932,6 +936,137 @@ def test_level_overflow_is_caught() raises:
     with assert_raises():
         var got = decode_dict_indices(Span(idx), 5)
         _ = len(got)
+
+
+# ── the writer ─────────────────────────────────────────────────────────────
+
+
+def _round_trip(
+    name: StringSlice, columns: List[String], var options: WriterOptions
+) raises -> Int:
+    """Read a fixture, write it back out, read that, and check it still
+    matches pyarrow's values for the original file."""
+    var r = _reader(name)
+    if len(columns):
+        r.select_columns(columns)
+    var t = r.read_table()
+    var w = ParquetWriter(options^)
+    w.add_metadata("parquet.mojo", "round trip")
+    for b in t.batches:
+        w.write_batch(b.arena, b.roots)
+    var bytes = w^.finish()
+    var back = ParquetReader(bytes^)
+    var t2 = back.read_table()
+    var doc = load_oracle(String(FIXTURES, name, ".parquet.oracle.json"))
+    return check_table(doc, t2, name, columns)
+
+
+def test_write_round_trip() raises:
+    var total = 0
+    for f in core_fixtures():
+        var opts = WriterOptions()
+        total += _round_trip(f, List[String](), opts^)
+    assert_true(total > 20000, String("only ", total, " values round-tripped"))
+
+
+def test_write_round_trip_options() raises:
+    var plain = WriterOptions()
+    plain.use_dictionary = False
+    plain.codec = CompressionCodec.UNCOMPRESSED.value
+    assert_true(_round_trip("nested", List[String](), plain^) > 60)
+
+    var gzip = WriterOptions()
+    gzip.codec = CompressionCodec.GZIP.value
+    gzip.row_group_size = 37
+    gzip.data_page_size = 64
+    assert_true(_round_trip("v2pages", List[String](), gzip^) > 2000)
+
+    var tiny = WriterOptions()
+    tiny.row_group_size = 3
+    tiny.data_page_size = 16
+    tiny.write_page_index = False
+    assert_true(_round_trip("primitives", List[String](), tiny^) > 180)
+
+    var nostats = WriterOptions()
+    nostats.write_statistics = False
+    assert_true(_round_trip("logical", List[String](), nostats^) > 160)
+
+
+def test_single_entry_dictionary() raises:
+    # A column whose values are all the same gives a one-entry dictionary and
+    # therefore a bit width of zero: the RLE run header still has to be there.
+    var one: List[UInt16] = [0, 0, 0]
+    var enc = encode_hybrid(one, 0)
+    assert_equal(len(enc), 1)
+    var dec = HybridDecoder(Span(enc), 0)
+    assert_equal(dec.next(), 0)
+    assert_equal(dec.next(), 0)
+    assert_equal(dec.next(), 0)
+    # …and the same thing end to end, with tiny row groups so several chunks
+    # hold a single distinct value.
+    var tiny = WriterOptions()
+    tiny.row_group_size = 4
+    tiny.data_page_size = 32
+    assert_true(_round_trip("nested", List[String](), tiny^) > 60)
+
+
+def test_written_metadata() raises:
+    var r = _reader("fieldids")
+    var t = r.read_table()
+    var opts = WriterOptions()
+    opts.row_group_size = 2
+    var w = ParquetWriter(opts^)
+    w.add_metadata("k", "v")
+    for b in t.batches:
+        w.write_batch(b.arena, b.roots)
+    var bytes = w^.finish()
+    var back = ParquetReader(bytes^)
+    assert_equal(back.num_rows(), 5)
+    assert_equal(back.num_row_groups(), 3)
+    assert_true(back.created_by().find("parquet.mojo") >= 0)
+    var kv = back.key_value_metadata()
+    assert_equal(len(kv), 1)
+    assert_equal(kv[0][0], "k")
+    assert_equal(kv[0][1], "v")
+    # Field ids survive the round trip, on nested fields too.
+    assert_equal(back.schema.fields[back.schema.field_by_name("id")].field_id, 1)
+    assert_true(back.schema.field_by_id(5) >= 0)
+    # …as do split offsets, statistics and the page index.
+    assert_equal(len(back.split_offsets()), 3)
+    var st = back.statistics(0, 0)
+    assert_true(st.has_min_max)
+    assert_equal(st.min.i, 1)
+    assert_equal(st.max.i, 2)
+    assert_true(Bool(back.offset_index(0, 0)))
+    assert_true(Bool(back.column_index(0, 0)))
+
+
+def test_written_schema_shapes() raises:
+    var r = _reader("nested")
+    var t = r.read_table()
+    var opts = WriterOptions()
+    var w = ParquetWriter(opts^)
+    for b in t.batches:
+        w.write_batch(b.arena, b.roots)
+    var bytes = w^.finish()
+    var back = ParquetReader(bytes^)
+    assert_equal(len(back.schema.leaves), len(r.schema.leaves))
+    for i in range(len(r.schema.leaves)):
+        assert_equal(
+            back.schema.leaves[i].dotted(),
+            r.schema.leaves[i].dotted(),
+            String("leaf ", i, " path"),
+        )
+        assert_equal(
+            back.schema.leaves[i].max_def,
+            r.schema.leaves[i].max_def,
+            String("leaf ", i, " max_def"),
+        )
+        assert_equal(
+            back.schema.leaves[i].max_rep,
+            r.schema.leaves[i].max_rep,
+            String("leaf ", i, " max_rep"),
+        )
 
 
 def main() raises:

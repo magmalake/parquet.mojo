@@ -26,8 +26,9 @@ magmalake shim for one yet. A file with a Brotli column raises a message that
 says so; every other column of that file still reads.
 """
 
-from avro.deflate import inflate
-from snappy import decompress as snappy_decompress
+from avro.deflate import deflate, inflate
+from hashes import crc32
+from snappy import compress as snappy_compress, decompress as snappy_decompress
 from thrift import CompressionCodec
 
 
@@ -43,6 +44,11 @@ trait CodecSet:
     def decompress(
         codec: Int32, data: Span[UInt8, _], uncompressed_size: Int
     ) raises -> List[UInt8]:
+        ...
+
+    @staticmethod
+    def compress(codec: Int32, data: Span[UInt8, _]) raises -> List[UInt8]:
+        """Compress one page body. Used by `parquet.writer`."""
         ...
 
 
@@ -111,6 +117,29 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
     return inflate(data)
 
 
+def gzip_wrap(data: Span[UInt8, _]) raises -> List[UInt8]:
+    """Wrap a DEFLATE stream in the gzip (RFC 1952) framing Parquet's `GZIP`
+    codec expects: a 10-byte header, then the deflate bits, then the CRC32 of
+    the *uncompressed* data and its length modulo 2^32."""
+    var out = List[UInt8]()
+    out.append(0x1F)
+    out.append(0x8B)
+    out.append(8)  # deflate
+    out.append(0)  # no optional fields
+    for _ in range(4):
+        out.append(0)  # mtime
+    out.append(0)  # no extra flags
+    out.append(0xFF)  # unknown OS
+    out.extend(Span(deflate(data)))
+    var sum = crc32(data)
+    for k in range(4):
+        out.append(UInt8((sum >> UInt32(8 * k)) & 0xFF))
+    var n = UInt32(len(data) & 0xFFFFFFFF)
+    for k in range(4):
+        out.append(UInt8((n >> UInt32(8 * k)) & 0xFF))
+    return out^
+
+
 struct DefaultCodecs(CodecSet):
     """`UNCOMPRESSED`, `SNAPPY` and `GZIP` — no FFI, no shared libraries."""
 
@@ -132,4 +161,14 @@ struct DefaultCodecs(CodecSet):
             return snappy_decompress(data)
         if codec == CompressionCodec.GZIP.value:
             return gunzip(data)
+        raise unsupported_codec(codec)
+
+    @staticmethod
+    def compress(codec: Int32, data: Span[UInt8, _]) raises -> List[UInt8]:
+        if codec == CompressionCodec.UNCOMPRESSED.value:
+            return copy_of(data)
+        if codec == CompressionCodec.SNAPPY.value:
+            return snappy_compress(data)
+        if codec == CompressionCodec.GZIP.value:
+            return gzip_wrap(data)
         raise unsupported_codec(codec)

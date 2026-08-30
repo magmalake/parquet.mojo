@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VENV="${TMPDIR:-/tmp}/parquet-mojo-fixtures-venv"
-uv venv --quiet "$VENV"
+uv venv --quiet --allow-existing "$VENV" 2>/dev/null || uv venv --quiet "$VENV"
 VIRTUAL_ENV="$VENV" uv pip install --quiet 'pyarrow>=21,<26' numpy
 "$VENV/bin/python" tools/gen_fixtures.py tests/fixtures
 "$VENV/bin/python" tools/oracle_pyarrow.py tests/fixtures

@@ -89,6 +89,14 @@ from parquet.schema import (
     arrow_type_of,
     build_schema,
 )
+from parquet.writer import (
+    ParquetWriter,
+    WLeaf,
+    WNode,
+    WriteSchema,
+    WriterOptions,
+    build_write_schema,
+)
 from parquet.stats import (
     SV_BOOL,
     SV_BYTES,

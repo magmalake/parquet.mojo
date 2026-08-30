@@ -23,13 +23,19 @@ def check_fixture[
     """
     var path = String("tests/fixtures/", name, ".parquet")
     var doc = load_oracle(String(path, ".oracle.json"))
-    var root = doc.root
     var r = ParquetReader[Codecs].open(path)
     r.batch_size = batch_size
     if len(columns):
         r.select_columns(columns)
     var t = r.read_table()
+    return check_table(doc, t, name, columns)
 
+
+def check_table(
+    doc: JsonDoc, t: Table, name: StringSlice, columns: List[String]
+) raises -> Int:
+    """Assert a decoded table matches an oracle document, value by value."""
+    var root = doc.root
     assert_equal(
         t.num_rows,
         Int(doc.as_int(doc.get(root, "num_rows"))),

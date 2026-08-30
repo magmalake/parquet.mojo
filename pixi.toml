@@ -24,6 +24,8 @@ fixtures = { cmd = "bash tools/gen_fixtures.sh" }
 # Build the Arrow C Data Interface shared library and import it into pyarrow.
 carrow-lib = { cmd = "mkdir -p build && mojo build --emit shared-lib tools/carrow_export.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/libpqcarrow$SHLIB_EXT" }
 verify-c = { cmd = "bash tools/verify_c_data.sh", depends-on = ["carrow-lib"] }
+# Write every fixture back out through our writer and have pyarrow read it.
+verify-written = { cmd = "bash tools/verify_written.sh" }
 # pyarrow's numbers for the same files, for the README's honesty.
 bench-pyarrow = { cmd = "bash tools/bench_pyarrow.sh" }
 
