@@ -428,27 +428,31 @@ struct ArrayArena(Copyable, Defaultable, Movable):
 
 @always_inline
 def load_i32(buf: Span[UInt8, _], i: Int) -> Int32:
-    return buf.unsafe_ptr().bitcast[Int32]().load[alignment=1](i)
+    return buf.unsafe_ptr().unsafe_bitcast[Int32]().unsafe_load[alignment=1](i)
 
 
 @always_inline
 def load_i64(buf: Span[UInt8, _], i: Int) -> Int64:
-    return buf.unsafe_ptr().bitcast[Int64]().load[alignment=1](i)
+    return buf.unsafe_ptr().unsafe_bitcast[Int64]().unsafe_load[alignment=1](i)
 
 
 @always_inline
 def load_u64(buf: Span[UInt8, _], i: Int) -> UInt64:
-    return buf.unsafe_ptr().bitcast[UInt64]().load[alignment=1](i)
+    return buf.unsafe_ptr().unsafe_bitcast[UInt64]().unsafe_load[alignment=1](i)
 
 
 @always_inline
 def load_f32(buf: Span[UInt8, _], i: Int) -> Float32:
-    return buf.unsafe_ptr().bitcast[Float32]().load[alignment=1](i)
+    return (
+        buf.unsafe_ptr().unsafe_bitcast[Float32]().unsafe_load[alignment=1](i)
+    )
 
 
 @always_inline
 def load_f64(buf: Span[UInt8, _], i: Int) -> Float64:
-    return buf.unsafe_ptr().bitcast[Float64]().load[alignment=1](i)
+    return (
+        buf.unsafe_ptr().unsafe_bitcast[Float64]().unsafe_load[alignment=1](i)
+    )
 
 
 def store_u32(mut buf: List[UInt8], v: UInt32):
