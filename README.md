@@ -1,5 +1,7 @@
 # parquet.mojo
 
+[![mojoshelf](https://mojoshelf.org/badge/parquet-mojo.svg)](https://mojoshelf.org/tins/parquet-mojo) [![mojo nightly](https://mojoshelf.org/badge/parquet-mojo/nightly.svg)](https://mojoshelf.org/tins/parquet-mojo)
+
 [![CI](https://github.com/magmalake/parquet.mojo/actions/workflows/ci.yml/badge.svg)](https://github.com/magmalake/parquet.mojo/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 > Part of **magmalake** — data lake building blocks in Mojo.
