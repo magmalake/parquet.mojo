@@ -16,6 +16,7 @@ def core_fixtures() -> List[String]:
         String("v2pages"),
         String("v2pages_uncompressed"),
         String("pageindex"),
+        String("manypages"),
         String("bloom"),
         String("nostats"),
         String("int96"),
@@ -27,6 +28,24 @@ def core_fixtures() -> List[String]:
         String("prune"),
         String("big"),
     ]
+
+
+def iceberg_fixtures() -> List[String]:
+    """Real Iceberg data files written by parquet-rs and by PyIceberg."""
+    return [
+        String("unpartitioned"),
+        String("ident_part_eu"),
+        String("day_part"),
+        String("bucket_part"),
+        String("nullable"),
+        String("orders_apac"),
+        String("position_deletes"),
+    ]
+
+
+def iceberg_zstd_fixtures() -> List[String]:
+    """The Iceberg fixtures PyIceberg wrote with ZSTD."""
+    return [String("deletes_data"), String("evolved")]
 
 
 def codec_columns() -> List[String]:

@@ -34,8 +34,9 @@ for i in range(len(ids[0])):
   list layouts old writers produced.
 * **Projects** by column name, by dotted leaf path, or by **Parquet field id**,
   which is what Apache Iceberg needs for schema evolution.
-* **Skips row groups** whose statistics prove no row can match a
-  `column op literal` predicate, and **probes bloom filters** for equality.
+* **Skips row groups and pages** whose statistics or `ColumnIndex` bounds
+  prove no row can match a `column op literal` predicate, and **probes bloom
+  filters** for equality.
 * **Exports Arrow** over the C Data Interface, with a real `release` callback —
   `pyarrow.Array._import_from_c` takes the result directly.
 * **Writes Parquet** back out — `PLAIN` and `RLE_DICTIONARY`, all the codecs,
@@ -85,13 +86,15 @@ tins — see [Codecs](#codecs).
 | `.select_field_ids([...])` | project by Parquet field id |
 | `.select_row_groups([...])` | read only these row groups |
 | `.prune_row_groups(predicates)` | drop row groups by statistics |
+| `.prune_pages(predicates)` | drop *pages* by the `ColumnIndex`; returns the rows left |
+| `.page_row_ranges(rg, predicates)` | the row ranges those pages cover |
 | `.batch_size` | rows per batch (default 65536) |
 | `.verify_crc` | check page CRC32s when present (default true) |
 | `.read_batch()` / `.has_next()` / `.rewind()` | iterate batches |
 | `.read_table()` | every selected row group, as a `Table` |
 
-A batch never spans two row groups, so the last batch of each row group can be
-shorter than `batch_size`.
+A batch never spans two row groups, and never crosses a gap left by page
+pruning, so the last batch of each range can be shorter than `batch_size`.
 
 ### `RecordBatch` and `Table`
 
@@ -289,18 +292,19 @@ which returns how many row groups survived.
 
 ## Tests
 
-`pixi run test` — **40 tests**, on `default` (nightly) and `stable` (Mojo
-1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 5 more for ZSTD
-and LZ4, including a write/read round trip through each.
+`pixi run test` — **44 tests**, on `default` (nightly) and `stable` (Mojo
+1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 6 more for ZSTD
+and LZ4, including a write/read round trip through each and the
+ZSTD-compressed Iceberg fixtures.
 
-**pyarrow is the oracle.** `tools/gen_fixtures.py` writes 23 fixtures with
+**pyarrow is the oracle.** `tools/gen_fixtures.py` writes 24 fixtures with
 pyarrow 25.0.1 and `tools/oracle_pyarrow.py` reads each one back and dumps
 **every value of every column** to a JSON file beside it — nulls as `null`,
 floats as their exact IEEE-754 bits, decimals as their unscaled 128-bit
 integer, binary as hex, timestamps as the integer they store, lists as arrays,
 structs as objects, maps as arrays of pairs. The Mojo suite reproduces each
 oracle from its own decode, value by value *and* as a CRC32 over a canonical
-serialisation of the whole column — **20,630 value assertions across 22
+serialisation of the whole column — **over 20,000 value assertions across 23
 fixtures**, and again at batch sizes 1, 3, 64 and 997 to prove batching does
 not change anything.
 
@@ -312,9 +316,20 @@ Beyond value parity the suite covers:
   `SchemaElement`s (pyarrow 25 no longer writes 2-level lists, even with
   `use_compliant_nested_type=False` — it writes a 3-level list whose inner
   field is named `item`, which `legacy_list.parquet` does cover);
+- **nine real Iceberg data files** from the sibling tins' test warehouses, six
+  of them written by `parquet-rs 58` rather than pyarrow — a second writer, a
+  root schema element named `arrow_schema`, top-level `required` columns
+  (which pyarrow never writes), Iceberg field ids on every column, and a
+  position-delete file using the reserved ids 2147483546 and 2147483545;
 - projection by name and by field id, row-group selection, and pruning by
   integer, string and float statistics — including that a file *without*
   statistics prunes nothing;
+- **page-level pruning** against `manypages.parquet` (20 pages per row group,
+  disjoint ranges): a `k in [1200, 1210)` predicate must keep every matching
+  row and drop most of the rest, a string predicate must do the same, an
+  impossible predicate must leave nothing, a file with no page index must be
+  left alone, pruning must compose with batching — and the same again against
+  a page index **our own writer** produced;
 - statistics decoded to typed min/max compared against pyarrow's, per column
   chunk of five fixtures;
 - `split_offsets`, `created_by` and key/value metadata against the oracle;
@@ -352,9 +367,12 @@ all-null file and a legacy list file — import into pyarrow and compare equal.
 
 ### Fixtures
 
-`tests/fixtures/PROVENANCE.md` lists all 23 with their size, row count and what
-each covers; the directory including the oracles is under 2 MB. Regenerate with
-`pixi run fixtures` (needs `uv`).
+`tests/fixtures/PROVENANCE.md` lists all 24 with their size, row count and what
+each covers, and `tests/fixtures/iceberg/PROVENANCE.md` says where each of the
+nine Iceberg data files came from and what it is worth testing against. The
+whole directory including the oracles is under 2 MB. Regenerate the pyarrow
+half with `pixi run fixtures` (needs `uv`); the Iceberg files are copied
+verbatim and are not regenerated.
 
 ## Performance
 
@@ -392,9 +410,10 @@ vectorised level decoder.
   dictionaries). Reading it would need a Flatbuffers parser; this reader
   derives everything from the Parquet schema alone, like `parquet-mr` does. The
   values are identical, only the Arrow type differs.
-* **Page-level skipping** — the `OffsetIndex` and `ColumnIndex` are decoded and
-  exposed, but pruning is currently at row-group granularity. Page skipping is
-  the natural next step and the metadata for it is already there.
+* **Page-level skipping for repeated columns** — `prune_pages` uses the page
+  index for flat columns; a column with a maximum repetition level above zero
+  is left alone, because its pages do not line up with rows one to one in a
+  way a simple predicate can use.
 * **`marrow`** — kszucs/marrow is the Arrow-in-Mojo library this would
   otherwise build on, but it pins `mojo == 0.26.3.0.dev2026032105`, far older
   than Mojo 1.0.0, so it does not compile on either supported toolchain. The
@@ -447,7 +466,7 @@ CRC32s, `INT96`, bloom filters, and encryption.
 fixtures back out through our writer — plus three of them again with the
 dictionary off, uncompressed, and with GZIP at a 4-row row group and a 32-byte
 page — then has pyarrow read every one and compare it with the original.
-**28 files, 172 columns, all equal.** In the Mojo suite,
+**29 files, 175 columns, all equal.** In the Mojo suite,
 `test_write_round_trip` sends every fixture through write → read and checks the
 result against the *original* pyarrow oracle, value by value.
 

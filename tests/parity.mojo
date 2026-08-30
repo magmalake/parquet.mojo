@@ -21,7 +21,18 @@ def check_fixture[
 
     Returns the number of values checked. `columns` empty means "all of them".
     """
-    var path = String("tests/fixtures/", name, ".parquet")
+    return check_path[Codecs](
+        String("tests/fixtures/", name), name, columns, batch_size
+    )
+
+
+def check_path[
+    Codecs: CodecSet
+](
+    stem: StringSlice, name: StringSlice, columns: List[String], batch_size: Int
+) raises -> Int:
+    """The same, for a fixture that is not directly under `tests/fixtures`."""
+    var path = String(stem, ".parquet")
     var doc = load_oracle(String(path, ".oracle.json"))
     var r = ParquetReader[Codecs].open(path)
     r.batch_size = batch_size

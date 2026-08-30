@@ -5,9 +5,14 @@ These need `zstd.mojo` and `lz4.mojo` checked out next door and their shims
 installed, which the `codecs` environment does.
 """
 
-from fixtures_list import core_fixtures, full_codec_columns
+from fixtures_list import (
+    core_fixtures,
+    full_codec_columns,
+    iceberg_fixtures,
+    iceberg_zstd_fixtures,
+)
 from oracle import load_oracle
-from parity import check_fixture, check_table
+from parity import check_fixture, check_path, check_table
 from parquet import ParquetReader, ParquetWriter, WriterOptions
 from thrift import CompressionCodec
 from parquet.ext_full import AllCodecs
@@ -61,6 +66,20 @@ def test_write_and_read_back_with_zstd_and_lz4() raises:
         var doc = load_oracle("tests/fixtures/nested.parquet.oracle.json")
         total += check_table(doc, t2, "nested", List[String]())
     assert_true(total > 100, String("only ", total, " values round-tripped"))
+
+
+def test_iceberg_zstd_data_files() raises:
+    """The PyIceberg-written Iceberg fixtures use ZSTD."""
+    var total = 0
+    for f in iceberg_zstd_fixtures():
+        total += check_path[AllCodecs](
+            String("tests/fixtures/iceberg/", f), f, List[String](), 65536
+        )
+    for f in iceberg_fixtures():
+        total += check_path[AllCodecs](
+            String("tests/fixtures/iceberg/", f), f, List[String](), 65536
+        )
+    assert_true(total > 80, String("only ", total, " Iceberg values checked"))
 
 
 def main() raises:

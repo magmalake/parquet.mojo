@@ -237,7 +237,9 @@ write("v2pages_uncompressed.parquet", pages, data_page_version="2.0", data_page_
       row_group_size=180, compression="none")
 
 # ── 8. page index + checksums + bloom filters ──────────────────────────────
-idx_kw = dict(data_page_size=512, row_group_size=150, write_statistics=True)
+idx_kw = dict(
+    data_page_size=512, row_group_size=150, write_statistics=True, write_batch_size=40
+)
 if supports(pq.write_table, "write_page_index"):
     idx_kw["write_page_index"] = True
 if supports(pq.write_table, "write_page_checksum"):
@@ -245,6 +247,23 @@ if supports(pq.write_table, "write_page_checksum"):
 write("pageindex.parquet", pages, **idx_kw)
 
 # `bloom_filter_options` is a {column: {ndv, fpp}} dict on recent pyarrow.
+# Many small pages with disjoint value ranges, for page-level pruning: no
+# dictionary, so a 256-byte page really is only a handful of values.
+many = pa.table(
+    {
+        "k": pa.array(list(range(2000)), pa.int64()),
+        "s": pa.array([f"v{i:05d}" for i in range(2000)], pa.string()),
+        "f": pa.array([float(i) * 0.25 for i in range(2000)], pa.float64()),
+    }
+)
+many_kw = dict(idx_kw)
+many_kw["data_page_size"] = 256
+many_kw["row_group_size"] = 1000
+# pyarrow only checks the page size at a `write_batch_size` boundary, so the
+# default of 1024 would put a whole row group in one page.
+many_kw["write_batch_size"] = 50
+write("manypages.parquet", many, use_dictionary=False, compression="none", **many_kw)
+
 bloom_kw = {}
 if supports(pq.write_table, "bloom_filter_options"):
     bloom_kw["bloom_filter_options"] = {

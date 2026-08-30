@@ -6,9 +6,14 @@ from the same file, both one value at a time and as a CRC32 over the lot.
 """
 
 from avro.json import JsonDoc
-from fixtures_list import core_fixtures, default_codec_columns
+from fixtures_list import (
+    core_fixtures,
+    default_codec_columns,
+    iceberg_fixtures,
+    iceberg_zstd_fixtures,
+)
 from oracle import decimal_string, double_bits, hex_of, load_oracle
-from parity import check_fixture, check_table
+from parity import check_fixture, check_path, check_table
 from parquet import (
     AT_BINARY,
     AT_BOOL,
@@ -129,6 +134,50 @@ def test_batching_is_invariant() raises:
         assert_true(n > 2000, String("batch size ", bs))
     _ = check_fixture[DefaultCodecs](String("nested"), List[String](), 1)
     _ = check_fixture[DefaultCodecs](String("big"), List[String](), 12500)
+
+
+def test_iceberg_data_files() raises:
+    """Real Iceberg data files, most of them written by parquet-rs 58 rather
+    than pyarrow — a second writer, top-level `required` columns, and a field
+    id on every column."""
+    var total = 0
+    for f in iceberg_fixtures():
+        total += check_path[DefaultCodecs](
+            String(FIXTURES, "iceberg/", f), f, List[String](), 65536
+        )
+    assert_true(total > 60, String("only ", total, " Iceberg values checked"))
+
+
+def test_iceberg_field_ids() raises:
+    var r = ParquetReader.open(String(FIXTURES, "iceberg/unpartitioned.parquet"))
+    # parquet-rs names the root element `arrow_schema`, and every column has an
+    # Iceberg field id.
+    for i in range(len(r.schema.leaves)):
+        assert_equal(
+            r.schema.leaves[i].field_id, Int32(i + 1), String("leaf ", i, " field id")
+        )
+    r.select_field_ids([Int32(2), Int32(1)])
+    var t = r.read_table()
+    assert_equal(t.num_columns(), 2)
+    assert_equal(t.name(0), "region")
+    assert_equal(t.name(1), "id")
+    # `id` and `region` are REQUIRED at the top level, which pyarrow never
+    # writes: their maximum definition level is 0.
+    assert_equal(r.schema.leaves[0].max_def, 0)
+    assert_false(r.schema.fields[r.schema.field_by_name("id")].nullable)
+    var ids = t.column_i64(1)
+    assert_equal(len(ids[0]), 3)
+    for v in ids[1]:
+        assert_true(v)
+
+    # A position-delete file uses the reserved field ids.
+    var d = ParquetReader.open(String(FIXTURES, "iceberg/position_deletes.parquet"))
+    assert_true(d.schema.field_by_id(2147483546) >= 0)
+    assert_true(d.schema.field_by_id(2147483545) >= 0)
+    d.select_field_ids([Int32(2147483545)])
+    var dt = d.read_table()
+    assert_equal(dt.name(0), "pos")
+    assert_equal(dt.num_rows, 2)
 
 
 # ── schema ─────────────────────────────────────────────────────────────────
@@ -472,6 +521,106 @@ def test_statistics_pruning() raises:
         Predicate(String("k"), OP_GT, ScalarValue.of_int(1000000))
     ]
     assert_equal(r6.prune_row_groups(p6), r6.num_row_groups())
+
+
+def test_page_pruning() raises:
+    # manypages.parquet is 2000 sorted rows in 2 row groups with 256-byte
+    # pages and no dictionary, so its pages really do have disjoint ranges.
+    var r = _reader("manypages")
+    assert_equal(r.read_table().num_rows, 2000)
+
+    var r2 = _reader("manypages")
+    var p: List[Predicate] = [
+        Predicate(String("k"), OP_GE, ScalarValue.of_int(1200)),
+        Predicate(String("k"), OP_LT, ScalarValue.of_int(1210)),
+    ]
+    assert_equal(r2.prune_row_groups(p), 1)
+    var left = r2.prune_pages(p)
+    assert_true(left > 0, "page pruning left nothing")
+    assert_true(left < 100, String("page pruning left ", left, " of 1000 rows"))
+    var t = r2.read_table()
+    assert_equal(t.num_rows, left)
+    var ks = t.column_i64(0)
+    var found = 0
+    for i in range(len(ks[0])):
+        if ks[1][i] and ks[0][i] >= 1200 and ks[0][i] < 1210:
+            found += 1
+    assert_equal(found, 10, "every matching row must survive pruning")
+
+    # The row ranges are what the page index says they are.
+    var ranges = r2.page_row_ranges(1, p)
+    var covered = 0
+    for span in ranges:
+        assert_true(span[0] < span[1])
+        covered += span[1] - span[0]
+    assert_equal(covered, left)
+
+    # A string predicate prunes too.
+    var r6 = _reader("manypages")
+    var sp: List[Predicate] = [
+        Predicate(String("s"), OP_EQ, ScalarValue.of_string("v00777"))
+    ]
+    var left6 = r6.prune_pages(sp)
+    assert_true(left6 > 0 and left6 < 2000, String("string pruning left ", left6))
+    var t6 = r6.read_table()
+    var ss = t6.column_str(1)
+    var hit = False
+    for v in ss[0]:
+        if v == "v00777":
+            hit = True
+    assert_true(hit, "the matching row must survive string page pruning")
+
+    # A predicate nothing can match leaves no rows at all.
+    var r3 = _reader("manypages")
+    var none: List[Predicate] = [
+        Predicate(String("k"), OP_GT, ScalarValue.of_int(100000))
+    ]
+    assert_equal(r3.prune_pages(none), 0)
+    assert_equal(r3.read_table().num_rows, 0)
+
+    # A file without a page index is not restricted at all.
+    var r4 = _reader("nostats")
+    var any: List[Predicate] = [
+        Predicate(String("k"), OP_GE, ScalarValue.of_int(0))
+    ]
+    assert_equal(r4.prune_pages(any), 500)
+    assert_equal(r4.read_table().num_rows, 500)
+
+    # Pruning composes with batching.
+    var r5 = _reader("manypages")
+    _ = r5.prune_pages(p)
+    r5.batch_size = 7
+    var t5 = r5.read_table()
+    assert_equal(t5.num_rows, left)
+
+    # …and with the page index our own writer produces.
+    var src = _reader("prune")
+    var st = src.read_table()
+    var opts = WriterOptions()
+    opts.use_dictionary = False
+    opts.data_page_size = 128
+    opts.row_group_size = 500
+    var w = ParquetWriter(opts^)
+    for b in st.batches:
+        w.write_batch(b.arena, b.roots)
+    var bytes = w^.finish()
+    var back = ParquetReader(bytes^)
+    var mine: List[Predicate] = [
+        Predicate(String("k"), OP_GE, ScalarValue.of_int(600)),
+        Predicate(String("k"), OP_LT, ScalarValue.of_int(605)),
+    ]
+    var mine_left = back.prune_pages(mine)
+    assert_true(
+        mine_left > 0 and mine_left < 1000,
+        String("our own page index left ", mine_left, " of 1000 rows"),
+    )
+    var mt = back.read_table()
+    var mk = mt.column_i64(0)
+    var mfound = 0
+    for i in range(len(mk[0])):
+        if mk[1][i] and mk[0][i] >= 600 and mk[0][i] < 605:
+            mfound += 1
+    assert_equal(mfound, 5, "our own page index must not drop a matching row")
 
 
 def test_statistics_match_pyarrow() raises:
@@ -967,6 +1116,35 @@ def test_write_round_trip() raises:
         var opts = WriterOptions()
         total += _round_trip(f, List[String](), opts^)
     assert_true(total > 20000, String("only ", total, " values round-tripped"))
+
+
+def test_write_round_trip_iceberg() raises:
+    """The Iceberg files too, so field ids and top-level `required` columns
+    survive the writer."""
+    var total = 0
+    for f in iceberg_fixtures():
+        var r = ParquetReader.open(String(FIXTURES, "iceberg/", f, ".parquet"))
+        var t = r.read_table()
+        var opts = WriterOptions()
+        var w = ParquetWriter(opts^)
+        for b in t.batches:
+            w.write_batch(b.arena, b.roots)
+        var bytes = w^.finish()
+        var back = ParquetReader(bytes^)
+        var doc = load_oracle(String(FIXTURES, "iceberg/", f, ".parquet.oracle.json"))
+        total += check_table(doc, back.read_table(), f, List[String]())
+        for i in range(len(r.schema.leaves)):
+            assert_equal(
+                back.schema.leaves[i].field_id,
+                r.schema.leaves[i].field_id,
+                String(f, " leaf ", i, " field id"),
+            )
+            assert_equal(
+                back.schema.leaves[i].max_def,
+                r.schema.leaves[i].max_def,
+                String(f, " leaf ", i, " max_def"),
+            )
+    assert_true(total > 60, String("only ", total, " Iceberg values round-tripped"))
 
 
 def test_write_round_trip_options() raises:

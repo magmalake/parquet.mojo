@@ -48,6 +48,7 @@ from parquet.stats import (
     ScalarValue,
     TypedStats,
     compare_scalars,
+    decode_statistic,
     decode_stats,
 )
 from std.memory import bitcast
@@ -122,6 +123,39 @@ def range_can_match(op: Int, lo: ScalarValue, hi: ScalarValue, v: ScalarValue) r
     if op == OP_GE:
         return ch >= 0
     return True
+
+
+def _merge_ranges(var ranges: List[Tuple[Int, Int]]) -> List[Tuple[Int, Int]]:
+    """Sorted, disjoint, adjacent ranges joined."""
+    var out = List[Tuple[Int, Int]]()
+    for r in ranges:
+        if r[1] <= r[0]:
+            continue
+        if len(out) and out[len(out) - 1][1] >= r[0]:
+            var last = out[len(out) - 1]
+            var hi = last[1] if last[1] > r[1] else r[1]
+            out[len(out) - 1] = (last[0], hi)
+        else:
+            out.append(r)
+    return out^
+
+
+def _intersect_ranges(
+    a: List[Tuple[Int, Int]], b: List[Tuple[Int, Int]]
+) -> List[Tuple[Int, Int]]:
+    var out = List[Tuple[Int, Int]]()
+    var i = 0
+    var j = 0
+    while i < len(a) and j < len(b):
+        var lo = a[i][0] if a[i][0] > b[j][0] else b[j][0]
+        var hi = a[i][1] if a[i][1] < b[j][1] else b[j][1]
+        if lo < hi:
+            out.append((lo, hi))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out^
 
 
 struct RecordBatch(Copyable, Movable, Defaultable):
@@ -282,7 +316,13 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var _needed: List[Bool]
     """Per leaf: is it under a selected root?"""
     var _rg_pos: Int
+    var _range_pos: Int
     var _row_pos: Int
+    var _did_empty: Bool
+    """Whether the empty row group we are sitting on has been handed out."""
+    var _ranges: List[List[Tuple[Int, Int]]]
+    """Per selected row group, the row ranges left after page pruning. An
+    empty list means the whole row group."""
     var _loaded_rg: Int
     var _chunks: List[ColumnData]
     var _row_slot: List[List[Int]]
@@ -300,7 +340,10 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._roots = self.schema.roots.copy()
         self._needed = List[Bool](length=len(self.schema.leaves), fill=True)
         self._rg_pos = 0
+        self._range_pos = 0
         self._row_pos = 0
+        self._did_empty = False
+        self._ranges = List[List[Tuple[Int, Int]]]()
         self._loaded_rg = -1
         self._chunks = List[ColumnData]()
         self._row_slot = List[List[Int]]()
@@ -316,7 +359,10 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._roots = move._roots^
         self._needed = move._needed^
         self._rg_pos = move._rg_pos
+        self._range_pos = move._range_pos
         self._row_pos = move._row_pos
+        self._did_empty = move._did_empty
+        self._ranges = move._ranges^
         self._loaded_rg = move._loaded_rg
         self._chunks = move._chunks^
         self._row_slot = move._row_slot^
@@ -450,9 +496,8 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             if g < 0 or g >= len(self.meta.row_groups):
                 raise Error(String("parquet: row group ", g, " does not exist"))
         self._row_groups = groups^
-        self._rg_pos = 0
-        self._row_pos = 0
-        self._loaded_rg = -1
+        self._ranges = List[List[Tuple[Int, Int]]]()
+        self.rewind()
 
     def prune_row_groups(mut self, predicates: List[Predicate]) raises -> Int:
         """Drop row groups whose statistics prove no row can match. Returns
@@ -462,9 +507,8 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             if self._rg_matches(g, predicates):
                 keep.append(g)
         self._row_groups = keep^
-        self._rg_pos = 0
-        self._row_pos = 0
-        self._loaded_rg = -1
+        self._ranges = List[List[Tuple[Int, Int]]]()
+        self.rewind()
         return len(self._row_groups)
 
     def _rg_matches(self, rg: Int, predicates: List[Predicate]) raises -> Bool:
@@ -483,7 +527,9 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
 
     def rewind(mut self):
         self._rg_pos = 0
+        self._range_pos = 0
         self._row_pos = 0
+        self._did_empty = False
         self._loaded_rg = -1
 
     def _load(mut self, rg: Int) raises:
@@ -579,26 +625,68 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             self._row_value.append(value^)
         self._loaded_rg = rg
 
-    def has_next(self) -> Bool:
-        return self._rg_pos < len(self._row_groups)
+    def _ranges_for(self, slot: Int) -> List[Tuple[Int, Int]]:
+        """The row ranges to read from the row group at `slot`."""
+        var rows = Int(self.meta.row_groups[self._row_groups[slot]].num_rows)
+        if slot < len(self._ranges) and len(self._ranges[slot]):
+            return self._ranges[slot].copy()
+        if slot < len(self._ranges):
+            # Pruning ran and left this row group with nothing.
+            return List[Tuple[Int, Int]]()
+        var whole = List[Tuple[Int, Int]]()
+        whole.append((0, rows))
+        return whole^
+
+    def _seek(mut self) -> Bool:
+        """Move to the next non-empty row range; False when there is none."""
+        while self._rg_pos < len(self._row_groups):
+            var rows = Int(self.meta.row_groups[self._row_groups[self._rg_pos]].num_rows)
+            if rows == 0:
+                # A row group with no rows still yields one empty batch, so a
+                # zero-row file keeps its columns.
+                if not self._did_empty:
+                    return True
+                self._rg_pos += 1
+                self._range_pos = 0
+                self._row_pos = 0
+                self._did_empty = False
+                continue
+            var ranges = self._ranges_for(self._rg_pos)
+            while self._range_pos < len(ranges):
+                var span = ranges[self._range_pos]
+                if self._row_pos < span[0]:
+                    self._row_pos = span[0]
+                if self._row_pos < span[1]:
+                    return True
+                self._range_pos += 1
+                self._row_pos = 0
+            self._rg_pos += 1
+            self._range_pos = 0
+            self._row_pos = 0
+            self._did_empty = False
+        return False
+
+    def has_next(mut self) -> Bool:
+        return self._seek()
 
     def read_batch(mut self) raises -> RecordBatch:
-        """The next batch of at most `batch_size` rows. A batch never spans
-        two row groups."""
-        if not self.has_next():
+        """The next batch of at most `batch_size` rows. A batch never spans two
+        row groups, and never crosses a gap left by page pruning."""
+        if not self._seek():
             return RecordBatch()
         var rg = self._row_groups[self._rg_pos]
         self._load(rg)
-        var rows = Int(self.meta.row_groups[rg].num_rows)
+        if Int(self.meta.row_groups[rg].num_rows) == 0:
+            self._did_empty = True
+            return self._assemble(0, 0)
+        var ranges = self._ranges_for(self._rg_pos)
+        var span = ranges[self._range_pos]
         var r0 = self._row_pos
         var r1 = r0 + self.batch_size
-        if r1 > rows:
-            r1 = rows
+        if r1 > span[1]:
+            r1 = span[1]
         var batch = self._assemble(r0, r1)
         self._row_pos = r1
-        if self._row_pos >= rows:
-            self._rg_pos += 1
-            self._row_pos = 0
         return batch^
 
     def _assemble(mut self, r0: Int, r1: Int) raises -> RecordBatch:
@@ -622,6 +710,73 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 build_field(self.schema, r, 0, self._chunks, slices, batch.arena)
             )
         return batch^
+
+    # ── page-level pruning ─────────────────────────────────────────────────
+
+    def page_row_ranges(
+        self, rg: Int, predicates: List[Predicate]
+    ) raises -> List[Tuple[Int, Int]]:
+        """The rows of row group `rg` whose pages could satisfy `predicates`.
+
+        Uses the `ColumnIndex` bounds and the `OffsetIndex` first-row indices.
+        A column without a page index puts no restriction on the answer, so a
+        file written without one behaves exactly as it did before.
+        """
+        var rows = Int(self.meta.row_groups[rg].num_rows)
+        var out = List[Tuple[Int, Int]]()
+        out.append((0, rows))
+        for p in predicates:
+            var leaf = self.schema.leaf_by_path(p.column)
+            if leaf < 0:
+                continue
+            if self.schema.leaves[leaf].max_rep > 0:
+                # A repeated column's pages do not line up with rows one to
+                # one in a way a simple predicate can use.
+                continue
+            var oi = self.offset_index(rg, leaf)
+            var ci = self.column_index(rg, leaf)
+            if not oi or not ci:
+                continue
+            var keep = List[Tuple[Int, Int]]()
+            ref locs = oi.value().page_locations
+            ref idx = ci.value()
+            if len(idx.null_pages) != len(locs):
+                continue
+            for k in range(len(locs)):
+                var start = Int(locs[k].first_row_index)
+                var end = rows
+                if k + 1 < len(locs):
+                    end = Int(locs[k + 1].first_row_index)
+                if start >= end:
+                    continue
+                if idx.null_pages[k]:
+                    continue
+                if k >= len(idx.min_values) or k >= len(idx.max_values):
+                    keep.append((start, end))
+                    continue
+                var lo = decode_statistic(
+                    self.schema.leaves[leaf], Span(idx.min_values[k])
+                )
+                var hi = decode_statistic(
+                    self.schema.leaves[leaf], Span(idx.max_values[k])
+                )
+                if range_can_match(p.op, lo, hi, p.value):
+                    keep.append((start, end))
+            out = _intersect_ranges(out, keep)
+        return _merge_ranges(out^)
+
+    def prune_pages(mut self, predicates: List[Predicate]) raises -> Int:
+        """Restrict reading to the pages whose bounds could match. Returns the
+        number of rows left."""
+        self._ranges = List[List[Tuple[Int, Int]]]()
+        var total = 0
+        for i in range(len(self._row_groups)):
+            var ranges = self.page_row_ranges(self._row_groups[i], predicates)
+            for r in ranges:
+                total += r[1] - r[0]
+            self._ranges.append(ranges^)
+        self.rewind()
+        return total
 
     def read_table(mut self) raises -> Table:
         """Every selected row group, as a list of batches."""
