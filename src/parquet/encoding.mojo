@@ -177,22 +177,54 @@ def decode_plain(
     phys: Int32, type_length: Int, data: Span[UInt8, _], count: Int
 ) raises -> PhysBuffer:
     """PLAIN: fixed-width values little-endian, byte arrays length-prefixed."""
+    var out = PhysBuffer(physical_kind(phys), physical_width(phys, type_length))
+    decode_plain_into(out, phys, type_length, data, count)
+    return out^
+
+
+def decode_plain_into(
+    mut out: PhysBuffer,
+    phys: Int32,
+    type_length: Int,
+    data: Span[UInt8, _],
+    count: Int,
+) raises:
+    """PLAIN-decode `count` values onto the end of `out`.
+
+    Decoding straight into the chunk's buffer is what keeps a many-page column
+    from copying every byte twice: once into the page's own buffer and again
+    when the page is concatenated.
+    """
     if count < 0:
         raise Error(String("parquet.encoding: negative value count ", count))
     var kind = physical_kind(phys)
+    if kind != out.kind:
+        raise Error("parquet.encoding: cannot concatenate unlike pages")
     if kind == PK_BOOL:
         _need(data, (count + 7) // 8, "PLAIN booleans")
-        var out = PhysBuffer(PK_BOOL, 0)
-        out.bytes.extend(data[0 : (count + 7) // 8])
-        out.count = count
-        return out^
+        if out.count % 8 == 0:
+            out.bytes.extend(data[0 : (count + 7) // 8])
+            out.count += count
+            # A partial last byte may carry bits past the end of the page.
+            var whole = (out.count + 7) // 8
+            while len(out.bytes) > whole:
+                _ = out.bytes.pop()
+            if out.count % 8 != 0 and len(out.bytes) > 0:
+                out.bytes[len(out.bytes) - 1] &= (
+                    UInt8(1) << UInt8(out.count % 8)
+                ) - 1
+        else:
+            for i in range(count):
+                out.append_bool(((data[i // 8] >> UInt8(i % 8)) & 1) == 1)
+        return
     if kind == PK_VAR:
-        var out = PhysBuffer(PK_VAR, 0)
         if count == 0:
-            return out^
+            return
         # One pass over the length prefixes fixes every offset and the total
-        # size, so the bytes are copied once into a buffer that never grows.
-        out.offsets.resize(count + 1, 0)
+        # size, so the bodies are copied once into a buffer that never grows.
+        var obase = len(out.offsets)
+        var vbase = len(out.bytes)
+        out.offsets.resize(obase + count, 0)
         var ooff = out.offsets.unsafe_ptr()
         var pos = 0
         var total = 0
@@ -212,39 +244,67 @@ def decode_plain(
             _need(data, pos + n, "PLAIN byte array body")
             pos += n
             total += n
-            ooff.unsafe_store(i + 1, Int32(total))
-        out.bytes.resize(total, 0)
+            ooff.unsafe_store(obase + i, Int32(vbase + total))
+        # Eight bytes of slack let a short value — which is most of them —
+        # move in a single 8-byte store; the overhang is overwritten by the
+        # next value, and the buffer is trimmed back at the end.
+        out.bytes.resize(vbase + total + 8, 0)
         var dst = out.bytes.unsafe_ptr()
         var src = data.unsafe_ptr()
+        var limit = len(data) - 8
         pos = 0
+        var at = vbase
         for i in range(count):
-            var at = Int(ooff.unsafe_load(i))
-            var n = Int(ooff.unsafe_load(i + 1)) - at
+            var n = Int(ooff.unsafe_load(obase + i)) - at
             pos += 4
-            for b in range(n):
-                dst.unsafe_store(at + b, src.unsafe_load(pos + b))
+            if n <= 8 and pos <= limit:
+                dst.unsafe_store[width=8](at, src.unsafe_load[width=8](pos))
+            else:
+                var b = 0
+                while b + 8 <= n and pos + b <= limit:
+                    dst.unsafe_store[width=8](
+                        at + b, src.unsafe_load[width=8](pos + b)
+                    )
+                    b += 8
+                while b < n:
+                    dst.unsafe_store(at + b, src.unsafe_load(pos + b))
+                    b += 1
             pos += n
-        out.count = count
-        return out^
+            at += n
+        out.bytes.resize(vbase + total, 0)
+        out.count += count
+        return
     var width = physical_width(phys, type_length)
+    if out.count == 0 and len(out.bytes) == 0:
+        out.width = width
+    if out.width != width:
+        raise Error("parquet.encoding: cannot concatenate unlike pages")
     _need(data, count * width, "PLAIN fixed-width values")
-    var out = PhysBuffer(PK_FIXED, width)
     out.bytes.extend(data[0 : count * width])
-    out.count = count
-    return out^
+    out.count += count
 
 
 def gather(dict: PhysBuffer, indices: List[UInt32]) raises -> PhysBuffer:
-    """Materialise dictionary-encoded values from a dictionary page.
+    """Materialise dictionary-encoded values from a dictionary page."""
+    var out = PhysBuffer(dict.kind, dict.width)
+    gather_into(out, dict, indices)
+    return out^
+
+
+def gather_into(
+    mut out: PhysBuffer, dict: PhysBuffer, indices: List[UInt32]
+) raises:
+    """Gather `indices` out of `dict` onto the end of `out`.
 
     Fixed-width entries are a straight gather — one load and one store of the
-    whole element per index. Byte arrays take two passes: lengths into the
+    whole element per index. Byte arrays take two passes: the lengths into the
     offsets, then the bytes.
     """
     var n = len(indices)
-    var out = PhysBuffer(dict.kind, dict.width)
     if n == 0:
-        return out^
+        return
+    if out.kind != dict.kind:
+        raise Error("parquet.encoding: cannot concatenate unlike pages")
     var idx = indices.unsafe_ptr()
     var entries = dict.count
     for i in range(n):
@@ -262,34 +322,55 @@ def gather(dict: PhysBuffer, indices: List[UInt32]) raises -> PhysBuffer:
     if dict.kind == PK_BOOL:
         for i in range(n):
             out.append_bool(dict.bool_at(Int(idx.unsafe_load(i))))
-        return out^
+        return
 
     if dict.kind == PK_VAR:
         var doff = dict.offsets.unsafe_ptr()
-        out.offsets.resize(n + 1, 0)
+        var obase = len(out.offsets)
+        var vbase = len(out.bytes)
+        out.offsets.resize(obase + n, 0)
         var ooff = out.offsets.unsafe_ptr()
-        var total = 0
+        var total = vbase
         for i in range(n):
             var k = Int(idx.unsafe_load(i))
-            ooff.unsafe_store(i, Int32(total))
             total += Int(doff.unsafe_load(k + 1)) - Int(doff.unsafe_load(k))
-        ooff.unsafe_store(n, Int32(total))
-        out.bytes.resize(total, 0)
+            ooff.unsafe_store(obase + i, Int32(total))
+        # As in `decode_plain_into`: eight bytes of slack so a short value
+        # moves in one store.
+        out.bytes.resize(total + 8, 0)
         var dst = out.bytes.unsafe_ptr()
         var src = dict.bytes.unsafe_ptr()
+        var limit = len(dict.bytes) - 8
+        var at = vbase
         for i in range(n):
             var k = Int(idx.unsafe_load(i))
-            var at = Int(doff.unsafe_load(k))
-            var end = Int(doff.unsafe_load(k + 1))
-            var to = Int(ooff.unsafe_load(i))
-            for b in range(end - at):
-                dst.unsafe_store(to + b, src.unsafe_load(at + b))
-        out.count = n
-        return out^
+            var src_at = Int(doff.unsafe_load(k))
+            var ln = Int(doff.unsafe_load(k + 1)) - src_at
+            if ln <= 8 and src_at <= limit:
+                dst.unsafe_store[width=8](at, src.unsafe_load[width=8](src_at))
+            else:
+                var b = 0
+                while b + 8 <= ln and src_at + b <= limit:
+                    dst.unsafe_store[width=8](
+                        at + b, src.unsafe_load[width=8](src_at + b)
+                    )
+                    b += 8
+                while b < ln:
+                    dst.unsafe_store(at + b, src.unsafe_load(src_at + b))
+                    b += 1
+            at += ln
+        out.bytes.resize(total, 0)
+        out.count += n
+        return
 
     var w = dict.width
-    out.bytes.resize(n * w, 0)
-    var dst = out.bytes.unsafe_ptr()
+    if out.count == 0 and len(out.bytes) == 0:
+        out.width = w
+    if out.width != w:
+        raise Error("parquet.encoding: cannot concatenate unlike pages")
+    var vbase = len(out.bytes)
+    out.bytes.resize(vbase + n * w, 0)
+    var dst = out.bytes.unsafe_ptr().unsafe_offset(vbase)
     var src = dict.bytes.unsafe_ptr()
     if w == 8:
         var d8 = dst.bitcast[UInt64]()
@@ -310,8 +391,7 @@ def gather(dict: PhysBuffer, indices: List[UInt32]) raises -> PhysBuffer:
             var at = Int(idx.unsafe_load(i)) * w
             for b in range(w):
                 dst.unsafe_store(i * w + b, src.unsafe_load(at + b))
-    out.count = n
-    return out^
+    out.count += n
 
 
 def decode_dict_indices(

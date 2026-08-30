@@ -27,7 +27,8 @@ from parquet.encoding import (
     PhysBuffer,
     decode_dict_indices,
     decode_plain,
-    gather,
+    decode_plain_into,
+    gather_into,
     physical_kind,
     physical_width,
 )
@@ -139,6 +140,10 @@ def _walk_chunk(
         physical_kind(leaf.physical),
         physical_width(leaf.physical, leaf.type_length),
     )
+    var nv = Int(cm.num_values)
+    if nv > 0 and nv < (1 << 30) and values.width > 0:
+        if nv * values.width <= (1 << 28):
+            values.bytes.reserve(nv * values.width)
     var cd = ColumnData()
     ref defs = cd.defs
     ref reps = cd.reps
@@ -180,7 +185,6 @@ def _walk_chunk(
         var n = 0
         var non_null = 0
         var enc = Encoding.PLAIN.value
-        var vals = PhysBuffer()
 
         if ph.type_ == PageType.DATA_PAGE:
             ref h = ph.data_page_header
@@ -221,8 +225,8 @@ def _walk_chunk(
                 non_null = got[1]
             var t2 = perf_counter_ns()
             st.levels += t2 - t1
-            vals = _profile_values(
-                enc, leaf, buf[pos:], non_null, dict, has_dict, st
+            _profile_values(
+                values, enc, leaf, buf[pos:], non_null, dict, has_dict, st
             )
         else:
             ref h = ph.data_page_header_v2
@@ -266,17 +270,14 @@ def _walk_chunk(
                 st.decomp += t2 - t1
                 st.alloc_bytes += len(raw)
                 st.alloc_count += 1
-                vals = _profile_values(
-                    enc, leaf, Span(raw), non_null, dict, has_dict, st
+                _profile_values(
+                    values, enc, leaf, Span(raw), non_null, dict, has_dict, st
                 )
             else:
-                vals = _profile_values(
-                    enc, leaf, vbytes, non_null, dict, has_dict, st
+                _profile_values(
+                    values, enc, leaf, vbytes, non_null, dict, has_dict, st
                 )
 
-        var t3 = perf_counter_ns()
-        values.extend(vals)
-        st.concat += perf_counter_ns() - t3
         slots += n
         cd.num_slots = slots
 
@@ -285,6 +286,7 @@ def _walk_chunk(
 
 
 def _profile_values(
+    mut values: PhysBuffer,
     encoding: Int32,
     leaf: LeafColumn,
     data: Span[UInt8, _],
@@ -292,8 +294,9 @@ def _profile_values(
     dict: PhysBuffer,
     has_dict: Bool,
     mut st: Stages,
-) raises -> PhysBuffer:
-    """`_decode_values`, splitting the dictionary path into index + gather."""
+) raises:
+    """`_decode_values_into`, splitting the dictionary path into index + gather.
+    """
     var t0 = perf_counter_ns()
     if (
         encoding == Encoding.RLE_DICTIONARY.value
@@ -303,17 +306,21 @@ def _profile_values(
         var t1 = perf_counter_ns()
         st.values += t1 - t0
         st.alloc_bytes += len(indices) * 4
-        st.alloc_count += 2
-        var out = gather(dict, indices)
-        st.gather += perf_counter_ns() - t1
-        st.alloc_bytes += len(out.bytes)
         st.alloc_count += 1
-        return out^
+        gather_into(values, dict, indices)
+        st.gather += perf_counter_ns() - t1
+        return
+    if encoding == Encoding.PLAIN.value:
+        decode_plain_into(values, leaf.physical, leaf.type_length, data, count)
+        st.values += perf_counter_ns() - t0
+        return
     var out = _decode_values(encoding, leaf, data, count, dict, has_dict)
-    st.values += perf_counter_ns() - t0
     st.alloc_bytes += len(out.bytes)
     st.alloc_count += 1
-    return out^
+    var t2 = perf_counter_ns()
+    values.extend(out)
+    st.concat += perf_counter_ns() - t2
+    st.values += t2 - t0
 
 
 def _profile(path: StringSlice, label: StringSlice, repeats: Int) raises:

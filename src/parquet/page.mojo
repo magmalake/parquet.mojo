@@ -37,8 +37,10 @@ from parquet.encoding import (
     decode_delta_length_byte_array,
     decode_dict_indices,
     decode_plain,
+    decode_plain_into,
     decode_rle_bool,
     gather,
+    gather_into,
     physical_kind,
     physical_width,
 )
@@ -256,6 +258,42 @@ def _take_defs(
     _materialise_defs(out, max_def)
     var nn = decode_levels_into(block, width, count, max_def, out.defs)
     return (start + length, nn)
+
+
+def _decode_values_into(
+    mut out: PhysBuffer,
+    encoding: Int32,
+    leaf: LeafColumn,
+    data: Span[UInt8, _],
+    count: Int,
+    dict: PhysBuffer,
+    has_dict: Bool,
+) raises:
+    """Decode one page's values onto the end of the chunk's value buffer.
+
+    PLAIN and the two dictionary encodings — between them, almost every page
+    ever written — go straight in. The rest decode into their own buffer and
+    are concatenated, which is what the whole chunk used to do.
+    """
+    if (
+        encoding == Encoding.RLE_DICTIONARY.value
+        or encoding == Encoding.PLAIN_DICTIONARY.value
+    ):
+        if not has_dict:
+            raise Error(
+                String(
+                    "parquet.page: column '",
+                    leaf.dotted(),
+                    "' uses a dictionary encoding but has no dictionary page",
+                )
+            )
+        gather_into(out, dict, decode_dict_indices(data, count))
+        return
+    if encoding == Encoding.PLAIN.value:
+        decode_plain_into(out, leaf.physical, leaf.type_length, data, count)
+        return
+    var vals = _decode_values(encoding, leaf, data, count, dict, has_dict)
+    out.extend(vals)
 
 
 def _decode_values(
@@ -484,7 +522,8 @@ def read_column_chunk[
                 )
                 pos = got[0]
                 non_null = got[1]
-            var vals = _decode_values(
+            _decode_values_into(
+                out.values,
                 h.value().encoding.value,
                 leaf,
                 buf[pos:],
@@ -492,7 +531,6 @@ def read_column_chunk[
                 dict,
                 has_dict,
             )
-            out.values.extend(vals)
             out.num_slots += n
             continue
 
@@ -556,7 +594,8 @@ def read_column_chunk[
                 var raw = Codecs.decompress(
                     codec, vbytes, usize - rep_len - def_len
                 )
-                var vals = _decode_values(
+                _decode_values_into(
+                    out.values,
                     h.value().encoding.value,
                     leaf,
                     Span(raw),
@@ -564,9 +603,9 @@ def read_column_chunk[
                     dict,
                     has_dict,
                 )
-                out.values.extend(vals)
             else:
-                var vals = _decode_values(
+                _decode_values_into(
+                    out.values,
                     h.value().encoding.value,
                     leaf,
                     vbytes,
@@ -574,7 +613,6 @@ def read_column_chunk[
                     dict,
                     has_dict,
                 )
-                out.values.extend(vals)
             out.num_slots += n
             continue
 
