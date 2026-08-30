@@ -54,7 +54,7 @@ def _salt(i: Int) -> UInt32:
     return SALT7
 
 
-struct BloomFilter(Copyable, Movable, Defaultable):
+struct BloomFilter(Copyable, Defaultable, Movable):
     """One column chunk's split-block bloom filter bit set."""
 
     var bits: List[UInt8]
@@ -101,7 +101,9 @@ struct BloomFilter(Copyable, Movable, Defaultable):
         return self.might_contain_bytes(text.as_bytes())
 
     def might_contain_i32(self, v: Int32) raises -> Bool:
-        return self.might_contain_bytes(Span(_le(UInt64(bitcast[DType.uint32](v)), 4)))
+        return self.might_contain_bytes(
+            Span(_le(UInt64(bitcast[DType.uint32](v)), 4))
+        )
 
     def might_contain_i64(self, v: Int64) raises -> Bool:
         return self.might_contain_bytes(Span(_le(bitcast[DType.uint64](v), 8)))
@@ -138,14 +140,20 @@ def _le(v: UInt64, n: Int) -> List[UInt8]:
     return out^
 
 
-def read_bloom_filter(file: Span[UInt8, _], cm: ColumnMetaData) raises -> Optional[BloomFilter]:
+def read_bloom_filter(
+    file: Span[UInt8, _], cm: ColumnMetaData
+) raises -> Optional[BloomFilter]:
     """Read the bloom filter of one column chunk, or `None` if it has none."""
     if not cm.bloom_filter_offset:
         return None
     var off = Int(cm.bloom_filter_offset.value())
     if off <= 0 or off >= len(file):
         raise Error(
-            String("parquet.bloom: bloom filter offset ", off, " is outside the file")
+            String(
+                "parquet.bloom: bloom filter offset ",
+                off,
+                " is outside the file",
+            )
         )
     var p = TCompactProtocolReader(file, off)
     var hdr = BloomFilterHeader()
@@ -170,7 +178,11 @@ def read_bloom_filter(file: Span[UInt8, _], cm: ColumnMetaData) raises -> Option
         raise Error("parquet.bloom: compressed bloom filters are not supported")
     if n % BLOOM_BLOCK_BYTES != 0:
         raise Error(
-            String("parquet.bloom: bit set of ", n, " bytes is not a whole number of blocks")
+            String(
+                "parquet.bloom: bit set of ",
+                n,
+                " bytes is not a whole number of blocks",
+            )
         )
     var bits = List[UInt8](capacity=n)
     bits.extend(file[start : start + n])

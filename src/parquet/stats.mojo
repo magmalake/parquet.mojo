@@ -27,7 +27,7 @@ comptime SV_BYTES = 4
 comptime SV_BOOL = 5
 
 
-struct ScalarValue(Copyable, Movable, Defaultable, Writable):
+struct ScalarValue(Copyable, Defaultable, Movable, Writable):
     """One decoded statistic, or one predicate literal."""
 
     var kind: Int
@@ -141,7 +141,9 @@ def compare_scalars(a: ScalarValue, b: ScalarValue) raises -> Int:
     return compare_bytes(Span(a.b), Span(b.b))
 
 
-def decode_statistic(leaf: LeafColumn, raw: Span[UInt8, _]) raises -> ScalarValue:
+def decode_statistic(
+    leaf: LeafColumn, raw: Span[UInt8, _]
+) raises -> ScalarValue:
     """Decode one raw statistic against the leaf's physical and Arrow types."""
     var phys = leaf.physical
     var id = leaf.arrow.id
@@ -190,7 +192,7 @@ def decode_statistic(leaf: LeafColumn, raw: Span[UInt8, _]) raises -> ScalarValu
     return ScalarValue.of_bytes(raw)
 
 
-struct TypedStats(Copyable, Movable, Defaultable):
+struct TypedStats(Copyable, Defaultable, Movable):
     """One column chunk's statistics, decoded."""
 
     var has_min_max: Bool

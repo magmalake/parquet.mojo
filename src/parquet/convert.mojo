@@ -95,7 +95,9 @@ def int96_to_nanos(src: Span[UInt8, _]) -> Int64:
     little-endian Julian day number."""
     var nanos = bitcast[DType.int64](_le_u64(src, 8))
     var day = bitcast[DType.int32](UInt32(_le_u64(src[8:], 4)))
-    return (Int64(day) - Int64(JULIAN_UNIX_EPOCH)) * Int64(NANOS_PER_DAY) + nanos
+    return (Int64(day) - Int64(JULIAN_UNIX_EPOCH)) * Int64(
+        NANOS_PER_DAY
+    ) + nanos
 
 
 def append_null(mut out: ArrayData, leaf: LeafColumn) raises:
@@ -117,7 +119,10 @@ def append_null(mut out: ArrayData, leaf: LeafColumn) raises:
     var w = out.type.fixed_width()
     if w == 0:
         raise Error(
-            String("parquet.convert: cannot append a null of type ", String(out.type))
+            String(
+                "parquet.convert: cannot append a null of type ",
+                String(out.type),
+            )
         )
     _push_zero(out, w)
 
@@ -147,19 +152,26 @@ def append_value(
             _push_decimal_int(out, Int64(bitcast[DType.int32](raw)))
             return
         if phys == Type.INT64.value:
-            _push_decimal_int(out, bitcast[DType.int64](_le_u64(vals.value_span(vi), 8)))
+            _push_decimal_int(
+                out, bitcast[DType.int64](_le_u64(vals.value_span(vi), 8))
+            )
             return
         _push_decimal_be(out, vals.value_span(vi))
         return
 
     if id == AT_TIMESTAMP and phys == Type.INT96.value:
-        _push_le(out, bitcast[DType.uint64](int96_to_nanos(vals.value_span(vi))), 8)
+        _push_le(
+            out, bitcast[DType.uint64](int96_to_nanos(vals.value_span(vi))), 8
+        )
         return
 
     var w = out.type.fixed_width()
     if w == 0:
         raise Error(
-            String("parquet.convert: cannot append a value of type ", String(out.type))
+            String(
+                "parquet.convert: cannot append a value of type ",
+                String(out.type),
+            )
         )
     var src = vals.value_span(vi)
     if len(src) == w:

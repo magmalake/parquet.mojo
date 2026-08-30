@@ -391,7 +391,7 @@ struct ArrayData(Copyable, Movable):
         return bit_get(Span(self.validity), i)
 
 
-struct ArrayArena(Copyable, Movable, Defaultable):
+struct ArrayArena(Copyable, Defaultable, Movable):
     """Owns every `ArrayData` of a batch; children are referenced by index."""
 
     var nodes: List[ArrayData]

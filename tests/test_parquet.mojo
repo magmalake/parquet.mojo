@@ -81,7 +81,13 @@ from parquet.encoding import (
     gather,
 )
 from parquet.schema import REP_OPTIONAL, REP_REPEATED, REP_REQUIRED
-from std.testing import TestSuite, assert_equal, assert_false, assert_raises, assert_true
+from std.testing import (
+    TestSuite,
+    assert_equal,
+    assert_false,
+    assert_raises,
+    assert_true,
+)
 from thrift import (
     CompressionCodec,
     ConvertedType,
@@ -131,7 +137,9 @@ def test_unsupported_codec_says_so() raises:
 def test_batching_is_invariant() raises:
     var sizes: List[Int] = [1, 3, 64, 997]
     for bs in sizes:
-        var n = check_fixture[DefaultCodecs](String("v2pages"), List[String](), bs)
+        var n = check_fixture[DefaultCodecs](
+            String("v2pages"), List[String](), bs
+        )
         assert_true(n > 2000, String("batch size ", bs))
     _ = check_fixture[DefaultCodecs](String("nested"), List[String](), 1)
     _ = check_fixture[DefaultCodecs](String("big"), List[String](), 12500)
@@ -150,12 +158,16 @@ def test_iceberg_data_files() raises:
 
 
 def test_iceberg_field_ids() raises:
-    var r = ParquetReader.open(String(FIXTURES, "iceberg/unpartitioned.parquet"))
+    var r = ParquetReader.open(
+        String(FIXTURES, "iceberg/unpartitioned.parquet")
+    )
     # parquet-rs names the root element `arrow_schema`, and every column has an
     # Iceberg field id.
     for i in range(len(r.schema.leaves)):
         assert_equal(
-            r.schema.leaves[i].field_id, Int32(i + 1), String("leaf ", i, " field id")
+            r.schema.leaves[i].field_id,
+            Int32(i + 1),
+            String("leaf ", i, " field id"),
         )
     r.select_field_ids([Int32(2), Int32(1)])
     var t = r.read_table()
@@ -172,7 +184,9 @@ def test_iceberg_field_ids() raises:
         assert_true(v)
 
     # A position-delete file uses the reserved field ids.
-    var d = ParquetReader.open(String(FIXTURES, "iceberg/position_deletes.parquet"))
+    var d = ParquetReader.open(
+        String(FIXTURES, "iceberg/position_deletes.parquet")
+    )
     assert_true(d.schema.field_by_id(2147483546) >= 0)
     assert_true(d.schema.field_by_id(2147483545) >= 0)
     d.select_field_ids([Int32(2147483545)])
@@ -228,13 +242,25 @@ def test_logical_types_map_to_arrow() raises:
         var fi = r.schema.field_by_name(want[i])
         assert_true(fi >= 0, want[i])
         assert_equal(r.schema.fields[fi].type.id, ids[i], want[i])
-    assert_equal(r.schema.fields[r.schema.field_by_name("dec_flba")].type.precision, 29)
-    assert_equal(r.schema.fields[r.schema.field_by_name("dec_flba")].type.scale, 2)
-    assert_equal(r.schema.fields[r.schema.field_by_name("ts_ns_utc")].type.unit, TU_NANO)
-    assert_equal(r.schema.fields[r.schema.field_by_name("ts_ns_utc")].type.tz, "UTC")
+    assert_equal(
+        r.schema.fields[r.schema.field_by_name("dec_flba")].type.precision, 29
+    )
+    assert_equal(
+        r.schema.fields[r.schema.field_by_name("dec_flba")].type.scale, 2
+    )
+    assert_equal(
+        r.schema.fields[r.schema.field_by_name("ts_ns_utc")].type.unit, TU_NANO
+    )
+    assert_equal(
+        r.schema.fields[r.schema.field_by_name("ts_ns_utc")].type.tz, "UTC"
+    )
     assert_equal(r.schema.fields[r.schema.field_by_name("ts_ns")].type.tz, "")
-    assert_equal(r.schema.fields[r.schema.field_by_name("time_ms")].type.unit, TU_MILLI)
-    assert_equal(r.schema.fields[r.schema.field_by_name("time_us")].type.unit, TU_MICRO)
+    assert_equal(
+        r.schema.fields[r.schema.field_by_name("time_ms")].type.unit, TU_MILLI
+    )
+    assert_equal(
+        r.schema.fields[r.schema.field_by_name("time_us")].type.unit, TU_MICRO
+    )
 
 
 def test_integer_widths_and_signs() raises:
@@ -274,7 +300,9 @@ def test_extension_types() raises:
     assert_equal(j.type.id, AT_UTF8)
     assert_equal(j.type.extension, "arrow.json")
     var h = _reader("float16")
-    assert_equal(h.schema.fields[h.schema.field_by_name("h")].type.id, AT_FLOAT16)
+    assert_equal(
+        h.schema.fields[h.schema.field_by_name("h")].type.id, AT_FLOAT16
+    )
 
 
 def test_int96_is_a_nanosecond_timestamp() raises:
@@ -426,7 +454,9 @@ def test_two_level_lists_backward_compatibility() raises:
     e3.append(_group(String("li_tuple"), REP_REPEATED, 1, False))
     e3.append(_leaf(String("x"), REP_REQUIRED, Type.INT32.value))
     var s3 = build_schema(e3)
-    assert_equal(s3.fields[s3.fields[s3.roots[0]].children[0]].type.id, AT_STRUCT)
+    assert_equal(
+        s3.fields[s3.fields[s3.roots[0]].children[0]].type.id, AT_STRUCT
+    )
 
     # A three-level list keeps the grandchild as the element.
     var e4 = List[SchemaElement]()
@@ -548,7 +578,9 @@ def test_statistics_pruning() raises:
     assert_equal(k[0][0], 600)
 
     var r2 = _reader("prune")
-    var eq: List[Predicate] = [Predicate(String("k"), OP_EQ, ScalarValue.of_int(42))]
+    var eq: List[Predicate] = [
+        Predicate(String("k"), OP_EQ, ScalarValue.of_int(42))
+    ]
     assert_equal(r2.prune_row_groups(eq), 1)
 
     var r3 = _reader("prune")
@@ -616,7 +648,9 @@ def test_page_pruning() raises:
         Predicate(String("s"), OP_EQ, ScalarValue.of_string("v00777"))
     ]
     var left6 = r6.prune_pages(sp)
-    assert_true(left6 > 0 and left6 < 2000, String("string pruning left ", left6))
+    assert_true(
+        left6 > 0 and left6 < 2000, String("string pruning left ", left6)
+    )
     var t6 = r6.read_table()
     var ss = t6.column_str(1)
     var hit = False
@@ -713,7 +747,8 @@ def test_statistics_match_pyarrow() raises:
                 if omin < 0 or doc.is_null(omin):
                     continue
                 assert_true(
-                    st.has_min_max, String(name, " leaf ", li, " rg ", g, ": bounds")
+                    st.has_min_max,
+                    String(name, " leaf ", li, " rg ", g, ": bounds"),
                 )
                 assert_equal(
                     _stat_text(r, li, st.min),
@@ -729,7 +764,9 @@ def test_statistics_match_pyarrow() raises:
     assert_true(checked > 100, String("only ", checked, " statistics checked"))
 
 
-def _stat_text(r: ParquetReader[DefaultCodecs], leaf: Int, v: ScalarValue) raises -> String:
+def _stat_text(
+    r: ParquetReader[DefaultCodecs], leaf: Int, v: ScalarValue
+) raises -> String:
     """Render a decoded statistic the way `tools/oracle_pyarrow.py` does."""
     ref lc = r.schema.leaves[leaf]
     if v.kind == SV_FLOAT:
@@ -818,7 +855,10 @@ def test_bloom_filter() raises:
             for i in range(500):
                 if not f.might_contain_string(String("absent-", i)):
                     misses += 1
-            assert_true(misses > 400, String("only ", misses, "/500 absent keys ruled out"))
+            assert_true(
+                misses > 400,
+                String("only ", misses, "/500 absent keys ruled out"),
+            )
         elif r.schema.leaves[c].dotted() == "i":
             for i in range(200):
                 assert_true(f.might_contain_i64(Int64(i) * 3))
@@ -832,7 +872,11 @@ def test_bloom_filter() raises:
     var r2 = _reader("nostats")
     var d2 = fixture_bytes("nostats")
     assert_false(
-        Bool(read_bloom_filter(Span(d2), r2.meta.row_groups[0].columns[0].meta_data.value()))
+        Bool(
+            read_bloom_filter(
+                Span(d2), r2.meta.row_groups[0].columns[0].meta_data.value()
+            )
+        )
     )
 
 
@@ -1105,7 +1149,9 @@ def test_corrupt_page_is_caught() raises:
     # pageindex.parquet is written with page checksums.
     var data = fixture_bytes("pageindex")
     var r = ParquetReader(data.copy())
-    var start = Int(r.meta.row_groups[0].columns[0].meta_data.value().data_page_offset)
+    var start = Int(
+        r.meta.row_groups[0].columns[0].meta_data.value().data_page_offset
+    )
     var broken = data.copy()
     broken[start + 12] = broken[start + 12] ^ 0xFF
     var r2 = ParquetReader(broken^)
@@ -1144,7 +1190,9 @@ def test_hostile_page_headers() raises:
             _ = rr.read_table()
         except:
             raised += 1
-    assert_true(raised >= 6, String("only ", raised, "/11 header corruptions raised"))
+    assert_true(
+        raised >= 6, String("only ", raised, "/11 header corruptions raised")
+    )
 
 
 def test_level_overflow_is_caught() raises:
@@ -1202,7 +1250,9 @@ def test_write_round_trip_iceberg() raises:
             w.write_batch(b.arena, b.roots)
         var bytes = w^.finish()
         var back = ParquetReader(bytes^)
-        var doc = load_oracle(String(FIXTURES, "iceberg/", f, ".parquet.oracle.json"))
+        var doc = load_oracle(
+            String(FIXTURES, "iceberg/", f, ".parquet.oracle.json")
+        )
         total += check_table(doc, back.read_table(), f, List[String]())
         for i in range(len(r.schema.leaves)):
             assert_equal(
@@ -1215,7 +1265,9 @@ def test_write_round_trip_iceberg() raises:
                 r.schema.leaves[i].max_def,
                 String(f, " leaf ", i, " max_def"),
             )
-    assert_true(total > 60, String("only ", total, " Iceberg values round-tripped"))
+    assert_true(
+        total > 60, String("only ", total, " Iceberg values round-tripped")
+    )
 
 
 def test_write_round_trip_options() raises:
@@ -1278,7 +1330,9 @@ def test_written_metadata() raises:
     assert_equal(kv[0][0], "k")
     assert_equal(kv[0][1], "v")
     # Field ids survive the round trip, on nested fields too.
-    assert_equal(back.schema.fields[back.schema.field_by_name("id")].field_id, 1)
+    assert_equal(
+        back.schema.fields[back.schema.field_by_name("id")].field_id, 1
+    )
     assert_true(back.schema.field_by_id(5) >= 0)
     # …as do split offsets, statistics and the page index.
     assert_equal(len(back.split_offsets()), 3)

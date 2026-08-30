@@ -57,7 +57,7 @@ comptime REP_OPTIONAL = 1
 comptime REP_REPEATED = 2
 
 
-struct SchemaNode(Copyable, Movable, Defaultable):
+struct SchemaNode(Copyable, Defaultable, Movable):
     """One node of the Parquet schema tree."""
 
     var name: String
@@ -115,7 +115,7 @@ struct SchemaNode(Copyable, Movable, Defaultable):
         self.field_id = move.field_id
 
 
-struct LeafColumn(Copyable, Movable, Defaultable):
+struct LeafColumn(Copyable, Defaultable, Movable):
     """A column that holds data — one column chunk per row group."""
 
     var node: Int
@@ -179,7 +179,7 @@ struct LeafColumn(Copyable, Movable, Defaultable):
         return out^
 
 
-struct ArrowField(Copyable, Movable, Defaultable):
+struct ArrowField(Copyable, Defaultable, Movable):
     """One node of the Arrow field tree derived from the Parquet schema."""
 
     var name: String
@@ -335,17 +335,25 @@ def arrow_type_of(el: SchemaElement) raises -> ArrowType:
         is_decimal = True
     elif conv == ConvertedType.DATE.value:
         is_date = True
-    elif conv == ConvertedType.TIME_MILLIS.value or conv == ConvertedType.TIME_MICROS.value:
+    elif (
+        conv == ConvertedType.TIME_MILLIS.value
+        or conv == ConvertedType.TIME_MICROS.value
+    ):
         is_time = True
     elif (
         conv == ConvertedType.TIMESTAMP_MILLIS.value
         or conv == ConvertedType.TIMESTAMP_MICROS.value
     ):
         is_timestamp = True
-    elif conv >= ConvertedType.UINT_8.value and conv <= ConvertedType.UINT_64.value:
+    elif (
+        conv >= ConvertedType.UINT_8.value
+        and conv <= ConvertedType.UINT_64.value
+    ):
         int_signed = False
         int_bits = 8 << Int(conv - ConvertedType.UINT_8.value)
-    elif conv >= ConvertedType.INT_8.value and conv <= ConvertedType.INT_64.value:
+    elif (
+        conv >= ConvertedType.INT_8.value and conv <= ConvertedType.INT_64.value
+    ):
         int_signed = True
         int_bits = 8 << Int(conv - ConvertedType.INT_8.value)
 
@@ -426,7 +434,7 @@ def arrow_type_of(el: SchemaElement) raises -> ArrowType:
     raise Error(String("parquet.schema: unknown physical type ", phys))
 
 
-struct ParquetSchema(Copyable, Movable, Defaultable):
+struct ParquetSchema(Copyable, Defaultable, Movable):
     """The schema tree, its leaves, and the Arrow fields they add up to."""
 
     var nodes: List[SchemaNode]
@@ -488,7 +496,8 @@ def _build_node(
     mut pos: Int,
     parent: Int,
 ) raises -> Int:
-    """Consume one `SchemaElement` and its whole subtree; return its node index."""
+    """Consume one `SchemaElement` and its whole subtree; return its node index.
+    """
     if pos >= len(elements):
         raise Error("parquet.schema: schema list ends inside a group")
     var idx = pos
@@ -545,19 +554,25 @@ def _collect_leaves(
         _collect_leaves(s, elements, c)
 
 
-def _is_list_group(s: ParquetSchema, elements: List[SchemaElement], n: Int) -> Bool:
+def _is_list_group(
+    s: ParquetSchema, elements: List[SchemaElement], n: Int
+) -> Bool:
     ref el = elements[s.nodes[n].elem]
     if el.logicalType and Bool(el.logicalType.value().LIST):
         return True
     return _converted_of(el) == ConvertedType.LIST.value
 
 
-def _is_map_group(s: ParquetSchema, elements: List[SchemaElement], n: Int) -> Bool:
+def _is_map_group(
+    s: ParquetSchema, elements: List[SchemaElement], n: Int
+) -> Bool:
     ref el = elements[s.nodes[n].elem]
     if el.logicalType and Bool(el.logicalType.value().MAP):
         return True
     var c = _converted_of(el)
-    return c == ConvertedType.MAP.value or c == ConvertedType.MAP_KEY_VALUE.value
+    return (
+        c == ConvertedType.MAP.value or c == ConvertedType.MAP_KEY_VALUE.value
+    )
 
 
 def _make_field(
@@ -638,7 +653,9 @@ def _make_field(
                 two_level = True
             elif rep_kids != 1:
                 two_level = True
-            elif rep_name == "array" or rep_name == String(s.nodes[n].name, "_tuple"):
+            elif rep_name == "array" or rep_name == String(
+                s.nodes[n].name, "_tuple"
+            ):
                 two_level = True
         var elem_index: Int
         if is_map:
@@ -647,7 +664,9 @@ def _make_field(
             elem_index = _make_field(s, elements, rn, String("element"), True)
         else:
             var gn = s.nodes[rn].children[0]
-            elem_index = _make_field(s, elements, gn, s.nodes[gn].name.copy(), False)
+            elem_index = _make_field(
+                s, elements, gn, s.nodes[gn].name.copy(), False
+            )
         f.type = at(AT_MAP if is_map else AT_LIST)
         f.nullable = rep == REP_OPTIONAL
         f.elem_def_level = rep_def
@@ -710,5 +729,7 @@ def build_schema(elements: List[SchemaElement]) raises -> ParquetSchema:
     for c in top:
         _collect_leaves(s, elements, c)
     for c in top:
-        s.roots.append(_make_field(s, elements, c, s.nodes[c].name.copy(), False))
+        s.roots.append(
+            _make_field(s, elements, c, s.nodes[c].name.copy(), False)
+        )
     return s^

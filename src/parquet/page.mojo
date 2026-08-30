@@ -18,7 +18,13 @@ doctored file raises instead of reading past the end of the buffer.
 from std.memory import bitcast
 
 from hashes import crc32
-from parquet.bitio import HybridDecoder, bit_width, unpack_msb
+from parquet.bitio import (
+    HybridDecoder,
+    bit_width,
+    decode_levels_into,
+    levels_all_equal,
+    unpack_msb,
+)
 from parquet.codec import CodecSet
 from parquet.encoding import (
     PK_BOOL,
@@ -48,7 +54,7 @@ from thrift import (
 )
 
 
-struct ColumnData(Copyable, Movable, Defaultable):
+struct ColumnData(Copyable, Defaultable, Movable):
     """One decoded column chunk: levels and non-null values."""
 
     var defs: List[UInt16]
@@ -56,24 +62,40 @@ struct ColumnData(Copyable, Movable, Defaultable):
     var values: PhysBuffer
     var num_slots: Int
     """Level slots — the number of values including nulls."""
+    var all_present: Bool
+    """Every slot is at the leaf's maximum definition level, so `defs` was
+    never materialised. This is the usual case — a column with no nulls — and
+    skipping the per-slot level array is worth a great deal on a wide read."""
 
     def __init__(out self):
         self.defs = List[UInt16]()
         self.reps = List[UInt16]()
         self.values = PhysBuffer()
         self.num_slots = 0
+        self.all_present = True
 
     def __init__(out self, *, copy: Self):
         self.defs = copy.defs.copy()
         self.reps = copy.reps.copy()
         self.values = copy.values.copy()
         self.num_slots = copy.num_slots
+        self.all_present = copy.all_present
 
     def __init__(out self, *, deinit move: Self):
         self.defs = move.defs^
         self.reps = move.reps^
         self.values = move.values^
         self.num_slots = move.num_slots
+        self.all_present = move.all_present
+
+    @always_inline
+    def def_at(self, i: Int, max_def: Int) -> Int:
+        """The definition level of slot `i`."""
+        return max_def if self.all_present else Int(self.defs[i])
+
+    @always_inline
+    def rep_at(self, i: Int) -> Int:
+        return Int(self.reps[i]) if len(self.reps) else 0
 
 
 def _read_levels(
@@ -147,6 +169,104 @@ def _read_levels(
             )
         out.append(UInt16(v))
     return start + length
+
+
+def _materialise_defs(mut out: ColumnData, max_def: Int):
+    """Back-fill the definition levels of the slots decoded so far.
+
+    Pages whose levels are all `max_def` do not write anything into
+    `out.defs`; the first page that actually has a null has to pay for the
+    slots that were skipped.
+    """
+    if len(out.defs) == 0 and out.num_slots > 0:
+        out.defs.resize(out.num_slots, UInt16(max_def))
+
+
+def _take_defs(
+    data: Span[UInt8, _],
+    pos: Int,
+    encoding: Int32,
+    max_def: Int,
+    count: Int,
+    length_prefixed: Bool,
+    explicit_length: Int,
+    mut out: ColumnData,
+) raises -> Tuple[Int, Int]:
+    """Read one page's definition levels; return the offset past them and the
+    number of non-null values.
+
+    A page whose levels are all `max_def` — the overwhelmingly common case —
+    is recognised from its run headers alone and never materialised.
+    """
+    var width = bit_width(max_def)
+    if encoding == Encoding.BIT_PACKED.value:
+        _materialise_defs(out, max_def)
+        var before = len(out.defs)
+        var end = _read_levels(
+            data,
+            pos,
+            encoding,
+            max_def,
+            count,
+            length_prefixed,
+            explicit_length,
+            out.defs,
+        )
+        _ = width
+        var nn = 0
+        for i in range(before, len(out.defs)):
+            if Int(out.defs[i]) > max_def:
+                raise Error(
+                    String(
+                        "parquet.page: level ",
+                        out.defs[i],
+                        " exceeds the column maximum of ",
+                        max_def,
+                    )
+                )
+            if Int(out.defs[i]) == max_def:
+                nn += 1
+        return (end, nn)
+    if encoding != Encoding.RLE.value:
+        raise Error(
+            String(
+                "parquet.page: level encoding ",
+                Encoding(encoding).name(),
+                " is not RLE or BIT_PACKED",
+            )
+        )
+    var start = pos
+    var length = explicit_length
+    if length_prefixed:
+        if pos + 4 > len(data):
+            raise Error("parquet.page: truncated level length prefix")
+        length = (
+            Int(data[pos])
+            | (Int(data[pos + 1]) << 8)
+            | (Int(data[pos + 2]) << 16)
+            | (Int(data[pos + 3]) << 24)
+        )
+        start = pos + 4
+    if length < 0 or start + length > len(data):
+        raise Error(
+            String(
+                "parquet.page: level block of ",
+                length,
+                " byte(s) at ",
+                start,
+                " runs past the ",
+                len(data),
+                "-byte page",
+            )
+        )
+    var block = data[start : start + length]
+    if levels_all_equal(block, width, count, max_def):
+        if len(out.defs) > 0:
+            out.defs.resize(len(out.defs) + count, UInt16(max_def))
+        return (start + length, count)
+    _materialise_defs(out, max_def)
+    var nn = decode_levels_into(block, width, count, max_def, out.defs)
+    return (start + length, nn)
 
 
 def _decode_values(
@@ -232,7 +352,8 @@ def _decode_values(
 
 
 def chunk_start(cm: ColumnMetaData) -> Int:
-    """Where a column chunk's pages begin — the dictionary page if it has one."""
+    """Where a column chunk's pages begin — the dictionary page if it has one.
+    """
     if cm.dictionary_page_offset:
         var d = Int(cm.dictionary_page_offset.value())
         if d > 0 and d < Int(cm.data_page_offset):
@@ -240,7 +361,9 @@ def chunk_start(cm: ColumnMetaData) -> Int:
     return Int(cm.data_page_offset)
 
 
-def read_column_chunk[Codecs: CodecSet](
+def read_column_chunk[
+    Codecs: CodecSet
+](
     file: Span[UInt8, _],
     cm: ColumnMetaData,
     leaf: LeafColumn,
@@ -248,7 +371,10 @@ def read_column_chunk[Codecs: CodecSet](
 ) raises -> ColumnData:
     """Decode every page of one column chunk."""
     var out = ColumnData()
-    out.values = PhysBuffer(physical_kind(leaf.physical), physical_width(leaf.physical, leaf.type_length))
+    out.values = PhysBuffer(
+        physical_kind(leaf.physical),
+        physical_width(leaf.physical, leaf.type_length),
+    )
     var offset = chunk_start(cm)
     var limit = offset + Int(cm.total_compressed_size)
     if offset < 0 or limit > len(file):
@@ -334,7 +460,6 @@ def read_column_chunk[Codecs: CodecSet](
             var raw = Codecs.decompress(codec, body, usize)
             var buf = Span(raw)
             var pos = 0
-            var before = len(out.defs)
             if leaf.max_rep > 0:
                 pos = _read_levels(
                     buf,
@@ -346,8 +471,9 @@ def read_column_chunk[Codecs: CodecSet](
                     0,
                     out.reps,
                 )
+            var non_null = n
             if leaf.max_def > 0:
-                pos = _read_levels(
+                var got = _take_defs(
                     buf,
                     pos,
                     h.value().definition_level_encoding.value,
@@ -355,19 +481,17 @@ def read_column_chunk[Codecs: CodecSet](
                     n,
                     True,
                     0,
-                    out.defs,
+                    out,
                 )
-            else:
-                for _ in range(n):
-                    out.defs.append(0)
-            var non_null = n
-            if leaf.max_def > 0:
-                non_null = 0
-                for i in range(before, len(out.defs)):
-                    if Int(out.defs[i]) == leaf.max_def:
-                        non_null += 1
+                pos = got[0]
+                non_null = got[1]
             var vals = _decode_values(
-                h.value().encoding.value, leaf, buf[pos:], non_null, dict, has_dict
+                h.value().encoding.value,
+                leaf,
+                buf[pos:],
+                non_null,
+                dict,
+                has_dict,
             )
             out.values.extend(vals)
             out.num_slots += n
@@ -406,7 +530,7 @@ def read_column_chunk[Codecs: CodecSet](
                     out.reps,
                 )
             if leaf.max_def > 0:
-                _ = _read_levels(
+                _ = _take_defs(
                     body[rep_len : rep_len + def_len],
                     0,
                     Encoding.RLE.value,
@@ -414,11 +538,8 @@ def read_column_chunk[Codecs: CodecSet](
                     n,
                     False,
                     def_len,
-                    out.defs,
+                    out,
                 )
-            else:
-                for _ in range(n):
-                    out.defs.append(0)
             var vbytes = body[rep_len + def_len :]
             var compressed = h.value().is_compressed.or_else(True)
             var non_null = n - nulls
@@ -447,15 +568,18 @@ def read_column_chunk[Codecs: CodecSet](
                 out.values.extend(vals)
             else:
                 var vals = _decode_values(
-                    h.value().encoding.value, leaf, vbytes, non_null, dict, has_dict
+                    h.value().encoding.value,
+                    leaf,
+                    vbytes,
+                    non_null,
+                    dict,
+                    has_dict,
                 )
                 out.values.extend(vals)
             out.num_slots += n
             continue
 
-        raise Error(
-            String("parquet.page: unknown page type ", ph.type_.name())
-        )
+        raise Error(String("parquet.page: unknown page type ", ph.type_.name()))
 
     if out.num_slots != want:
         raise Error(
@@ -470,4 +594,5 @@ def read_column_chunk[Codecs: CodecSet](
         )
     if leaf.max_rep == 0:
         out.reps.clear()
+    out.all_present = len(out.defs) == 0
     return out^

@@ -1,7 +1,7 @@
 """Encoders for the two bit-level formats a Parquet writer needs."""
 
 
-struct BitPacker(Copyable, Movable, Defaultable):
+struct BitPacker(Copyable, Defaultable, Movable):
     """Packs values of a fixed bit width, least-significant bit first."""
 
     var out: List[UInt8]

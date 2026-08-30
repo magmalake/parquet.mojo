@@ -2,7 +2,8 @@
 
 
 def core_fixtures() -> List[String]:
-    """Every fixture the default codec set (uncompressed / snappy / gzip) reads."""
+    """Every fixture the default codec set (uncompressed / snappy / gzip) reads.
+    """
     return [
         String("primitives"),
         String("logical"),

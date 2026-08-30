@@ -72,17 +72,17 @@ def print_schema_tree(s: ParquetSchema, root: Int, depth: Int) raises:
 
 def cmd_schema(mut r: ParquetReader, as_json: Bool) raises:
     if as_json:
-        var out = String("{\"num_rows\":", r.num_rows(), ",\"columns\":[")
+        var out = String('{"num_rows":', r.num_rows(), ',"columns":[')
         for i in range(len(r.schema.roots)):
             if i:
                 out += ","
             ref f = r.schema.fields[r.schema.roots[i]]
             out += String(
-                "{\"name\":",
+                '{"name":',
                 json_escape(f.name),
-                ",\"type\":",
+                ',"type":',
                 json_escape(String(f.type)),
-                ",\"field_id\":",
+                ',"field_id":',
                 f.field_id,
                 "}",
             )
@@ -118,13 +118,13 @@ def cmd_schema(mut r: ParquetReader, as_json: Bool) raises:
 def cmd_meta(mut r: ParquetReader, as_json: Bool) raises:
     if as_json:
         var out = String(
-            "{\"num_rows\":",
+            '{"num_rows":',
             r.num_rows(),
-            ",\"num_row_groups\":",
+            ',"num_row_groups":',
             r.num_row_groups(),
-            ",\"created_by\":",
+            ',"created_by":',
             json_escape(r.created_by()),
-            ",\"split_offsets\":[",
+            ',"split_offsets":[',
         )
         var so = r.split_offsets()
         for i in range(len(so)):

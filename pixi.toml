@@ -17,6 +17,7 @@ test = { cmd = "mkdir -p build && mojo build tests/test_parquet.mojo -I src -I t
 check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-mojo" }
 bench = { cmd = "mkdir -p build && mojo build bench/bench_parquet.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-bench && ./build/parquet-bench" }
+profile = { cmd = "mkdir -p build && mojo build bench/profile_parquet.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-profile && ./build/parquet-profile" }
 fmt = { cmd = "mojo format src tests bench" }
 format-check = { cmd = "mojo format --check src tests bench" }
 # Regenerate tests/fixtures/*.parquet and their pyarrow oracles (needs `uv`).

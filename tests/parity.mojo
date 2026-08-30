@@ -67,12 +67,16 @@ def check_table(
                 continue
         var ci = _column_index(t, cname)
         if ci < 0:
-            raise Error(String(name, ": we did not decode column '", cname, "'"))
+            raise Error(
+                String(name, ": we did not decode column '", cname, "'")
+            )
 
         var values = doc.get(oc, "values")
         var explicit = doc.as_bool(doc.get(oc, "explicit"))
         var n_expect = Int(doc.as_int(doc.get(oc, "num_values")))
-        assert_equal(n_expect, t.num_rows, String(name, ".", cname, ": value count"))
+        assert_equal(
+            n_expect, t.num_rows, String(name, ".", cname, ": value count")
+        )
 
         # Every value the oracle spells out, one by one.
         var row = 0
@@ -106,9 +110,7 @@ def check_table(
         var want: UInt32 = 0
         for k in range(want_hex.byte_length()):
             var ch = want_hex.as_bytes()[k]
-            var d = (
-                Int(ch) - 48 if ch <= 57 else Int(ch) - 87
-            )
+            var d = Int(ch) - 48 if ch <= 57 else Int(ch) - 87
             want = (want << 4) | UInt32(d)
         assert_equal(
             got,

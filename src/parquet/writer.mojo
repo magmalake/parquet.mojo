@@ -123,7 +123,7 @@ comptime WN_STRUCT = 3
 comptime CREATED_BY = "parquet.mojo version 0.1.0"
 
 
-struct WriterOptions(Copyable, Movable, Defaultable):
+struct WriterOptions(Copyable, Defaultable, Movable):
     """How to write. Every field has a sensible default."""
 
     var codec: Int32
@@ -163,7 +163,7 @@ struct WriterOptions(Copyable, Movable, Defaultable):
         self.created_by = move.created_by^
 
 
-struct WNode(Copyable, Movable, Defaultable):
+struct WNode(Copyable, Defaultable, Movable):
     """One node of the tree the writer walks, mirroring the Arrow field tree."""
 
     var name: String
@@ -218,7 +218,7 @@ struct WNode(Copyable, Movable, Defaultable):
         self.leaf = move.leaf
 
 
-struct WLeaf(Copyable, Movable, Defaultable):
+struct WLeaf(Copyable, Defaultable, Movable):
     """A column the writer will produce chunks for."""
 
     var path: List[String]
@@ -321,7 +321,8 @@ def annotate(mut el: SchemaElement, t: ArrowType) raises:
         it.isSigned = True
         lt.INTEGER = it^
         el.converted_type = ConvertedType(
-            ConvertedType.INT_8.value + Int32(0 if bits == 8 else (1 if bits == 16 else 2))
+            ConvertedType.INT_8.value
+            + Int32(0 if bits == 8 else (1 if bits == 16 else 2))
         )
     elif i == AT_UINT8 or i == AT_UINT16 or i == AT_UINT32 or i == AT_UINT64:
         var bits = 8 * t.fixed_width()
@@ -329,8 +330,12 @@ def annotate(mut el: SchemaElement, t: ArrowType) raises:
         it.bitWidth = Int8(bits)
         it.isSigned = False
         lt.INTEGER = it^
-        var step = 0 if bits == 8 else (1 if bits == 16 else (2 if bits == 32 else 3))
-        el.converted_type = ConvertedType(ConvertedType.UINT_8.value + Int32(step))
+        var step = 0 if bits == 8 else (
+            1 if bits == 16 else (2 if bits == 32 else 3)
+        )
+        el.converted_type = ConvertedType(
+            ConvertedType.UINT_8.value + Int32(step)
+        )
     elif i == AT_UTF8 or i == AT_LARGE_UTF8:
         if t.extension == "arrow.json":
             lt.JSON = JsonType()
@@ -377,7 +382,7 @@ def annotate(mut el: SchemaElement, t: ArrowType) raises:
     el.logicalType = lt^
 
 
-struct WriteSchema(Copyable, Movable, Defaultable):
+struct WriteSchema(Copyable, Defaultable, Movable):
     """The writer's mirror of the Arrow field tree, plus the Parquet schema."""
 
     var nodes: List[WNode]
@@ -426,7 +431,8 @@ def _build_node(
     parent_rep: Int,
     mut path: List[String],
 ) raises -> Int:
-    """Build the writer node for one Arrow array, appending its schema elements."""
+    """Build the writer node for one Arrow array, appending its schema elements.
+    """
     ref a = arena.nodes[node]
     var w = WNode()
     w.name = name.copy()
@@ -435,7 +441,9 @@ def _build_node(
     w.field_id = a.field_id
     w.def_level = parent_def + (1 if a.nullable else 0)
     w.rep_level = parent_rep
-    var rep = FieldRepetitionType.OPTIONAL.value if a.nullable else FieldRepetitionType.REQUIRED.value
+    var rep = (
+        FieldRepetitionType.OPTIONAL.value if a.nullable else FieldRepetitionType.REQUIRED.value
+    )
     var id = a.type.id
 
     if id == AT_STRUCT:
@@ -446,7 +454,13 @@ def _build_node(
         path.append(s.elements[len(s.elements) - 1].name.copy())
         for c in a.children:
             var kid = _build_node(
-                s, arena, c, arena.nodes[c].name.copy(), w_def(s, me), parent_rep, path
+                s,
+                arena,
+                c,
+                arena.nodes[c].name.copy(),
+                w_def(s, me),
+                parent_rep,
+                path,
             )
             s.nodes[me].children.append(kid)
         _ = path.pop()
@@ -476,7 +490,12 @@ def _build_node(
         if is_map:
             n_inner = len(arena.nodes[child].children)
         s.elements.append(
-            _elem(inner_name.copy(), FieldRepetitionType.REPEATED.value, n_inner, -1)
+            _elem(
+                inner_name.copy(),
+                FieldRepetitionType.REPEATED.value,
+                n_inner,
+                -1,
+            )
         )
         path.append(inner_name^)
         var edef = s.nodes[me].elem_def_level
@@ -489,7 +508,13 @@ def _build_node(
             for c in arena.nodes[entries].children:
                 kids.append(
                     _build_node(
-                        s, arena, c, arena.nodes[c].name.copy(), edef, erep, path
+                        s,
+                        arena,
+                        c,
+                        arena.nodes[c].name.copy(),
+                        edef,
+                        erep,
+                        path,
                     )
                 )
             var entry_node = WNode()
@@ -541,10 +566,16 @@ def w_def(s: WriteSchema, node: Int) -> Int:
     return s.nodes[node].def_level
 
 
-def build_write_schema(arena: ArrayArena, roots: List[Int]) raises -> WriteSchema:
+def build_write_schema(
+    arena: ArrayArena, roots: List[Int]
+) raises -> WriteSchema:
     """Derive the Parquet schema from the Arrow arrays that will be written."""
     var s = WriteSchema()
-    s.elements.append(_elem(String("schema"), FieldRepetitionType.REQUIRED.value, len(roots), -1))
+    s.elements.append(
+        _elem(
+            String("schema"), FieldRepetitionType.REQUIRED.value, len(roots), -1
+        )
+    )
     var path = List[String]()
     for r in roots:
         s.roots.append(
@@ -556,7 +587,7 @@ def build_write_schema(arena: ArrayArena, roots: List[Int]) raises -> WriteSchem
 # ── shredding: Arrow arrays back to levels and values ──────────────────────
 
 
-struct LeafBuffer(Copyable, Movable, Defaultable):
+struct LeafBuffer(Copyable, Defaultable, Movable):
     var defs: List[UInt16]
     var reps: List[UInt16]
     var values: PhysBuffer
@@ -614,7 +645,11 @@ def append_physical(
         out.count += 1
         return
     var w = a.type.fixed_width()
-    if leaf.physical == Type.FIXED_LEN_BYTE_ARRAY.value or leaf.physical == Type.FLOAT.value or leaf.physical == Type.DOUBLE.value:
+    if (
+        leaf.physical == Type.FIXED_LEN_BYTE_ARRAY.value
+        or leaf.physical == Type.FLOAT.value
+        or leaf.physical == Type.DOUBLE.value
+    ):
         out.bytes.extend(Span(a.values)[i * w : (i + 1) * w])
         out.count += 1
         return
@@ -669,7 +704,9 @@ def shred(
         return
     if kind == WN_STRUCT:
         for k in range(len(a.children)):
-            shred(s, s.nodes[w].children[k], arena, a.children[k], i, d, rep, cols)
+            shred(
+                s, s.nodes[w].children[k], arena, a.children[k], i, d, rep, cols
+            )
         return
     # A list or a map.
     var lo = Int(a.offsets[i])
@@ -697,7 +734,9 @@ def shred(
 # ── statistics ─────────────────────────────────────────────────────────────
 
 
-def _stat_less(leaf: WLeaf, a: Span[UInt8, _], b: Span[UInt8, _]) raises -> Bool:
+def _stat_less(
+    leaf: WLeaf, a: Span[UInt8, _], b: Span[UInt8, _]
+) raises -> Bool:
     """Is `a` below `b` in the sort order this column's type requires?"""
     var phys = leaf.physical
     var id = leaf.arrow.id
@@ -753,7 +792,8 @@ def _is_nan(leaf: WLeaf, v: Span[UInt8, _]) -> Bool:
 def min_max(
     leaf: WLeaf, values: PhysBuffer, start: Int, count: Int
 ) raises -> Tuple[List[UInt8], List[UInt8], Bool]:
-    """The bounds of `count` values from `start`, in this column's sort order."""
+    """The bounds of `count` values from `start`, in this column's sort order.
+    """
     var mn = List[UInt8]()
     var mx = List[UInt8]()
     if count == 0:
@@ -815,7 +855,7 @@ def _hash_bytes(v: Span[UInt8, _]) -> UInt64:
     return h
 
 
-struct DictBuilder(Movable, Defaultable):
+struct DictBuilder(Defaultable, Movable):
     var values: PhysBuffer
     var buckets: Dict[UInt64, List[Int]]
 
@@ -856,7 +896,8 @@ struct DictBuilder(Movable, Defaultable):
 
 
 struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
-    """Writes Arrow arrays out as Parquet. One `write_batch` per record batch."""
+    """Writes Arrow arrays out as Parquet. One `write_batch` per record batch.
+    """
 
     var options: WriterOptions
     var schema: WriteSchema
@@ -1003,7 +1044,9 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             for i in range(n_values):
                 raw.append(builder.index_of(buf.values.value_span(i)))
             dict = builder.values.copy()
-            if dict.count > 65535 or (dict.count * 2 > n_values and dict.count > 64):
+            if dict.count > 65535 or (
+                dict.count * 2 > n_values and dict.count > 64
+            ):
                 use_dict = False
             else:
                 for v in raw:
@@ -1082,7 +1125,13 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
                 body.append(UInt8(width))
                 body.extend(Span(encode_hybrid(page_idx, width)))
             else:
-                body.extend(Span(_plain_slice(leaf, buf.values, value_cursor, page_values)))
+                body.extend(
+                    Span(
+                        _plain_slice(
+                            leaf, buf.values, value_cursor, page_values
+                        )
+                    )
+                )
             value_cursor += page_values
             var compressed = Self.Codecs.compress(codec, Span(body))
             var ph = PageHeader()
@@ -1102,7 +1151,9 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             loc.compressed_page_size = Int32(header_len + len(compressed))
             loc.first_row_index = first_row
             oi.page_locations.append(loc^)
-            var bounds = min_max(leaf, buf.values, value_cursor - page_values, page_values)
+            var bounds = min_max(
+                leaf, buf.values, value_cursor - page_values, page_values
+            )
             ci.null_pages.append(not bounds[2])
             ci.min_values.append(bounds[0].copy())
             ci.max_values.append(bounds[1].copy())

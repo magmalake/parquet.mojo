@@ -67,9 +67,11 @@ def unsupported_codec(codec: Int32) -> Error:
         String(
             "parquet: page codec ",
             codec_name(codec),
-            " is not available — use parquet.ext_full.AllCodecs for ZSTD/LZ4"
-            " (needs -I ../zstd.mojo/src -I ../lz4.mojo/src); BROTLI is not"
-            " implemented",
+            (
+                " is not available — use parquet.ext_full.AllCodecs for"
+                " ZSTD/LZ4 (needs -I ../zstd.mojo/src -I ../lz4.mojo/src);"
+                " BROTLI is not implemented"
+            ),
         )
     )
 
@@ -109,9 +111,11 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
         if pos >= len(data):
             raise Error("parquet.gzip: gzip header runs past the page")
         return inflate(data[pos : len(data) - 8])
-    if len(data) >= 2 and (data[0] & 0x0F) == 8 and (
-        (UInt16(data[0]) * 256 + UInt16(data[1])) % 31
-    ) == 0:
+    if (
+        len(data) >= 2
+        and (data[0] & 0x0F) == 8
+        and ((UInt16(data[0]) * 256 + UInt16(data[1])) % 31) == 0
+    ):
         # RFC 1950 zlib wrapper: 2-byte header, 4-byte Adler-32 trailer.
         return inflate(data[2 : len(data) - 4])
     return inflate(data)

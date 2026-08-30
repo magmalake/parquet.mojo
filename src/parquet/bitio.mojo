@@ -87,7 +87,11 @@ struct BitReader[origin: ImmOrigin](Copyable, Movable):
 
 
 def unpack_lsb(
-    data: Span[UInt8, _], start_byte: Int, width: Int, count: Int, mut out: List[UInt64]
+    data: Span[UInt8, _],
+    start_byte: Int,
+    width: Int,
+    count: Int,
+    mut out: List[UInt64],
 ) raises -> Int:
     """Append `count` little-endian bit-packed values; return the end byte."""
     var need = (count * width + 7) // 8
@@ -115,8 +119,231 @@ def unpack_lsb(
     return start_byte + need
 
 
+@always_inline
+def _u64_at(data: Span[UInt8, _], byte: Int) -> UInt64:
+    """The 8 little-endian bytes at `byte`. The caller must have checked that
+    8 bytes are readable there."""
+    return (
+        data.unsafe_ptr()
+        .unsafe_offset(byte)
+        .bitcast[UInt64]()
+        .unsafe_load[alignment=1](0)
+    )
+
+
+@always_inline
+def _bits_slow(data: Span[UInt8, _], bitpos: Int, width: Int) -> UInt64:
+    """`width` bits at `bitpos`, byte at a time — the tail of a run, where a
+    64-bit window would read past the buffer."""
+    var out: UInt64 = 0
+    var got = 0
+    var at = bitpos
+    while got < width:
+        var byte = at >> 3
+        var off = at & 7
+        var avail = 8 - off
+        var take = width - got
+        if take > avail:
+            take = avail
+        var mask = (UInt64(1) << UInt64(take)) - 1
+        out |= ((UInt64(data[byte]) >> UInt64(off)) & mask) << UInt64(got)
+        got += take
+        at += take
+    return out
+
+
+def unpack_lsb_into[
+    dt: DType
+](
+    data: Span[UInt8, _],
+    start_byte: Int,
+    width: Int,
+    count: Int,
+    mut out: List[Scalar[dt]],
+    at: Int,
+) raises -> Int:
+    """Unpack `count` little-endian bit-packed values of `width` bits into
+    `out[at : at + count]`, which the caller has already sized. Returns the
+    byte just past the run.
+
+    The body of the run is read one *unaligned 64-bit window* per value —
+    a load, a shift and a mask — which is what makes bit-packed levels and
+    dictionary indices cheap. Only the last few values, whose window would
+    reach past the end of the buffer, take the byte-at-a-time path.
+    """
+    var need = (count * width + 7) // 8
+    if width < 0 or width > 57:
+        raise Error(String("parquet.bitio: bit width ", width, " unsupported"))
+    if start_byte < 0 or start_byte + need > len(data):
+        raise Error(
+            String(
+                "parquet.bitio: bit-packed run of ",
+                count,
+                " x ",
+                width,
+                " bits needs ",
+                need,
+                " byte(s) at ",
+                start_byte,
+                " but only ",
+                len(data) - start_byte,
+                " remain",
+            )
+        )
+    if at < 0 or at + count > len(out):
+        raise Error("parquet.bitio: unpack destination is too small")
+    if count == 0:
+        return start_byte + need
+    var dst = out.unsafe_ptr()
+    if width == 0:
+        for i in range(count):
+            dst.unsafe_store(at + i, Scalar[dt](0))
+        return start_byte + need
+    var mask = (UInt64(1) << UInt64(width)) - 1
+    var bitpos = start_byte * 8
+    # How many values keep their whole 64-bit window inside the buffer.
+    var fast = 0
+    var last_bit = (len(data) - 8) * 8
+    if last_bit >= bitpos:
+        fast = (last_bit - bitpos) // width + 1
+        if fast > count:
+            fast = count
+    for i in range(fast):
+        var v = (_u64_at(data, bitpos >> 3) >> UInt64(bitpos & 7)) & mask
+        dst.unsafe_store(at + i, v.cast[dt]())
+        bitpos += width
+    for i in range(fast, count):
+        dst.unsafe_store(at + i, _bits_slow(data, bitpos, width).cast[dt]())
+        bitpos += width
+    return start_byte + need
+
+
+def levels_all_equal(
+    data: Span[UInt8, _], width: Int, count: Int, value: Int
+) raises -> Bool:
+    """Is every one of the next `count` hybrid-encoded levels equal to `value`?
+
+    Only run *headers* are read, so this is O(runs), not O(values). A
+    bit-packed run answers `False` without being unpacked: a page whose levels
+    are all the maximum is written as RLE runs by every writer in the wild,
+    and that is the case worth the fast path.
+    """
+    if width == 0:
+        return value == 0
+    var pos = 0
+    var done = 0
+    var nbytes = (width + 7) // 8
+    while done < count:
+        if pos >= len(data):
+            return False
+        var head = read_uleb128(data, pos)
+        pos = head[1]
+        var indicator = head[0]
+        if (indicator & 1) == 1:
+            return False
+        var n = Int(indicator >> 1)
+        if n <= 0 or pos + nbytes > len(data):
+            return False
+        var v: UInt64 = 0
+        for k in range(nbytes):
+            v |= UInt64(data[pos + k]) << UInt64(8 * k)
+        pos += nbytes
+        if Int(v) != value:
+            return False
+        done += n
+    return True
+
+
+def decode_levels_into(
+    data: Span[UInt8, _],
+    width: Int,
+    count: Int,
+    max_level: Int,
+    mut out: List[UInt16],
+) raises -> Int:
+    """Append `count` hybrid-encoded levels to `out`; return how many of them
+    equal `max_level`.
+
+    Runs are handled whole: a repeated run is a fill, a bit-packed run is one
+    `unpack_lsb_into` call. Nothing goes through a per-value decoder.
+    """
+    var base = len(out)
+    out.resize(base + count, 0)
+    if count == 0:
+        return 0
+    var pos = 0
+    var done = 0
+    var non_null = 0
+    while done < count:
+        if pos >= len(data):
+            raise Error("parquet.rle: ran out of runs before all values")
+        var head = read_uleb128(data, pos)
+        pos = head[1]
+        var indicator = head[0]
+        if (indicator & 1) == 1:
+            var n = Int(indicator >> 1) * 8
+            if n <= 0:
+                raise Error(String("parquet.rle: bit-packed run of ", n))
+            if n > count - done:
+                n = count - done
+            pos = unpack_lsb_into[DType.uint16](
+                data, pos, width, n, out, base + done
+            )
+            var ptr = out.unsafe_ptr()
+            for i in range(base + done, base + done + n):
+                var v = Int(ptr.unsafe_load(i))
+                if v > max_level:
+                    raise Error(
+                        String(
+                            "parquet.page: level ",
+                            v,
+                            " exceeds the column maximum of ",
+                            max_level,
+                        )
+                    )
+                if v == max_level:
+                    non_null += 1
+            done += n
+        else:
+            var n = Int(indicator >> 1)
+            if n <= 0:
+                raise Error(String("parquet.rle: RLE run of ", n, " values"))
+            if n > count - done:
+                n = count - done
+            var nbytes = (width + 7) // 8
+            if pos + nbytes > len(data):
+                raise Error(
+                    String("parquet.rle: truncated RLE run value at ", pos)
+                )
+            var v: UInt64 = 0
+            for k in range(nbytes):
+                v |= UInt64(data[pos + k]) << UInt64(8 * k)
+            pos += nbytes
+            if Int(v) > max_level:
+                raise Error(
+                    String(
+                        "parquet.page: level ",
+                        v,
+                        " exceeds the column maximum of ",
+                        max_level,
+                    )
+                )
+            var lv = UInt16(v)
+            var ptr = out.unsafe_ptr()
+            for i in range(base + done, base + done + n):
+                ptr.unsafe_store(i, lv)
+            if Int(v) == max_level:
+                non_null += n
+            done += n
+    return non_null
+
+
 def unpack_msb(
-    data: Span[UInt8, _], start_byte: Int, width: Int, count: Int, mut out: List[UInt64]
+    data: Span[UInt8, _],
+    start_byte: Int,
+    width: Int,
+    count: Int,
+    mut out: List[UInt64],
 ) raises -> Int:
     """The legacy `BIT_PACKED` level encoding — most-significant bit first."""
     var need = (count * width + 7) // 8
@@ -252,20 +479,22 @@ struct HybridDecoder[origin: ImmOrigin](Copyable, Movable):
                     String("parquet.rle: bit-packed run of ", count, " values")
                 )
             self.buffer.clear()
-            self.pos = unpack_lsb(self.data, self.pos, self.width, count, self.buffer)
+            self.pos = unpack_lsb(
+                self.data, self.pos, self.width, count, self.buffer
+            )
             self.buf_pos = 0
             self.remaining = count
             self.is_packed = True
         else:
             var count = Int(indicator >> 1)
             if count <= 0:
-                raise Error(String("parquet.rle: RLE run of ", count, " values"))
+                raise Error(
+                    String("parquet.rle: RLE run of ", count, " values")
+                )
             var nbytes = (self.width + 7) // 8
             if self.pos + nbytes > len(self.data):
                 raise Error(
-                    String(
-                        "parquet.rle: truncated RLE run value at ", self.pos
-                    )
+                    String("parquet.rle: truncated RLE run value at ", self.pos)
                 )
             var v: UInt64 = 0
             for k in range(nbytes):

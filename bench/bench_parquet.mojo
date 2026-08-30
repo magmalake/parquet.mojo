@@ -45,10 +45,22 @@ def _bench(path: StringSlice, label: StringSlice, repeats: Int) raises:
 
 def main() raises:
     print("parquet.mojo decode benchmark (single threaded)\n")
-    _bench("tests/fixtures/big.parquet", "big.parquet (100k rows, 5 mixed cols)", 5)
-    _bench("tests/fixtures/prune.parquet", "prune.parquet (1k rows, 3 cols)", 20)
-    _bench("tests/fixtures/encodings.parquet", "encodings.parquet (400 rows, 12 cols)", 50)
-    _bench("tests/fixtures/v2pages.parquet", "v2pages.parquet (500 rows, v2 pages)", 50)
+    _bench(
+        "tests/fixtures/big.parquet", "big.parquet (100k rows, 5 mixed cols)", 5
+    )
+    _bench(
+        "tests/fixtures/prune.parquet", "prune.parquet (1k rows, 3 cols)", 20
+    )
+    _bench(
+        "tests/fixtures/encodings.parquet",
+        "encodings.parquet (400 rows, 12 cols)",
+        50,
+    )
+    _bench(
+        "tests/fixtures/v2pages.parquet",
+        "v2pages.parquet (500 rows, v2 pages)",
+        50,
+    )
     var wide = "build/bench-wide.parquet"
     try:
         _bench(wide, "bench-wide.parquet (1M rows int64+double)", 3)

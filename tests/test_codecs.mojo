@@ -20,7 +20,9 @@ from std.testing import TestSuite, assert_equal, assert_raises, assert_true
 
 
 def test_all_codecs_read_every_column_but_brotli() raises:
-    var n = check_fixture[AllCodecs](String("codecs"), full_codec_columns(), 65536)
+    var n = check_fixture[AllCodecs](
+        String("codecs"), full_codec_columns(), 65536
+    )
     assert_true(n > 1800, String("only ", n, " values checked"))
 
 

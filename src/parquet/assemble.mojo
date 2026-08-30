@@ -38,7 +38,7 @@ from parquet.schema import ParquetSchema
 
 
 @fieldwise_init
-struct LeafSlice(Copyable, Movable, Defaultable):
+struct LeafSlice(Copyable, Defaultable, Movable):
     """The slot range of one leaf that a batch covers, and where its values
     start in the chunk's value buffer."""
 
@@ -168,7 +168,7 @@ def _build_leaf(
     var out = _new_array(s, fi)
     var vi = sl.v0
     for i in range(sl.s0, sl.s1):
-        var d = Int(cd.defs[i]) if len(cd.defs) else 0
+        var d = cd.def_at(i, max_def)
         var present = d == max_def
         if d >= require_def:
             _mark(out, out.length, present)
@@ -206,9 +206,10 @@ def _build_struct(
     var def_level = s.fields[fi].def_level
     var rep_level = s.fields[fi].rep_level
     var out = _new_array(s, fi)
+    var leaf_max_def = s.leaves[lf].max_def
     for i in range(sl.s0, sl.s1):
-        var d = Int(cd.defs[i]) if len(cd.defs) else 0
-        var r = Int(cd.reps[i]) if len(cd.reps) else 0
+        var d = cd.def_at(i, leaf_max_def)
+        var r = cd.rep_at(i)
         if d >= require_def and r <= rep_level:
             _mark(out, out.length, d >= def_level)
             out.length += 1
@@ -254,9 +255,10 @@ def _build_list(
     var out = _new_array(s, fi)
     out.offsets.append(0)
     var elems = 0
+    var leaf_max_def = s.leaves[lf].max_def
     for i in range(sl.s0, sl.s1):
-        var d = Int(cd.defs[i]) if len(cd.defs) else 0
-        var r = Int(cd.reps[i]) if len(cd.reps) else 0
+        var d = cd.def_at(i, leaf_max_def)
+        var r = cd.rep_at(i)
         if d < require_def:
             continue
         if r <= rep_level:

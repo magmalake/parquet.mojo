@@ -32,8 +32,8 @@ comptime HEXDIGITS = "0123456789abcdef"
 def hex_string(data: Span[UInt8, _]) -> String:
     var out = String()
     for b in data:
-        out += HEXDIGITS[byte = Int(b >> 4)]
-        out += HEXDIGITS[byte = Int(b & 15)]
+        out += HEXDIGITS[byte=Int(b >> 4)]
+        out += HEXDIGITS[byte=Int(b & 15)]
     return out^
 
 
@@ -53,8 +53,8 @@ def json_escape(s: StringSlice) -> String:
             out += "\\t"
         elif c < 0x20:
             out += "\\u00"
-            out += HEXDIGITS[byte = Int(c >> 4)]
-            out += HEXDIGITS[byte = Int(c & 15)]
+            out += HEXDIGITS[byte=Int(c >> 4)]
+            out += HEXDIGITS[byte=Int(c & 15)]
         else:
             out += String(StringSlice(unsafe_from_utf8=s.as_bytes()[i : i + 1]))
     out += '"'
@@ -77,11 +77,11 @@ def _u128_decimal(lo_in: UInt64, hi_in: UInt64) -> String:
         var r = bot % 10
         hi = q_hi
         lo = (q_top << 32) | q_bot
-        digits += HEXDIGITS[byte = Int(r)]
+        digits += HEXDIGITS[byte=Int(r)]
     var out = String()
     var n = digits.byte_length()
     for i in range(n):
-        out += digits[byte = n - 1 - i]
+        out += digits[byte=n - 1 - i]
     return out^
 
 
@@ -113,10 +113,10 @@ def decimal_text(bytes: Span[UInt8, _], scale: Int) raises -> String:
     var n = digits.byte_length()
     var head = String()
     for i in range(n - scale):
-        head += digits[byte = i]
+        head += digits[byte=i]
     var tail = String()
     for i in range(n - scale, n):
-        tail += digits[byte = i]
+        tail += digits[byte=i]
     return String(sign, head, ".", tail)
 
 

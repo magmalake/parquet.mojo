@@ -105,7 +105,9 @@ def op_name(op: Int) -> String:
     return names[op].copy()
 
 
-def range_can_match(op: Int, lo: ScalarValue, hi: ScalarValue, v: ScalarValue) raises -> Bool:
+def range_can_match(
+    op: Int, lo: ScalarValue, hi: ScalarValue, v: ScalarValue
+) raises -> Bool:
     """Could any value in `[lo, hi]` satisfy `x op v`?"""
     if lo.kind != v.kind:
         return True  # different kinds — do not prune on a guess
@@ -160,7 +162,7 @@ def _intersect_ranges(
     return out^
 
 
-struct RecordBatch(Copyable, Movable, Defaultable):
+struct RecordBatch(Copyable, Defaultable, Movable):
     """A contiguous run of rows as Arrow arrays, one per selected column."""
 
     var arena: ArrayArena
@@ -185,10 +187,12 @@ struct RecordBatch(Copyable, Movable, Defaultable):
     def num_columns(self) -> Int:
         return len(self.roots)
 
-    def column(ref self, i: Int) -> ref [self.arena.nodes[0]] ArrayData:
+    def column(ref self, i: Int) -> ref[self.arena.nodes[0]] ArrayData:
         return self.arena.nodes[self.roots[i]]
 
-    def child(ref self, node: Int, k: Int) -> ref [self.arena.nodes[0]] ArrayData:
+    def child(
+        ref self, node: Int, k: Int
+    ) -> ref[self.arena.nodes[0]] ArrayData:
         return self.arena.nodes[self.arena.nodes[node].children[k]]
 
     def name(self, i: Int) -> String:
@@ -227,7 +231,9 @@ def array_i64_into(
     var w = a.type.fixed_width()
     if w == 0 or a.type.id == AT_FLOAT32 or a.type.id == AT_FLOAT64:
         raise Error(
-            String("parquet: column of type ", String(a.type), " is not an integer")
+            String(
+                "parquet: column of type ", String(a.type), " is not an integer"
+            )
         )
     var signed = not (
         a.type.id == AT_UINT8
@@ -258,11 +264,17 @@ def array_f64_into(
             vals.append(Float64(load_f32(Span(a.values), i)))
     elif a.type.id == AT_FLOAT16:
         for i in range(a.length):
-            var bits = UInt16(a.values[i * 2]) | (UInt16(a.values[i * 2 + 1]) << 8)
+            var bits = UInt16(a.values[i * 2]) | (
+                UInt16(a.values[i * 2 + 1]) << 8
+            )
             vals.append(Float64(bitcast[DType.float16](bits)))
     else:
         raise Error(
-            String("parquet: column of type ", String(a.type), " is not floating point")
+            String(
+                "parquet: column of type ",
+                String(a.type),
+                " is not floating point",
+            )
         )
     _append_validity(a, valid)
 
@@ -272,7 +284,9 @@ def array_bool_into(
 ) raises:
     if a.type.id != AT_BOOL:
         raise Error(
-            String("parquet: column of type ", String(a.type), " is not boolean")
+            String(
+                "parquet: column of type ", String(a.type), " is not boolean"
+            )
         )
     for i in range(a.length):
         vals.append(bit_get(Span(a.values), i))
@@ -284,7 +298,11 @@ def array_str_into(
 ) raises:
     if a.type.id != AT_UTF8 and a.type.id != AT_BINARY:
         raise Error(
-            String("parquet: column of type ", String(a.type), " is not a byte array")
+            String(
+                "parquet: column of type ",
+                String(a.type),
+                " is not a byte array",
+            )
         )
     for i in range(a.length):
         var lo = Int(a.offsets[i])
@@ -346,8 +364,13 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     empty list means the whole row group."""
     var _loaded_rg: Int
     var _chunks: List[ColumnData]
+    var _row_flat: List[Bool]
+    """Per leaf: slot index == row index, so `_row_slot` is not built."""
     var _row_slot: List[List[Int]]
+    """Per leaf, the first *slot* of each row. Empty when `_row_flat`."""
     var _row_value: List[List[Int]]
+    """Per leaf, the first *value* of each row. Empty when every slot of the
+    chunk is present, in which case the value index is the slot index."""
 
     def __init__(out self, var data: List[UInt8]) raises:
         self.data = data^
@@ -368,6 +391,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._ranges = List[List[Tuple[Int, Int]]]()
         self._loaded_rg = -1
         self._chunks = List[ColumnData]()
+        self._row_flat = List[Bool]()
         self._row_slot = List[List[Int]]()
         self._row_value = List[List[Int]]()
 
@@ -388,6 +412,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._ranges = move._ranges^
         self._loaded_rg = move._loaded_rg
         self._chunks = move._chunks^
+        self._row_flat = move._row_flat^
         self._row_slot = move._row_slot^
         self._row_value = move._row_value^
 
@@ -637,6 +662,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             return
         var nleaves = len(self.schema.leaves)
         self._chunks = List[ColumnData]()
+        self._row_flat = List[Bool]()
         self._row_slot = List[List[Int]]()
         self._row_value = List[List[Int]]()
         var rows = Int(self.meta.row_groups[rg].num_rows)
@@ -656,6 +682,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             var cd = ColumnData()
             var slot = List[Int]()
             var value = List[Int]()
+            var flat = False
             if self._needed[i]:
                 ref chunk = self.meta.row_groups[rg].columns[i]
                 if not chunk.meta_data:
@@ -676,10 +703,11 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 )
                 var max_def = self.schema.leaves[i].max_def
                 var max_rep = self.schema.leaves[i].max_rep
-                slot.reserve(rows + 1)
-                value.reserve(rows + 1)
                 var nvals = 0
                 if max_rep == 0:
+                    # One slot per row, so the slot index *is* the row index
+                    # and `slot` never has to be built.
+                    flat = True
                     if cd.num_slots != rows:
                         raise Error(
                             String(
@@ -692,22 +720,28 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                                 " rows",
                             )
                         )
-                    for k in range(rows):
-                        slot.append(k)
+                    if not cd.all_present:
+                        value.reserve(rows + 1)
+                        ref defs = cd.defs
+                        for k in range(rows):
+                            value.append(nvals)
+                            if Int(defs[k]) == max_def:
+                                nvals += 1
                         value.append(nvals)
-                        if max_def == 0 or Int(cd.defs[k]) == max_def:
-                            nvals += 1
-                    slot.append(rows)
-                    value.append(nvals)
                 else:
+                    slot.reserve(rows + 1)
+                    if not cd.all_present:
+                        value.reserve(rows + 1)
                     for k in range(cd.num_slots):
                         if Int(cd.reps[k]) == 0:
                             slot.append(k)
-                            value.append(nvals)
-                        if Int(cd.defs[k]) == max_def:
+                            if not cd.all_present:
+                                value.append(nvals)
+                        if cd.def_at(k, max_def) == max_def:
                             nvals += 1
                     slot.append(cd.num_slots)
-                    value.append(nvals)
+                    if not cd.all_present:
+                        value.append(nvals)
                     if len(slot) != rows + 1:
                         raise Error(
                             String(
@@ -721,6 +755,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                             )
                         )
             self._chunks.append(cd^)
+            self._row_flat.append(flat)
             self._row_slot.append(slot^)
             self._row_value.append(value^)
         self._loaded_rg = rg
@@ -740,7 +775,9 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     def _seek(mut self) -> Bool:
         """Move to the next non-empty row range; False when there is none."""
         while self._rg_pos < len(self._row_groups):
-            var rows = Int(self.meta.row_groups[self._row_groups[self._rg_pos]].num_rows)
+            var rows = Int(
+                self.meta.row_groups[self._row_groups[self._rg_pos]].num_rows
+            )
             if rows == 0:
                 # A row group with no rows still yields one empty batch, so a
                 # zero-row file keeps its columns.
@@ -792,16 +829,26 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     def _assemble(mut self, r0: Int, r1: Int) raises -> RecordBatch:
         var slices = List[LeafSlice]()
         for i in range(len(self.schema.leaves)):
-            if self._needed[i] and len(self._row_slot[i]) > r1:
-                slices.append(
-                    LeafSlice(
-                        self._row_slot[i][r0],
-                        self._row_slot[i][r1],
-                        self._row_value[i][r0],
-                    )
-                )
-            else:
+            if not self._needed[i]:
                 slices.append(LeafSlice())
+                continue
+            var s0 = r0
+            var s1 = r1
+            if not self._row_flat[i]:
+                if len(self._row_slot[i]) <= r1:
+                    slices.append(LeafSlice())
+                    continue
+                s0 = self._row_slot[i][r0]
+                s1 = self._row_slot[i][r1]
+            elif r1 > self._chunks[i].num_slots:
+                slices.append(LeafSlice())
+                continue
+            # An empty `_row_value` means every slot holds a value, so the
+            # value index and the slot index are the same number.
+            var v0 = (
+                s0 if len(self._row_value[i]) == 0 else self._row_value[i][r0]
+            )
+            slices.append(LeafSlice(s0, s1, v0))
         var batch = RecordBatch()
         batch.num_rows = r1 - r0
         var roots = self._roots.copy()
@@ -897,7 +944,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         return t^
 
 
-struct Table(Copyable, Movable, Defaultable):
+struct Table(Copyable, Defaultable, Movable):
     """Every batch of a read, with accessors that run across all of them."""
 
     var batches: List[RecordBatch]

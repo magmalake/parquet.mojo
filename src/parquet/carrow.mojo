@@ -82,21 +82,29 @@ struct CArrowArray(Copyable, Movable):
     var private_data: Int
 
 
-def release_array(p: UnsafePointer[CArrowArray, MutUntrackedOrigin]) abi("C") -> None:
+def release_array(
+    p: UnsafePointer[CArrowArray, MutUntrackedOrigin]
+) abi("C") -> None:
     """Free the whole exported array tree. `private_data` is the block."""
     var block = p[].private_data
     p[].release = 0
     if block != 0:
-        var base = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=block)
+        var base = UnsafePointer[UInt64, MutUntrackedOrigin](
+            unsafe_from_address=block
+        )
         base.unsafe_free()
 
 
-def release_schema(p: UnsafePointer[CArrowSchema, MutUntrackedOrigin]) abi("C") -> None:
+def release_schema(
+    p: UnsafePointer[CArrowSchema, MutUntrackedOrigin]
+) abi("C") -> None:
     """Free the whole exported schema tree."""
     var block = p[].private_data
     p[].release = 0
     if block != 0:
-        var base = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=block)
+        var base = UnsafePointer[UInt64, MutUntrackedOrigin](
+            unsafe_from_address=block
+        )
         base.unsafe_free()
 
 
@@ -121,7 +129,12 @@ def n_buffers_for(a: ArrayData) -> Int:
         return 1
     if i == AT_LIST or i == AT_LARGE_LIST or i == AT_MAP:
         return 2
-    if i == AT_UTF8 or i == AT_BINARY or i == AT_LARGE_UTF8 or i == AT_LARGE_BINARY:
+    if (
+        i == AT_UTF8
+        or i == AT_BINARY
+        or i == AT_LARGE_UTF8
+        or i == AT_LARGE_BINARY
+    ):
         return 3
     return 2
 
@@ -170,10 +183,14 @@ struct _Block(Movable):
         return Int(self.base) + at
 
     def bytes_at(self, addr: Int) -> UnsafePointer[UInt8, MutUntrackedOrigin]:
-        return UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
+        return UnsafePointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=addr
+        )
 
     def words_at(self, addr: Int) -> UnsafePointer[Int64, MutUntrackedOrigin]:
-        return UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
+        return UnsafePointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=addr
+        )
 
     def put_bytes(mut self, data: Span[UInt8, _]) raises -> Int:
         var at = self.take(len(data) if len(data) else 1)
@@ -188,7 +205,7 @@ struct _Block(Movable):
         var p = self.bytes_at(at)
         for i in range(len(b)):
             p[unsafe_offset=i] = b[i]
-        p[unsafe_offset = len(b)] = 0
+        p[unsafe_offset=len(b)] = 0
         return at
 
 
@@ -224,21 +241,27 @@ def _values_bytes(a: ArrayData) -> Int:
     var i = a.type.id
     if i == AT_BOOL:
         return (a.length + 7) // 8
-    if i == AT_UTF8 or i == AT_BINARY or i == AT_LARGE_UTF8 or i == AT_LARGE_BINARY:
+    if (
+        i == AT_UTF8
+        or i == AT_BINARY
+        or i == AT_LARGE_UTF8
+        or i == AT_LARGE_BINARY
+    ):
         return len(a.values)
-    if i == AT_STRUCT or i == AT_LIST or i == AT_LARGE_LIST or i == AT_MAP or i == AT_NULL:
+    if (
+        i == AT_STRUCT
+        or i == AT_LIST
+        or i == AT_LARGE_LIST
+        or i == AT_MAP
+        or i == AT_NULL
+    ):
         return 0
     return a.type.fixed_width() * a.length
 
 
 def _offsets_bytes(a: ArrayData) -> Int:
     var i = a.type.id
-    if (
-        i == AT_UTF8
-        or i == AT_BINARY
-        or i == AT_LIST
-        or i == AT_MAP
-    ):
+    if i == AT_UTF8 or i == AT_BINARY or i == AT_LIST or i == AT_MAP:
         return 4 * (a.length + 1)
     if i == AT_LARGE_UTF8 or i == AT_LARGE_BINARY or i == AT_LARGE_LIST:
         return 8 * (a.length + 1)
@@ -299,7 +322,9 @@ struct ExportedArray(Movable):
         self.release()
 
 
-def _export_schema(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int:
+def _export_schema(
+    arena: ArrayArena, root: Int, order: List[Int]
+) raises -> Int:
     var n = len(order)
     var index = Dict[Int, Int]()
     for i in range(n):
@@ -348,10 +373,10 @@ def _export_schema(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int
     return addr
 
 
-comptime SchemaReleaseFn = def (
+comptime SchemaReleaseFn = def(
     UnsafePointer[CArrowSchema, MutUntrackedOrigin]
 ) thin abi("C") -> None
-comptime ArrayReleaseFn = def (
+comptime ArrayReleaseFn = def(
     UnsafePointer[CArrowArray, MutUntrackedOrigin]
 ) thin abi("C") -> None
 
@@ -405,7 +430,9 @@ def _export_array(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int:
                 var at = blk.take(vb)
                 var p = blk.bytes_at(at)
                 for k in range(vb):
-                    p[unsafe_offset=k] = a.validity[k] if k < len(a.validity) else 0
+                    p[unsafe_offset=k] = (
+                        a.validity[k] if k < len(a.validity) else 0
+                    )
                 bp[unsafe_offset=0] = Int64(at)
             else:
                 bp[unsafe_offset=0] = 0

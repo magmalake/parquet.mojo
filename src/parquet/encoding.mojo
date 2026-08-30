@@ -58,7 +58,7 @@ def physical_kind(phys: Int32) -> Int:
     return PK_FIXED
 
 
-struct PhysBuffer(Copyable, Movable, Defaultable):
+struct PhysBuffer(Copyable, Defaultable, Movable):
     """Decoded values still in their physical Parquet representation."""
 
     var kind: Int
@@ -141,7 +141,9 @@ struct PhysBuffer(Copyable, Movable, Defaultable):
     def value_span(self, i: Int) -> Span[UInt8, origin_of(self.bytes)]:
         """The bytes of value `i` — `PK_VAR` or `PK_FIXED` only."""
         if self.kind == PK_VAR:
-            return Span(self.bytes)[Int(self.offsets[i]) : Int(self.offsets[i + 1])]
+            return Span(self.bytes)[
+                Int(self.offsets[i]) : Int(self.offsets[i + 1])
+            ]
         return Span(self.bytes)[i * self.width : (i + 1) * self.width]
 
 
@@ -257,11 +259,18 @@ def decode_rle_bool(data: Span[UInt8, _], count: Int) raises -> PhysBuffer:
     run of 1-bit values."""
     _need(data, 4, "RLE boolean length")
     var n = (
-        Int(data[0]) | (Int(data[1]) << 8) | (Int(data[2]) << 16) | (Int(data[3]) << 24)
+        Int(data[0])
+        | (Int(data[1]) << 8)
+        | (Int(data[2]) << 16)
+        | (Int(data[3]) << 24)
     )
     if n < 0 or 4 + n > len(data):
         raise Error(
-            String("parquet.encoding: RLE boolean length ", n, " runs past the page")
+            String(
+                "parquet.encoding: RLE boolean length ",
+                n,
+                " runs past the page",
+            )
         )
     var dec = HybridDecoder(data[4 : 4 + n], 1)
     var out = PhysBuffer(PK_BOOL, 0)
@@ -308,7 +317,11 @@ def decode_delta_ints(
         )
     if block_size % 128 != 0:
         raise Error(
-            String("parquet.delta: block size ", block_size, " is not a multiple of 128")
+            String(
+                "parquet.delta: block size ",
+                block_size,
+                " is not a multiple of 128",
+            )
         )
     var miniblock_size = block_size // miniblocks
     if total < 0:
