@@ -154,20 +154,9 @@ def _read_levels(
                 "-byte page",
             )
         )
-    var dec = HybridDecoder(data[start : start + length], width)
-    out.reserve(len(out) + count)
-    for _ in range(count):
-        var v = dec.next()
-        if Int(v) > max_level:
-            raise Error(
-                String(
-                    "parquet.page: level ",
-                    v,
-                    " exceeds the column maximum of ",
-                    max_level,
-                )
-            )
-        out.append(UInt16(v))
+    _ = decode_levels_into(
+        data[start : start + length], width, count, max_level, out
+    )
     return start + length
 
 

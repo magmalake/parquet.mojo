@@ -3,6 +3,12 @@
 Reports rows/s and MB/s (of the *file*) for each fixture, single threaded.
 `tools/bench_pyarrow.py` prints the same numbers for pyarrow with one thread,
 so the README can quote both honestly.
+
+The timed region is footer parse plus `read_table` — everything from bytes to
+Arrow. `ParquetReader` takes ownership of the file bytes, so each repeat needs
+its own copy; that copy is made *outside* the timer, because the pyarrow side
+hands its reader a `pa.py_buffer` over the same bytes every time and does not
+copy either.
 """
 
 from parquet import DefaultCodecs, ParquetReader
@@ -16,8 +22,9 @@ def _bench(path: StringSlice, label: StringSlice, repeats: Int) raises:
     var rows = 0
     var best = 1.0e30
     for _ in range(repeats):
+        var buf = bytes.copy()
         var t0 = perf_counter_ns()
-        var r = ParquetReader[DefaultCodecs](bytes.copy())
+        var r = ParquetReader[DefaultCodecs](buf^)
         r.verify_crc = False
         var t = r.read_table()
         var t1 = perf_counter_ns()

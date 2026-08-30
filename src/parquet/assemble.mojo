@@ -173,10 +173,10 @@ def _build_leaf(
     ref leaf = s.leaves[lf]
     var max_def = leaf.max_def
     var out = _new_array(s, fi)
-    if cd.all_present and max_def >= require_def:
-        # Every slot in the range holds a value, so the whole run can move in
-        # one piece instead of a million calls to `append_value`.
-        if _bulk_copy(out, leaf, cd.values, sl.v0, sl.s1 - sl.s0):
+    if require_def == 0 or (cd.all_present and max_def >= require_def):
+        # Every slot in the range becomes a row, so the array can be built one
+        # buffer at a time rather than one row at a time.
+        if _fill_leaf(out, leaf, cd, sl.s0, sl.v0, sl.s1 - sl.s0, max_def):
             return arena.add(out^)
     var vi = sl.v0
     for i in range(sl.s0, sl.s1):
@@ -195,14 +195,25 @@ def _build_leaf(
     return arena.add(out^)
 
 
-def _bulk_copy(
-    mut out: ArrayData, leaf: LeafColumn, vals: PhysBuffer, v0: Int, n: Int
+def _fill_leaf(
+    mut out: ArrayData,
+    leaf: LeafColumn,
+    cd: ColumnData,
+    s0: Int,
+    v0: Int,
+    n: Int,
+    max_def: Int,
 ) raises -> Bool:
-    """Copy `n` values starting at `v0` straight into `out`'s Arrow buffers.
+    """Build a leaf array for `n` consecutive slots in one pass per buffer.
 
-    Returns `False` when the leaf's Arrow type is not simply its physical
-    bytes — a decimal, an `INT96` timestamp, or a narrow integer carried in a
-    wider physical type — and the caller has to go value by value.
+    The caller has established that every one of those slots becomes a row, so
+    the only question left per slot is whether it holds a value. That makes
+    the validity bitmap one pass over the definition levels and the values one
+    pass over the value buffer, instead of a call to `append_value` per row.
+
+    Returns `False` — leaving `out` untouched — when the Arrow bytes are not
+    the Parquet bytes: a decimal, an `INT96` timestamp, or a narrow integer
+    carried in a wider physical type. Those still go value by value.
     """
     if n < 0:
         return False
@@ -211,47 +222,136 @@ def _bulk_copy(
         return False
     if id == AT_TIMESTAMP and leaf.physical == Type.INT96.value:
         return False
-
-    if id == AT_UTF8 or id == AT_BINARY:
-        if vals.kind != PK_VAR or v0 + n + 1 > len(vals.offsets):
+    ref vals = cd.values
+    var w = out.type.fixed_width()
+    var var_len = id == AT_UTF8 or id == AT_BINARY
+    if var_len:
+        if vals.kind != PK_VAR:
             return False
-        var src = vals.offsets.unsafe_ptr()
-        var b0 = Int(src.unsafe_load(v0))
-        var b1 = Int(src.unsafe_load(v0 + n))
-        out.values.extend(Span(vals.bytes)[b0:b1])
+    elif id == AT_BOOL:
+        if vals.kind != PK_BOOL:
+            return False
+    elif w == 0 or vals.kind != PK_FIXED or vals.width != w:
+        return False
+
+    # ── validity ──────────────────────────────────────────────────────────
+    var dense = cd.all_present
+    var present = n
+    if not dense:
+        if s0 + n > len(cd.defs):
+            return False
+        var defs = cd.defs.unsafe_ptr()
+        out.validity.resize((n + 7) // 8, 0)
+        var vb = out.validity.unsafe_ptr()
+        var byte = UInt8(0)
+        present = 0
+        for k in range(n):
+            if Int(defs.unsafe_load(s0 + k)) == max_def:
+                byte |= UInt8(1) << UInt8(k & 7)
+                present += 1
+            if (k & 7) == 7:
+                vb.unsafe_store(k >> 3, byte)
+                byte = 0
+        if (n & 7) != 0:
+            vb.unsafe_store(n >> 3, byte)
+    out.length = n
+    out.null_count = n - present
+    if out.null_count == 0:
+        out.validity.clear()
+        dense = True
+
+    # ── values ────────────────────────────────────────────────────────────
+    if var_len:
+        if v0 + present + 1 > len(vals.offsets):
+            raise Error(_short_values(leaf))
+        var voff = vals.offsets.unsafe_ptr()
+        var base = Int(voff.unsafe_load(v0))
+        var last = Int(voff.unsafe_load(v0 + present))
+        out.values.extend(Span(vals.bytes)[base:last])
         out.offsets.resize(n + 1, 0)
-        var dst = out.offsets.unsafe_ptr()
-        for k in range(n + 1):
-            dst.unsafe_store(k, src.unsafe_load(v0 + k) - Int32(b0))
-        out.length = n
+        var ooff = out.offsets.unsafe_ptr()
+        if dense:
+            for k in range(n + 1):
+                ooff.unsafe_store(k, voff.unsafe_load(v0 + k) - Int32(base))
+        else:
+            var defs = cd.defs.unsafe_ptr()
+            var vi = v0
+            var run = 0
+            for k in range(n):
+                ooff.unsafe_store(k, Int32(run))
+                if Int(defs.unsafe_load(s0 + k)) == max_def:
+                    run += Int(voff.unsafe_load(vi + 1)) - Int(
+                        voff.unsafe_load(vi)
+                    )
+                    vi += 1
+            ooff.unsafe_store(n, Int32(run))
         return True
 
     if id == AT_BOOL:
-        if vals.kind != PK_BOOL:
-            return False
-        if v0 % 8 == 0:
-            out.values.extend(Span(vals.bytes)[v0 // 8 : (v0 + n + 7) // 8])
-            # The tail byte can carry bits past the end of the run. Arrow
-            # ignores them, but keeping them zero makes a bitmap compare
-            # stable.
-            if n % 8 != 0 and len(out.values) > 0:
-                out.values[len(out.values) - 1] &= (
-                    UInt8(1) << UInt8(n % 8)
-                ) - 1
-        else:
+        out.values.resize((n + 7) // 8, 0)
+        var vp = out.values.unsafe_ptr()
+        var byte = UInt8(0)
+        var vi = v0
+        if dense:
             for k in range(n):
-                bit_set(out.values, k, vals.bool_at(v0 + k))
-        out.length = n
+                if vals.bool_at(v0 + k):
+                    byte |= UInt8(1) << UInt8(k & 7)
+                if (k & 7) == 7:
+                    vp.unsafe_store(k >> 3, byte)
+                    byte = 0
+        else:
+            var defs = cd.defs.unsafe_ptr()
+            for k in range(n):
+                if Int(defs.unsafe_load(s0 + k)) == max_def:
+                    if vals.bool_at(vi):
+                        byte |= UInt8(1) << UInt8(k & 7)
+                    vi += 1
+                if (k & 7) == 7:
+                    vp.unsafe_store(k >> 3, byte)
+                    byte = 0
+        if (n & 7) != 0:
+            vp.unsafe_store(n >> 3, byte)
         return True
 
-    var w = out.type.fixed_width()
-    if w == 0 or vals.kind != PK_FIXED or vals.width != w:
-        return False
-    if (v0 + n) * w > len(vals.bytes):
-        return False
-    out.values.extend(Span(vals.bytes)[v0 * w : (v0 + n) * w])
-    out.length = n
+    if (v0 + present) * w > len(vals.bytes):
+        raise Error(_short_values(leaf))
+    if dense:
+        out.values.extend(Span(vals.bytes)[v0 * w : (v0 + n) * w])
+        return True
+    out.values.resize(n * w, 0)
+    var dst = out.values.unsafe_ptr()
+    var src = vals.bytes.unsafe_ptr()
+    var defs = cd.defs.unsafe_ptr()
+    var vi = v0
+    if w == 8:
+        var d8 = dst.bitcast[UInt64]()
+        var s8 = src.bitcast[UInt64]()
+        for k in range(n):
+            if Int(defs.unsafe_load(s0 + k)) == max_def:
+                d8.unsafe_store(k, s8.unsafe_load[alignment=1](vi))
+                vi += 1
+    elif w == 4:
+        var d4 = dst.bitcast[UInt32]()
+        var s4 = src.bitcast[UInt32]()
+        for k in range(n):
+            if Int(defs.unsafe_load(s0 + k)) == max_def:
+                d4.unsafe_store(k, s4.unsafe_load[alignment=1](vi))
+                vi += 1
+    else:
+        for k in range(n):
+            if Int(defs.unsafe_load(s0 + k)) == max_def:
+                for b in range(w):
+                    dst.unsafe_store(k * w + b, src.unsafe_load(vi * w + b))
+                vi += 1
     return True
+
+
+def _short_values(leaf: LeafColumn) -> String:
+    return String(
+        "parquet.assemble: column '",
+        leaf.dotted(),
+        "' has fewer values than its definition levels call for",
+    )
 
 
 def _build_struct(
