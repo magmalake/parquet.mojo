@@ -28,6 +28,7 @@ from parquet.arrow import (
     AT_FLOAT16,
     AT_FLOAT32,
     AT_FLOAT64,
+    AT_MAP,
     AT_UTF8,
     ArrayArena,
     ArrayData,
@@ -333,6 +334,8 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     """Selected top-level Arrow field indices."""
     var _needed: List[Bool]
     """Per leaf: is it under a selected root?"""
+    var _include: List[Bool]
+    """Per Arrow field: is it built? Empty means "everything under a root"."""
     var _rg_pos: Int
     var _range_pos: Int
     var _row_pos: Int
@@ -357,6 +360,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             self._row_groups.append(i)
         self._roots = self.schema.roots.copy()
         self._needed = List[Bool](length=len(self.schema.leaves), fill=True)
+        self._include = List[Bool]()
         self._rg_pos = 0
         self._range_pos = 0
         self._row_pos = 0
@@ -376,6 +380,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_groups = move._row_groups^
         self._roots = move._roots^
         self._needed = move._needed^
+        self._include = move._include^
         self._rg_pos = move._rg_pos
         self._range_pos = move._range_pos
         self._row_pos = move._row_pos
@@ -479,12 +484,89 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
 
     def _set_roots(mut self, var roots: List[Int]):
         self._roots = roots^
+        self._include = List[Bool]()
         for i in range(len(self._needed)):
             self._needed[i] = False
         var rs = self._roots.copy()
         for r in rs:
             self._mark(r)
         self._loaded_rg = -1
+
+    def _include_subtree(self, fi: Int, mut inc: List[Bool]):
+        inc[fi] = True
+        ref kids = self.schema.fields[fi].children
+        if len(kids) == 0:
+            return
+        for k in range(len(kids)):
+            self._include_subtree(kids[k], inc)
+
+    def select_fields(mut self, fields: List[Int]) raises:
+        """Project by Arrow field index, sub-fields included.
+
+        A selected field brings its whole sub-tree; every ancestor is kept as a
+        wrapper, so the value still arrives inside the struct it belongs to,
+        and nothing else is decoded. Roots come out in the order they were
+        asked for, which is the contract `select_columns` already has.
+        `select_columns` is the special case where every selection is a root.
+        """
+        var n = len(self.schema.fields)
+        var parent = List[Int](length=n, fill=-1)
+        for f in range(n):
+            ref kids = self.schema.fields[f].children
+            for k in range(len(kids)):
+                parent[kids[k]] = f
+        var inc = List[Bool](length=n, fill=False)
+        for i in range(len(fields)):
+            var f = fields[i]
+            if f < 0 or f >= n:
+                raise Error(String("parquet: no field at index ", f))
+            self._include_subtree(f, inc)
+            var p = parent[f]
+            while p >= 0:
+                inc[p] = True
+                p = parent[p]
+        # A map is only a map with both halves: an included map keeps its key.
+        for f in range(n):
+            if not inc[f] or self.schema.fields[f].type.id != AT_MAP:
+                continue
+            ref kids = self.schema.fields[f].children
+            if len(kids) == 0:
+                continue
+            var entries = kids[0]
+            inc[entries] = True
+            ref pair = self.schema.fields[entries].children
+            if len(pair) > 0:
+                self._include_subtree(pair[0], inc)
+        var roots = List[Int]()
+        for i in range(len(fields)):
+            var top = fields[i]
+            while parent[top] >= 0:
+                top = parent[top]
+            var seen = False
+            for k in range(len(roots)):
+                if roots[k] == top:
+                    seen = True
+                    break
+            if not seen:
+                roots.append(top)
+        self._roots = roots^
+        for i in range(len(self._needed)):
+            self._needed[i] = False
+        for f in range(n):
+            if inc[f] and self.schema.fields[f].leaf >= 0:
+                self._needed[self.schema.fields[f].leaf] = True
+        self._include = inc^
+        self._loaded_rg = -1
+
+    def select_field_ids_deep(mut self, ids: List[Int32]) raises:
+        """`select_fields`, addressing the fields by Parquet field id."""
+        var fields = List[Int]()
+        for i in range(len(ids)):
+            var fi = self.schema.field_by_id(ids[i])
+            if fi < 0:
+                raise Error(String("parquet: no field with id ", ids[i]))
+            fields.append(fi)
+        self.select_fields(fields)
 
     def select_all(mut self):
         self._set_roots(self.schema.roots.copy())
@@ -725,7 +807,15 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var roots = self._roots.copy()
         for r in roots:
             batch.roots.append(
-                build_field(self.schema, r, 0, self._chunks, slices, batch.arena)
+                build_field(
+                    self.schema,
+                    r,
+                    0,
+                    self._chunks,
+                    slices,
+                    batch.arena,
+                    self._include,
+                )
             )
         return batch^
 

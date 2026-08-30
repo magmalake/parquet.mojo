@@ -54,18 +54,44 @@ struct LeafSlice(Copyable, Movable, Defaultable):
 
 def first_leaf(s: ParquetSchema, fi: Int) raises -> Int:
     """The first descendant leaf of Arrow field `fi` — its level source."""
-    var f = fi
-    while s.fields[f].leaf < 0:
-        if len(s.fields[f].children) == 0:
-            raise Error(
-                String(
-                    "parquet.assemble: field '",
-                    s.fields[f].name,
-                    "' has no leaf under it",
-                )
+    return first_included_leaf(s, fi, List[Bool]())
+
+
+def first_included_leaf(
+    s: ParquetSchema, fi: Int, include: List[Bool]
+) raises -> Int:
+    """`first_leaf`, restricted to the fields `include` selects.
+
+    A pruned read skips whole sub-trees, so the level source of a struct can no
+    longer be its first child: it has to be the first child actually being
+    built. Every leaf under a field agrees about the levels at and above that
+    field, so any included one will do.
+    """
+    var lf = _first_included_leaf(s, fi, include)
+    if lf < 0:
+        raise Error(
+            String(
+                "parquet.assemble: field '",
+                s.fields[fi].name,
+                "' has no leaf under it",
             )
-        f = s.fields[f].children[0]
-    return s.fields[f].leaf
+        )
+    return lf
+
+
+def _first_included_leaf(s: ParquetSchema, fi: Int, include: List[Bool]) -> Int:
+    if len(include) > 0 and not include[fi]:
+        return -1
+    if s.fields[fi].leaf >= 0:
+        return s.fields[fi].leaf
+    ref kids = s.fields[fi].children
+    if len(kids) == 0:
+        return -1
+    for k in range(len(kids)):
+        var got = _first_included_leaf(s, kids[k], include)
+        if got >= 0:
+            return got
+    return -1
 
 
 def build_field(
@@ -75,17 +101,29 @@ def build_field(
     chunks: List[ColumnData],
     slices: List[LeafSlice],
     mut arena: ArrayArena,
+    include: List[Bool],
 ) raises -> Int:
-    """Build the Arrow array for field `fi`; return its index in `arena`."""
-    var lf = first_leaf(s, fi)
+    """Build the Arrow array for field `fi`; return its index in `arena`.
+
+    `include`, when it is not empty, is one flag per entry of `s.fields`: a
+    struct builds only the children it selects, so a projection that wants
+    `a.b` and nothing else decodes exactly the leaves under `a.b`. A list and
+    a map always build their element (and a map its key), because their
+    offsets mean nothing without one.
+    """
+    var lf = first_included_leaf(s, fi, include)
     var kind = s.fields[fi].type.id
 
     if s.fields[fi].leaf >= 0:
         return _build_leaf(s, fi, require_def, chunks, slices, arena)
     if kind == AT_LIST or kind == AT_MAP:
-        return _build_list(s, fi, require_def, chunks, slices, arena, lf)
+        return _build_list(
+            s, fi, require_def, chunks, slices, arena, lf, include
+        )
     if kind == AT_STRUCT:
-        return _build_struct(s, fi, require_def, chunks, slices, arena, lf)
+        return _build_struct(
+            s, fi, require_def, chunks, slices, arena, lf, include
+        )
     raise Error(
         String(
             "parquet.assemble: field '",
@@ -153,11 +191,16 @@ def _build_struct(
     slices: List[LeafSlice],
     mut arena: ArrayArena,
     lf: Int,
+    include: List[Bool],
 ) raises -> Int:
     var kids = List[Int]()
     var child_fields = s.fields[fi].children.copy()
     for c in child_fields:
-        kids.append(build_field(s, c, require_def, chunks, slices, arena))
+        if len(include) > 0 and not include[c]:
+            continue
+        kids.append(
+            build_field(s, c, require_def, chunks, slices, arena, include)
+        )
     ref cd = chunks[lf]
     ref sl = slices[lf]
     var def_level = s.fields[fi].def_level
@@ -197,10 +240,11 @@ def _build_list(
     slices: List[LeafSlice],
     mut arena: ArrayArena,
     lf: Int,
+    include: List[Bool],
 ) raises -> Int:
     var elem_def = s.fields[fi].elem_def_level
     var child = build_field(
-        s, s.fields[fi].children[0], elem_def, chunks, slices, arena
+        s, s.fields[fi].children[0], elem_def, chunks, slices, arena, include
     )
     ref cd = chunks[lf]
     ref sl = slices[lf]

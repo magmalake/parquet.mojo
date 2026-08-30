@@ -59,6 +59,7 @@ from parquet import (
     WriterOptions,
     build_schema,
     export_c,
+    array_str,
 )
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.bitio import (
@@ -304,6 +305,60 @@ def test_nested_shapes_and_levels() raises:
     ref st = r.schema.fields[r.schema.field_by_name("st")]
     assert_equal(st.type.id, AT_STRUCT)
     assert_equal(len(st.children), 2)
+
+
+def test_select_fields_prunes_to_one_sub_field() raises:
+    """`st.b` alone: the struct comes back with one child, and `st.a` is never
+    decoded."""
+    var r = _reader("nested")
+    var st = r.schema.field_by_name("st")
+    var b = r.schema.fields[st].children[1]
+    r.select_fields([b])
+    var batch = r.read_batch()
+    assert_equal(batch.num_columns(), 1)
+    assert_equal(batch.name(0), "st")
+    assert_equal(batch.type(0).id, AT_STRUCT)
+    assert_equal(len(batch.column(0).children), 1)
+    assert_equal(batch.child(batch.roots[0], 0).name, "b")
+
+    # The values a whole read gives, for the one field that was kept.
+    var whole = _reader("nested")
+    var full = whole.read_batch()
+    var fi = -1
+    for i in range(full.num_columns()):
+        if full.name(i) == "st":
+            fi = i
+    var want = array_str(full.child(full.roots[fi], 1))
+    var got = array_str(batch.child(batch.roots[0], 0))
+    assert_equal(len(got[0]), len(want[0]))
+    for k in range(len(want[0])):
+        assert_equal(got[1][k], want[1][k])
+        if want[1][k]:
+            assert_equal(got[0][k], want[0][k])
+
+
+def test_select_fields_keeps_a_map_key() raises:
+    """A map is only a map with both halves, so selecting its value keeps the
+    key."""
+    var r = _reader("nested")
+    var m = r.schema.field_by_name("m")
+    var kv = r.schema.fields[m].children[0]
+    r.select_fields([r.schema.fields[kv].children[1]])
+    var batch = r.read_batch()
+    assert_equal(batch.num_columns(), 1)
+    assert_equal(batch.name(0), "m")
+    assert_equal(len(batch.child(batch.roots[0], 0).children), 2)
+
+
+def test_select_fields_keeps_the_order_it_was_asked_for() raises:
+    var r = _reader("nested")
+    var st = r.schema.field_by_name("st")
+    var kids = r.schema.fields[st].children.copy()
+    r.select_fields([kids[0], r.schema.field_by_name("li")])
+    var batch = r.read_batch()
+    assert_equal(batch.num_columns(), 2)
+    assert_equal(batch.name(0), "st")
+    assert_equal(batch.name(1), "li")
 
 
 def _group(

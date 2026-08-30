@@ -86,6 +86,8 @@ tins — see [Codecs](#codecs).
 | `.schema` | the `ParquetSchema` (see below) |
 | `.select_columns([...])` | project by top-level name |
 | `.select_field_ids([...])` | project by Parquet field id |
+| `.select_fields([...])` | project by Arrow field index, **sub-fields included** |
+| `.select_field_ids_deep([...])` | the same, addressed by Parquet field id |
 | `.select_row_groups([...])` | read only these row groups |
 | `.prune_row_groups(predicates)` | drop row groups by statistics |
 | `.prune_pages(predicates)` | drop *pages* by the `ColumnIndex`; returns the rows left |
@@ -273,7 +275,12 @@ from parquet.ext_full import AllCodecs         # optional ZSTD / LZ4
 The four things Iceberg specifically wants:
 
 * **field-id projection** — `reader.select_field_ids([1, 3, 7])` resolves
-  `SchemaElement.field_id` anywhere in the tree, including nested elements;
+  `SchemaElement.field_id` anywhere in the tree, including nested elements.
+  `select_field_ids_deep` goes one step further and projects *into* a nested
+  column: give it the id of a struct field and the batch comes back as that
+  struct with only that field in it, having decoded only the leaves under it.
+  Ancestors are kept as wrappers, a map always keeps its key, and the roots
+  come out in the order they were asked for;
 * **`split_offsets`** — `reader.split_offsets()` is each row group's
   `file_offset`, falling back to its first column chunk's starting page, which
   is what `data_file.split_offsets` records;
@@ -292,7 +299,7 @@ which returns how many row groups survived.
 
 ## Tests
 
-`pixi run test` — **45 tests**, on `default` (nightly) and `stable` (Mojo
+`pixi run test` — **48 tests**, on `default` (nightly) and `stable` (Mojo
 1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 6 more for ZSTD
 and LZ4, including a write/read round trip through each and the
 ZSTD-compressed Iceberg fixtures.
