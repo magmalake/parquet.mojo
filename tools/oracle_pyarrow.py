@@ -20,6 +20,7 @@ become JSON objects and maps become arrays of `[key, value]` pairs.
   time/timestamp  the integer in the column's own unit
 """
 
+import decimal
 import json
 import os
 import struct
@@ -72,7 +73,9 @@ def render(v, t):
     if pa.types.is_floating(t):
         return dbits(v)
     if pa.types.is_decimal(t):
-        return str(int(v.scaleb(t.scale)))
+        # scaleb() honours the *context* precision, which defaults to 28
+        # significant digits and would silently round a 38-digit decimal.
+        return str(int(v.scaleb(t.scale, decimal.Context(prec=80))))
     if pa.types.is_string(t) or pa.types.is_large_string(t):
         return str(v)
     if pa.types.is_binary(t) or pa.types.is_large_binary(t) or pa.types.is_fixed_size_binary(t):
@@ -172,7 +175,11 @@ def _stat_render(v, t):
     import decimal as _d
 
     if isinstance(v, _d.Decimal):
-        return str(int(v.scaleb(t.scale))) if pa.types.is_decimal(t) else str(v)
+        return (
+            str(int(v.scaleb(t.scale, _d.Context(prec=80))))
+            if pa.types.is_decimal(t)
+            else str(v)
+        )
     return None
 
 
