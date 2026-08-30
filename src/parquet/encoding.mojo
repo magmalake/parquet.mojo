@@ -373,15 +373,15 @@ def gather_into(
     var dst = out.bytes.unsafe_ptr().unsafe_offset(vbase)
     var src = dict.bytes.unsafe_ptr()
     if w == 8:
-        var d8 = dst.bitcast[UInt64]()
-        var s8 = src.bitcast[UInt64]()
+        var d8 = dst.unsafe_bitcast[UInt64]()
+        var s8 = src.unsafe_bitcast[UInt64]()
         for i in range(n):
             d8.unsafe_store(
                 i, s8.unsafe_load[alignment=1](Int(idx.unsafe_load(i)))
             )
     elif w == 4:
-        var d4 = dst.bitcast[UInt32]()
-        var s4 = src.bitcast[UInt32]()
+        var d4 = dst.unsafe_bitcast[UInt32]()
+        var s4 = src.unsafe_bitcast[UInt32]()
         for i in range(n):
             d4.unsafe_store(
                 i, s4.unsafe_load[alignment=1](Int(idx.unsafe_load(i)))

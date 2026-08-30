@@ -772,15 +772,15 @@ def shred_flat(
     var src = a.values.unsafe_ptr().unsafe_offset(r0 * aw)
     var vi = 0
     if aw == 8:
-        var d8 = dst.bitcast[UInt64]()
-        var s8 = src.bitcast[UInt64]()
+        var d8 = dst.unsafe_bitcast[UInt64]()
+        var s8 = src.unsafe_bitcast[UInt64]()
         for k in range(n):
             if Int(dp2.unsafe_load(base + k)) == d:
                 d8.unsafe_store(vi, s8.unsafe_load[alignment=1](k))
                 vi += 1
     elif aw == 4:
-        var d4 = dst.bitcast[UInt32]()
-        var s4 = src.bitcast[UInt32]()
+        var d4 = dst.unsafe_bitcast[UInt32]()
+        var s4 = src.unsafe_bitcast[UInt32]()
         for k in range(n):
             if Int(dp2.unsafe_load(base + k)) == d:
                 d4.unsafe_store(vi, s4.unsafe_load[alignment=1](k))
@@ -958,7 +958,7 @@ def _min_max_numeric(
         return (lo, hi, True)
     var raw = values.bytes.unsafe_ptr()
     if phys == Type.INT64.value and values.width == 8:
-        var p = raw.bitcast[Int64]()
+        var p = raw.unsafe_bitcast[Int64]()
         var lo = start
         var hi = start
         if id == AT_UINT64:
@@ -985,7 +985,7 @@ def _min_max_numeric(
                     hi = i
         return (lo, hi, True)
     if phys == Type.INT32.value and values.width == 4:
-        var p = raw.bitcast[Int32]()
+        var p = raw.unsafe_bitcast[Int32]()
         var lo = start
         var hi = start
         if id == AT_UINT8 or id == AT_UINT16 or id == AT_UINT32:
@@ -1012,7 +1012,7 @@ def _min_max_numeric(
                     hi = i
         return (lo, hi, True)
     if phys == Type.DOUBLE.value and values.width == 8:
-        var p = raw.bitcast[Float64]()
+        var p = raw.unsafe_bitcast[Float64]()
         var lo = -1
         var hi = -1
         var mn = Float64(0)
@@ -1035,7 +1035,7 @@ def _min_max_numeric(
                 hi = i
         return (lo, hi, True)
     if phys == Type.FLOAT.value and values.width == 4:
-        var p = raw.bitcast[Float32]()
+        var p = raw.unsafe_bitcast[Float32]()
         var lo = -1
         var hi = -1
         var mn = Float32(0)
@@ -1190,8 +1190,8 @@ struct DictBuilder(Defaultable, Movable):
             at * self.key_width
         )
         if self.key_width == 8:
-            return p.bitcast[UInt64]().unsafe_load[alignment=1](0)
-        return UInt64(p.bitcast[UInt32]().unsafe_load[alignment=1](0))
+            return p.unsafe_bitcast[UInt64]().unsafe_load[alignment=1](0)
+        return UInt64(p.unsafe_bitcast[UInt32]().unsafe_load[alignment=1](0))
 
     def _grow(mut self) raises:
         var cap = (Int(self.mask) + 1) * 2
@@ -1438,14 +1438,14 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
                 if kw == 8:
                     k = builder.index_of_key(
                         src.unsafe_offset(i * 8)
-                        .bitcast[UInt64]()
+                        .unsafe_bitcast[UInt64]()
                         .unsafe_load[alignment=1](0)
                     )
                 elif kw == 4:
                     k = builder.index_of_key(
                         UInt64(
                             src.unsafe_offset(i * 4)
-                            .bitcast[UInt32]()
+                            .unsafe_bitcast[UInt32]()
                             .unsafe_load[alignment=1](0)
                         )
                     )

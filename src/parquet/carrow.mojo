@@ -154,7 +154,7 @@ struct _Block(Movable):
         self.size = _align8(size)
         self.base = alloc[UInt64](self.size // 8)
         self.used = 0
-        var p = self.base.bitcast[UInt8]()
+        var p = self.base.unsafe_bitcast[UInt8]()
         for i in range(self.size):
             p[unsafe_offset=i] = 0
 

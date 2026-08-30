@@ -126,7 +126,7 @@ def _u64_at(data: Span[UInt8, _], byte: Int) -> UInt64:
     return (
         data.unsafe_ptr()
         .unsafe_offset(byte)
-        .bitcast[UInt64]()
+        .unsafe_bitcast[UInt64]()
         .unsafe_load[alignment=1](0)
     )
 
