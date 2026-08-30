@@ -241,11 +241,11 @@ def decode_stats(leaf: LeafColumn, st: Statistics) raises -> TypedStats:
     var lo = List[UInt8]()
     var hi = List[UInt8]()
     var have = False
-    if st.min_value and st.max_value:
+    if Bool(st.min_value) and Bool(st.max_value):
         lo = st.min_value.value().copy()
         hi = st.max_value.value().copy()
         have = True
-    elif st.min and st.max:
+    elif Bool(st.min) and Bool(st.max):
         # The deprecated fields. parquet-mr wrote signed comparisons for
         # BYTE_ARRAY here, which is the wrong order for UTF8, so those are
         # ignored rather than trusted.

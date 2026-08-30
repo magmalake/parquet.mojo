@@ -308,6 +308,15 @@ def bit_get(bitmap: Span[UInt8, _], i: Int) -> Bool:
     return ((bitmap[byte] >> UInt8(i % 8)) & 1) == 1
 
 
+def bit_fill_valid(mut bitmap: List[UInt8], count: Int):
+    """Materialise a bitmap in which the first `count` entries are all valid."""
+    var whole = count // 8
+    for _ in range(whole):
+        bitmap.append(0xFF)
+    if count % 8:
+        bitmap.append((UInt8(1) << UInt8(count % 8)) - 1)
+
+
 def bit_set(mut bitmap: List[UInt8], i: Int, value: Bool):
     var byte = i // 8
     while len(bitmap) <= byte:

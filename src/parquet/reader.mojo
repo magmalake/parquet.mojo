@@ -21,6 +21,10 @@ from their statistics against simple `column op literal` predicates.
 from parquet.arrow import (
     AT_BINARY,
     AT_BOOL,
+    AT_UINT16,
+    AT_UINT32,
+    AT_UINT64,
+    AT_UINT8,
     AT_FLOAT16,
     AT_FLOAT32,
     AT_FLOAT64,
@@ -145,10 +149,10 @@ struct RecordBatch(Copyable, Movable, Defaultable):
     def num_columns(self) -> Int:
         return len(self.roots)
 
-    def column(ref self, i: Int) -> ref [self.arena.nodes] ArrayData:
+    def column(ref self, i: Int) -> ref [self.arena.nodes[0]] ArrayData:
         return self.arena.nodes[self.roots[i]]
 
-    def child(ref self, node: Int, k: Int) -> ref [self.arena.nodes] ArrayData:
+    def child(ref self, node: Int, k: Int) -> ref [self.arena.nodes[0]] ArrayData:
         return self.arena.nodes[self.arena.nodes[node].children[k]]
 
     def name(self, i: Int) -> String:
@@ -158,14 +162,14 @@ struct RecordBatch(Copyable, Movable, Defaultable):
         return self.arena.nodes[self.roots[i]].type.copy()
 
 
-def _valid_list(a: ArrayData) -> List[Bool]:
-    var out = List[Bool](capacity=a.length)
+def _append_validity(a: ArrayData, mut out: List[Bool]):
     for i in range(a.length):
         out.append(bit_get(Span(a.validity), i))
-    return out^
 
 
-def array_i64(a: ArrayData) raises -> Tuple[List[Int64], List[Bool]]:
+def array_i64_into(
+    a: ArrayData, mut vals: List[Int64], mut valid: List[Bool]
+) raises:
     """Widen any integer, date, time or timestamp array to `Int64`."""
     var w = a.type.fixed_width()
     if w == 0 or a.type.id == AT_FLOAT32 or a.type.id == AT_FLOAT64:
@@ -173,9 +177,11 @@ def array_i64(a: ArrayData) raises -> Tuple[List[Int64], List[Bool]]:
             String("parquet: column of type ", String(a.type), " is not an integer")
         )
     var signed = not (
-        a.type.id == 6 or a.type.id == 7 or a.type.id == 8 or a.type.id == 9
+        a.type.id == AT_UINT8
+        or a.type.id == AT_UINT16
+        or a.type.id == AT_UINT32
+        or a.type.id == AT_UINT64
     )
-    var out = List[Int64](capacity=a.length)
     for i in range(a.length):
         var u: UInt64 = 0
         for k in range(w):
@@ -184,51 +190,82 @@ def array_i64(a: ArrayData) raises -> Tuple[List[Int64], List[Bool]]:
             var sign_bit = UInt64(1) << UInt64(8 * w - 1)
             if (u & sign_bit) != 0:
                 u |= ~((UInt64(1) << UInt64(8 * w)) - 1)
-        out.append(bitcast[DType.int64](u))
-    return (out^, _valid_list(a))
+        vals.append(bitcast[DType.int64](u))
+    _append_validity(a, valid)
 
 
-def array_f64(a: ArrayData) raises -> Tuple[List[Float64], List[Bool]]:
-    var out = List[Float64](capacity=a.length)
+def array_f64_into(
+    a: ArrayData, mut vals: List[Float64], mut valid: List[Bool]
+) raises:
     if a.type.id == AT_FLOAT64:
         for i in range(a.length):
-            out.append(load_f64(Span(a.values), i))
+            vals.append(load_f64(Span(a.values), i))
     elif a.type.id == AT_FLOAT32:
         for i in range(a.length):
-            out.append(Float64(load_f32(Span(a.values), i)))
+            vals.append(Float64(load_f32(Span(a.values), i)))
     elif a.type.id == AT_FLOAT16:
         for i in range(a.length):
             var bits = UInt16(a.values[i * 2]) | (UInt16(a.values[i * 2 + 1]) << 8)
-            out.append(Float64(bitcast[DType.float16](bits)))
+            vals.append(Float64(bitcast[DType.float16](bits)))
     else:
         raise Error(
             String("parquet: column of type ", String(a.type), " is not floating point")
         )
-    return (out^, _valid_list(a))
+    _append_validity(a, valid)
 
 
-def array_bool(a: ArrayData) raises -> Tuple[List[Bool], List[Bool]]:
+def array_bool_into(
+    a: ArrayData, mut vals: List[Bool], mut valid: List[Bool]
+) raises:
     if a.type.id != AT_BOOL:
         raise Error(
             String("parquet: column of type ", String(a.type), " is not boolean")
         )
-    var out = List[Bool](capacity=a.length)
     for i in range(a.length):
-        out.append(bit_get(Span(a.values), i))
-    return (out^, _valid_list(a))
+        vals.append(bit_get(Span(a.values), i))
+    _append_validity(a, valid)
 
 
-def array_str(a: ArrayData) raises -> Tuple[List[String], List[Bool]]:
+def array_str_into(
+    a: ArrayData, mut vals: List[String], mut valid: List[Bool]
+) raises:
     if a.type.id != AT_UTF8 and a.type.id != AT_BINARY:
         raise Error(
             String("parquet: column of type ", String(a.type), " is not a byte array")
         )
-    var out = List[String](capacity=a.length)
     for i in range(a.length):
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
-        out.append(String(StringSlice(unsafe_from_utf8=Span(a.values)[lo:hi])))
-    return (out^, _valid_list(a))
+        vals.append(String(StringSlice(unsafe_from_utf8=Span(a.values)[lo:hi])))
+    _append_validity(a, valid)
+
+
+def array_i64(a: ArrayData) raises -> Tuple[List[Int64], List[Bool]]:
+    var vals = List[Int64]()
+    var valid = List[Bool]()
+    array_i64_into(a, vals, valid)
+    return (vals^, valid^)
+
+
+def array_f64(a: ArrayData) raises -> Tuple[List[Float64], List[Bool]]:
+    var vals = List[Float64]()
+    var valid = List[Bool]()
+    array_f64_into(a, vals, valid)
+    return (vals^, valid^)
+
+
+def array_bool(a: ArrayData) raises -> Tuple[List[Bool], List[Bool]]:
+    var vals = List[Bool]()
+    var valid = List[Bool]()
+    array_bool_into(a, vals, valid)
+    return (vals^, valid^)
+
+
+def array_str(a: ArrayData) raises -> Tuple[List[String], List[Bool]]:
+    var vals = List[String]()
+    var valid = List[Bool]()
+    array_str_into(a, vals, valid)
+    return (vals^, valid^)
 
 
 struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
@@ -630,34 +667,26 @@ struct Table(Copyable, Movable, Defaultable):
         var vals = List[Int64]()
         var valid = List[Bool]()
         for b in self.batches:
-            var got = array_i64(b.column(i))
-            vals.extend(got[0])
-            valid.extend(got[1])
+            array_i64_into(b.column(i), vals, valid)
         return (vals^, valid^)
 
     def column_f64(self, i: Int) raises -> Tuple[List[Float64], List[Bool]]:
         var vals = List[Float64]()
         var valid = List[Bool]()
         for b in self.batches:
-            var got = array_f64(b.column(i))
-            vals.extend(got[0])
-            valid.extend(got[1])
+            array_f64_into(b.column(i), vals, valid)
         return (vals^, valid^)
 
     def column_bool(self, i: Int) raises -> Tuple[List[Bool], List[Bool]]:
         var vals = List[Bool]()
         var valid = List[Bool]()
         for b in self.batches:
-            var got = array_bool(b.column(i))
-            vals.extend(got[0])
-            valid.extend(got[1])
+            array_bool_into(b.column(i), vals, valid)
         return (vals^, valid^)
 
     def column_str(self, i: Int) raises -> Tuple[List[String], List[Bool]]:
         var vals = List[String]()
         var valid = List[Bool]()
         for b in self.batches:
-            var got = array_str(b.column(i))
-            vals.extend(got[0])
-            valid.extend(got[1])
+            array_str_into(b.column(i), vals, valid)
         return (vals^, valid^)

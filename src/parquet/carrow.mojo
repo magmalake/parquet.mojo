@@ -143,7 +143,7 @@ struct _Block(Movable):
         self.used = 0
         var p = self.base.bitcast[UInt8]()
         for i in range(self.size):
-            p[i] = 0
+            p[unsafe_offset=i] = 0
 
     def __init__(out self, *, deinit move: Self):
         self.base = move.base
@@ -179,7 +179,7 @@ struct _Block(Movable):
         var at = self.take(len(data) if len(data) else 1)
         var p = self.bytes_at(at)
         for i in range(len(data)):
-            p[i] = data[i]
+            p[unsafe_offset=i] = data[i]
         return at
 
     def put_cstring(mut self, text: StringSlice) raises -> Int:
@@ -187,8 +187,8 @@ struct _Block(Movable):
         var at = self.take(len(b) + 1)
         var p = self.bytes_at(at)
         for i in range(len(b)):
-            p[i] = b[i]
-        p[len(b)] = 0
+            p[unsafe_offset=i] = b[i]
+        p[unsafe_offset = len(b)] = 0
         return at
 
 
@@ -245,10 +245,15 @@ def _offsets_bytes(a: ArrayData) -> Int:
     return 0
 
 
-def _collect(arena: ArrayArena, node: Int, mut order: List[Int]):
-    order.append(node)
-    for c in arena.nodes[node].children:
-        _collect(arena, c, order)
+def _collect(arena: ArrayArena, root: Int, mut order: List[Int]):
+    """Depth-first order of an array and its children, parents first."""
+    var stack: List[Int] = [root]
+    while len(stack):
+        var node = stack.pop()
+        order.append(node)
+        ref kids = arena.nodes[node].children
+        for k in range(len(kids)):
+            stack.append(kids[len(kids) - 1 - k])
 
 
 struct ExportedArray(Movable):
@@ -290,7 +295,7 @@ struct ExportedArray(Movable):
         if s[].release != 0:
             release_schema(s)
 
-    def __del__(deinit self):
+    def __deinit__(deinit self):
         self.release()
 
 
@@ -324,34 +329,47 @@ def _export_schema(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int
         if len(md):
             mdp = blk.put_bytes(Span(md))
         var w = blk.words_at(structs + i * 72)
-        w[0] = Int64(fmt)
-        w[1] = Int64(nm)
-        w[2] = Int64(mdp)
-        w[3] = ARROW_FLAG_NULLABLE if a.nullable else 0
-        w[4] = Int64(kids)
-        w[5] = Int64(kidptr)
-        w[6] = 0
-        w[7] = Int64(_schema_release_addr(i == 0))
-        w[8] = Int64(blk.address()) if i == 0 else 0
+        w[unsafe_offset=0] = Int64(fmt)
+        w[unsafe_offset=1] = Int64(nm)
+        w[unsafe_offset=2] = Int64(mdp)
+        w[unsafe_offset=3] = ARROW_FLAG_NULLABLE if a.nullable else 0
+        w[unsafe_offset=4] = Int64(kids)
+        w[unsafe_offset=5] = Int64(kidptr)
+        w[unsafe_offset=6] = 0
+        w[unsafe_offset=7] = 0
+        w[unsafe_offset=8] = Int64(blk.address()) if i == 0 else 0
+        _store_schema_release(structs + i * 72, i == 0)
         if kids:
             var kp = blk.words_at(kidptr)
             for k in range(kids):
-                kp[k] = Int64(structs + index[a.children[k]] * 72)
+                kp[unsafe_offset=k] = Int64(structs + index[a.children[k]] * 72)
     var addr = structs
     _ = blk^
     return addr
 
 
-def _schema_release_addr(is_root: Bool) -> Int:
-    if is_root:
-        return Int(release_schema)
-    return Int(release_child_schema)
+comptime SchemaReleaseFn = def (
+    UnsafePointer[CArrowSchema, MutUntrackedOrigin]
+) thin abi("C") -> None
+comptime ArrayReleaseFn = def (
+    UnsafePointer[CArrowArray, MutUntrackedOrigin]
+) thin abi("C") -> None
 
 
-def _array_release_addr(is_root: Bool) -> Int:
-    if is_root:
-        return Int(release_array)
-    return Int(release_child_array)
+def _store_schema_release(struct_addr: Int, is_root: Bool):
+    """Write the `release` function pointer into a C `ArrowSchema` (word 7)."""
+    var slot = UnsafePointer[SchemaReleaseFn, MutUntrackedOrigin](
+        unsafe_from_address=struct_addr + 56
+    )
+    slot[] = release_schema if is_root else release_child_schema
+
+
+def _store_array_release(struct_addr: Int, is_root: Bool):
+    """Write the `release` function pointer into a C `ArrowArray` (word 8)."""
+    var slot = UnsafePointer[ArrayReleaseFn, MutUntrackedOrigin](
+        unsafe_from_address=struct_addr + 64
+    )
+    slot[] = release_array if is_root else release_child_array
 
 
 def _export_array(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int:
@@ -387,10 +405,10 @@ def _export_array(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int:
                 var at = blk.take(vb)
                 var p = blk.bytes_at(at)
                 for k in range(vb):
-                    p[k] = a.validity[k] if k < len(a.validity) else 0
-                bp[0] = Int64(at)
+                    p[unsafe_offset=k] = a.validity[k] if k < len(a.validity) else 0
+                bp[unsafe_offset=0] = Int64(at)
             else:
-                bp[0] = 0
+                bp[unsafe_offset=0] = 0
         var slot = 1
         var ob = _offsets_bytes(a)
         if ob > 0:
@@ -398,17 +416,17 @@ def _export_array(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int:
             var p32 = blk.bytes_at(at)
             var wide = ob == 8 * (a.length + 1)
             for k in range(a.length + 1):
-                var v: Int64 = 0
+                var v: Int64
                 if wide:
                     v = a.large_offsets[k] if k < len(a.large_offsets) else 0
                 else:
                     v = Int64(a.offsets[k]) if k < len(a.offsets) else 0
                 var width = 8 if wide else 4
                 for b in range(width):
-                    p32[k * width + b] = UInt8(
+                    p32[unsafe_offset=k * width + b] = UInt8(
                         (UInt64(v) >> UInt64(8 * b)) & 0xFF
                     )
-            bp[slot] = Int64(at)
+            bp[unsafe_offset=slot] = Int64(at)
             slot += 1
         var vb2 = _values_bytes(a)
         if slot < nbuf:
@@ -416,26 +434,27 @@ def _export_array(arena: ArrayArena, root: Int, order: List[Int]) raises -> Int:
                 var at = blk.take(vb2)
                 var p = blk.bytes_at(at)
                 for k in range(vb2):
-                    p[k] = a.values[k] if k < len(a.values) else 0
-                bp[slot] = Int64(at)
+                    p[unsafe_offset=k] = a.values[k] if k < len(a.values) else 0
+                bp[unsafe_offset=slot] = Int64(at)
             else:
-                bp[slot] = Int64(blk.take(1))
+                bp[unsafe_offset=slot] = Int64(blk.take(1))
             slot += 1
         var w = blk.words_at(structs + i * 80)
-        w[0] = Int64(a.length)
-        w[1] = Int64(a.null_count)
-        w[2] = 0
-        w[3] = Int64(nbuf)
-        w[4] = Int64(kids)
-        w[5] = Int64(bufptr)
-        w[6] = Int64(kidptr)
-        w[7] = 0
-        w[8] = Int64(_array_release_addr(i == 0))
-        w[9] = Int64(blk.address()) if i == 0 else 0
+        w[unsafe_offset=0] = Int64(a.length)
+        w[unsafe_offset=1] = Int64(a.null_count)
+        w[unsafe_offset=2] = 0
+        w[unsafe_offset=3] = Int64(nbuf)
+        w[unsafe_offset=4] = Int64(kids)
+        w[unsafe_offset=5] = Int64(bufptr)
+        w[unsafe_offset=6] = Int64(kidptr)
+        w[unsafe_offset=7] = 0
+        w[unsafe_offset=8] = 0
+        w[unsafe_offset=9] = Int64(blk.address()) if i == 0 else 0
+        _store_array_release(structs + i * 80, i == 0)
         if kids:
             var kp = blk.words_at(kidptr)
             for k in range(kids):
-                kp[k] = Int64(structs + index[a.children[k]] * 80)
+                kp[unsafe_offset=k] = Int64(structs + index[a.children[k]] * 80)
     var addr = structs
     _ = blk^
     return addr

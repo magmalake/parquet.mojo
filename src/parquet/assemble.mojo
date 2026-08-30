@@ -29,6 +29,7 @@ from parquet.arrow import (
     AT_STRUCT,
     ArrayArena,
     ArrayData,
+    bit_fill_valid,
     bit_set,
 )
 from parquet.convert import append_null, append_value
@@ -94,6 +95,18 @@ def build_field(
     )
 
 
+def _mark(mut a: ArrayData, i: Int, valid: Bool):
+    """Record the validity of slot `i`, building the bitmap only if needed."""
+    if valid:
+        if len(a.validity):
+            bit_set(a.validity, i, True)
+        return
+    if len(a.validity) == 0 and i > 0:
+        bit_fill_valid(a.validity, i)
+    bit_set(a.validity, i, False)
+    a.null_count += 1
+
+
 def _new_array(s: ParquetSchema, fi: Int) -> ArrayData:
     var a = ArrayData(s.fields[fi].type.copy(), s.fields[fi].name.copy())
     a.nullable = s.fields[fi].nullable
@@ -120,6 +133,7 @@ def _build_leaf(
         var d = Int(cd.defs[i]) if len(cd.defs) else 0
         var present = d == max_def
         if d >= require_def:
+            _mark(out, out.length, present)
             if present:
                 append_value(out, leaf, cd.values, vi)
             else:
@@ -153,10 +167,7 @@ def _build_struct(
         var d = Int(cd.defs[i]) if len(cd.defs) else 0
         var r = Int(cd.reps[i]) if len(cd.reps) else 0
         if d >= require_def and r <= rep_level:
-            var valid = d >= def_level
-            bit_set(out.validity, out.length, valid)
-            if not valid:
-                out.null_count += 1
+            _mark(out, out.length, d >= def_level)
             out.length += 1
     if out.null_count == 0:
         out.validity.clear()
@@ -207,10 +218,7 @@ def _build_list(
         if r <= rep_level:
             if out.length > 0:
                 out.offsets.append(Int32(elems))
-            var valid = d >= def_level
-            bit_set(out.validity, out.length, valid)
-            if not valid:
-                out.null_count += 1
+            _mark(out, out.length, d >= def_level)
             out.length += 1
         elif out.length == 0:
             raise Error(

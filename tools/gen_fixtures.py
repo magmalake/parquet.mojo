@@ -244,8 +244,15 @@ if supports(pq.write_table, "write_page_checksum"):
     idx_kw["write_page_checksum"] = True
 write("pageindex.parquet", pages, **idx_kw)
 
+# `bloom_filter_options` is a {column: {ndv, fpp}} dict on recent pyarrow.
 bloom_kw = {}
-if supports(pq.write_table, "write_bloom_filter"):
+if supports(pq.write_table, "bloom_filter_options"):
+    bloom_kw["bloom_filter_options"] = {
+        "s": {"ndv": 200, "fpp": 0.01},
+        "i": {"ndv": 200, "fpp": 0.01},
+        "d": {"ndv": 200, "fpp": 0.01},
+    }
+elif supports(pq.write_table, "write_bloom_filter"):
     bloom_kw["write_bloom_filter"] = True
 bloom = pa.table(
     {

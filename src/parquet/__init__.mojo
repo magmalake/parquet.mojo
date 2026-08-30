@@ -72,9 +72,13 @@ from parquet.reader import (
     RecordBatch,
     Table,
     array_bool,
+    array_bool_into,
     array_f64,
+    array_f64_into,
     array_i64,
+    array_i64_into,
     array_str,
+    array_str_into,
     op_name,
 )
 from parquet.schema import (

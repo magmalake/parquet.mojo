@@ -12,6 +12,7 @@ platforms = ["osx-arm64", "linux-64"]
 # mojo-compiler 1.0.0 and the nightly compiler refuses to load it. CI checks
 # each sibling out next to this repository.
 [tasks]
+# macOS wants .dylib, Linux .so; the shared-library tasks read $SHLIB_EXT.
 test = { cmd = "mkdir -p build && mojo build tests/test_parquet.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-test && ./build/parquet-test" }
 check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-mojo" }
@@ -20,6 +21,11 @@ fmt = { cmd = "mojo format src tests bench" }
 format-check = { cmd = "mojo format --check src tests bench" }
 # Regenerate tests/fixtures/*.parquet and their pyarrow oracles (needs `uv`).
 fixtures = { cmd = "bash tools/gen_fixtures.sh" }
+# Build the Arrow C Data Interface shared library and import it into pyarrow.
+carrow-lib = { cmd = "mkdir -p build && mojo build --emit shared-lib tools/carrow_export.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/libpqcarrow$SHLIB_EXT" }
+verify-c = { cmd = "bash tools/verify_c_data.sh", depends-on = ["carrow-lib"] }
+# pyarrow's numbers for the same files, for the README's honesty.
+bench-pyarrow = { cmd = "bash tools/bench_pyarrow.sh" }
 
 # The ZSTD / LZ4 codecs are FFI tins, so they live in their own environments:
 # `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.0.0).
@@ -72,6 +78,12 @@ mojo-compiler = "==1.0.0"
 [feature.codecs.dependencies]
 zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo" }
+
+[target.osx-arm64.activation.env]
+SHLIB_EXT = ".dylib"
+
+[target.linux-64.activation.env]
+SHLIB_EXT = ".so"
 
 [environments]
 default = ["nightly"]

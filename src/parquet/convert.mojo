@@ -99,10 +99,12 @@ def int96_to_nanos(src: Span[UInt8, _]) -> Int64:
 
 
 def append_null(mut out: ArrayData, leaf: LeafColumn) raises:
-    """Append a null slot, keeping every buffer the right length."""
+    """Append a null slot, keeping every buffer the right length.
+
+    Validity is the caller's business — `parquet.assemble` maintains it, and
+    only materialises a bitmap once a null actually turns up.
+    """
     var i = out.length
-    bit_set(out.validity, i, False)
-    out.null_count += 1
     out.length += 1
     var id = out.type.id
     if id == AT_BOOL:
@@ -125,7 +127,6 @@ def append_value(
 ) raises:
     """Append value `vi` of `vals`, translated to `out`'s Arrow type."""
     var i = out.length
-    bit_set(out.validity, i, True)
     out.length += 1
     var id = out.type.id
     var phys = leaf.physical

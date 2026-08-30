@@ -169,9 +169,7 @@ def decode_plain(
     if kind == PK_BOOL:
         _need(data, (count + 7) // 8, "PLAIN booleans")
         var out = PhysBuffer(PK_BOOL, 0)
-        out.bytes.reserve((count + 7) // 8)
-        for i in range((count + 7) // 8):
-            out.bytes.append(data[i])
+        out.bytes.extend(data[0 : (count + 7) // 8])
         out.count = count
         return out^
     if kind == PK_VAR:
@@ -197,9 +195,7 @@ def decode_plain(
     var width = physical_width(phys, type_length)
     _need(data, count * width, "PLAIN fixed-width values")
     var out = PhysBuffer(PK_FIXED, width)
-    out.bytes.reserve(count * width)
-    for i in range(count * width):
-        out.bytes.append(data[i])
+    out.bytes.extend(data[0 : count * width])
     out.count = count
     return out^
 
