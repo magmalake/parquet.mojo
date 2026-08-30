@@ -120,7 +120,7 @@ comptime WN_LIST = 1
 comptime WN_MAP = 2
 comptime WN_STRUCT = 3
 
-comptime CREATED_BY = "parquet.mojo version 0.1.0"
+comptime CREATED_BY = "parquet.mojo version 0.3.0"
 
 
 struct WriterOptions(Copyable, Defaultable, Movable):

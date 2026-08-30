@@ -384,26 +384,86 @@ verbatim and are not regenerated.
 ## Performance
 
 `pixi run bench` against `pixi run bench-pyarrow`, single threaded, Apple M4,
-CRC verification off on both sides:
+CRC verification off on both sides. Both timers cover the same thing — bytes
+in memory to Arrow arrays, and Arrow arrays to bytes — and neither side times
+a copy of the input file: `ParquetReader` takes ownership of the bytes, so
+each repeat gets its own copy, made outside the timed region, exactly as
+pyarrow gets a fresh `pa.py_buffer` over the same bytes. Best of N repeats.
+
+### Reading
 
 | file | parquet.mojo | pyarrow 25.0.1 | ratio |
 |---|---|---|---|
-| 1M rows × (int64, double, dictionary int64, dictionary string), 18 MiB | 78.8 ms — 12.7 M rows/s, 235 MB/s | 8.1 ms — 123 M rows/s, 2.3 GB/s | pyarrow 9.7× |
-| 100k rows × 5 mixed types incl. a list column, snappy, 1.3 MiB | 19.8 ms — 5.0 M rows/s, 70 MB/s | 2.3 ms — 44 M rows/s, 614 MB/s | pyarrow 8.7× |
-| 1,000 rows × 3 columns, 20 KiB | 0.26 ms — 3.9 M rows/s | 0.36 ms | **parquet.mojo 1.4×** |
-| 400 rows × 12 columns, every encoding, 19 KiB | 0.19 ms — 2.1 M rows/s | 0.17 ms | pyarrow 1.1× |
-| 500 rows, v2 pages, 13 KiB | 0.16 ms — 3.2 M rows/s | 0.18 ms | **parquet.mojo 1.2×** |
+| 1M rows × (int64, double, dictionary int64, dictionary string), 18 MiB | **4.3 ms** — 232 M rows/s, 4.3 GB/s | 8.2 ms — 122 M rows/s, 2.3 GB/s | **parquet.mojo 1.9×** |
+| 100k rows × 5 mixed types incl. a list column, ~1% nulls, snappy, 1.3 MiB | 4.3 ms — 23 M rows/s, 329 MB/s | 2.3 ms — 44 M rows/s, 616 MB/s | pyarrow 1.9× |
+| 1,000 rows × 3 columns, 20 KiB | **0.17 ms** — 6.0 M rows/s | 0.35 ms | **parquet.mojo 2.1×** |
+| 400 rows × 12 columns, every encoding, 19 KiB | 0.12 ms — 3.3 M rows/s | 0.17 ms | **parquet.mojo 1.4×** |
+| 500 rows, v2 pages, 13 KiB | **0.086 ms** — 5.8 M rows/s | 0.18 ms | **parquet.mojo 2.1×** |
 
-Honestly: pyarrow's C++ decoder is roughly **8–10× faster on bulk data**, which
-is what you would expect from a mature SIMD implementation against a first
-value-at-a-time one. On small files parquet.mojo is level with it or slightly
-ahead, because there is no Python call and no thread pool to set up. Nothing
-here is threaded — Mojo's nightly has no reachable thread pool — so both
-numbers are single-core.
+### Writing
 
-The obvious next wins are bulk paths for the no-nulls, no-nesting case
-(`memcpy` a whole page's values instead of one value at a time) and a
-vectorised level decoder.
+| file | parquet.mojo | pyarrow 25.0.1 | ratio |
+|---|---|---|---|
+| 1M rows × (int64, double, dictionary int64, dictionary string) | 41.6 ms — 24 M rows/s, 451 MB/s | 30.7 ms — 33 M rows/s, 622 MB/s | pyarrow 1.4× |
+| 100k rows × 5 mixed types incl. a list column | 13.5 ms — 7.4 M rows/s, 162 MB/s | 8.3 ms — 12 M rows/s, 290 MB/s | pyarrow 1.6× |
+
+Nothing here is threaded — Mojo's nightly has no reachable thread pool — so
+every number is one core. pyarrow's writer numbers are single-threaded too.
+
+### Where the time goes
+
+`pixi run profile` splits a read into stages and prints the table, so an
+optimisation can be aimed rather than guessed at. For the 1M-row file, in
+milliseconds:
+
+| stage | before | now |
+|---|---|---|
+| footer + page headers | 0.7 | 0.3 |
+| decompression | 0.8 | 0.4 |
+| definition / repetition levels | 32.3 | 0.03 |
+| value decoding | 27.8 | 1.2 |
+| dictionary gather | 9.1 | 3.0 |
+| per-page concatenation | 2.5 | — |
+| row index | — | 0.0 |
+| Dremel assembly | 18.1 | 1.0 |
+| **total** | **76.0** | **4.3** |
+
+What changed, in order of what the profile said to fix:
+
+* **Levels.** A page whose definition levels are all the column maximum — any
+  column with no nulls — is recognised from its run headers and never
+  materialised at all; `ColumnData.all_present` stands in for the array. Pages
+  that do have nulls decode whole runs at a time, a repeated run as a fill and
+  a bit-packed run as one unaligned 64-bit load, shift and mask per value.
+* **The row index.** A column with one slot per row was building a
+  row-to-slot array holding `k` at `k`, and a column with no nulls a
+  row-to-value array holding the same thing. Neither is built now.
+* **Values.** Dictionary indices decode straight into a `UInt32` buffer with
+  no `UInt64` detour; PLAIN values and the dictionary gather write onto the
+  end of the chunk's own buffer, so a page's bytes are copied once instead of
+  twice; byte arrays move eight bytes at a time into a buffer with slack.
+* **Assembly.** When every slot of a range becomes a row — any top-level
+  column, null or not — the array is built one buffer at a time: the validity
+  bitmap in one pass over the levels, the values in one pass that copies the
+  present ones into place. The value-by-value path is left for decimals,
+  `INT96` timestamps and narrow integers carried in a wider physical type,
+  where the Arrow bytes are not the Parquet bytes.
+* **Snappy.** snappy.mojo 0.1.1 moves literals and non-overlapping copies 16
+  bytes at a time; the compressed benchmark file spent a third of its read in
+  that loop.
+
+The writer got the same treatment: `shred_flat` moves a whole unnested column
+in one pass instead of a recursive call per row, the dictionary builder is an
+open-addressed table keyed on the integer value rather than a
+`Dict[UInt64, List[Int]]`, and the chunk's statistics are folded from its
+pages instead of scanning every value a second time. 584 ms to 41.6 ms.
+
+What is left, if you want to take it further: the remaining gap on the
+nullable/nested file is Dremel assembly of the list column and the per-page
+allocation of the decompression buffer, and the biggest single item on the
+wide file is the dictionary gather. A `keep_dictionary` option that handed
+back an Arrow dictionary array would remove the gather entirely for consumers
+that can take one.
 
 ## Gaps
 
@@ -484,7 +544,8 @@ result against the *original* pyarrow oracle, value by value.
 | `pixi run test` | the test suite (`-e stable` for Mojo 1.0.0) |
 | `pixi run check` | the tests plus a build of the CLI |
 | `pixi run -e codecs test-codecs` | the ZSTD / LZ4 tests |
-| `pixi run bench` | the decode benchmarks |
+| `pixi run bench` | the decode and encode benchmarks |
+| `pixi run profile` | per-stage decode profile: where a read spends its time |
 | `pixi run bench-pyarrow` | pyarrow's numbers for the same files (needs `uv`) |
 | `pixi run cli schema f.parquet` | build and run the CLI |
 | `pixi run verify-c` | import the C Data Interface export into pyarrow |
