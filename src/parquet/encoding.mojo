@@ -18,9 +18,11 @@ from std.memory import bitcast
 from parquet.bitio import (
     HybridDecoder,
     bit_width,
+    decode_hybrid_into,
     read_uleb128,
     read_zigzag,
     unpack_lsb,
+    unpack_lsb_into,
     zigzag_decode,
 )
 from thrift import Type
@@ -114,6 +116,16 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
         self.offsets.append(Int32(len(self.bytes)))
         self.count += 1
 
+    def reserve_values(mut self, count: Int, bytes: Int):
+        """Size the buffers for `count` more values and `bytes` more bytes, so
+        that a chunk of many pages does not grow its buffer log-many times."""
+        if self.kind == PK_VAR:
+            self.offsets.reserve(len(self.offsets) + count)
+        elif self.kind == PK_BOOL:
+            self.bytes.reserve((self.count + count + 7) // 8)
+        if bytes > 0:
+            self.bytes.reserve(len(self.bytes) + bytes)
+
     def extend(mut self, other: PhysBuffer) raises:
         """Append every value of `other`, which must have the same shape."""
         if other.count == 0:
@@ -176,8 +188,15 @@ def decode_plain(
         return out^
     if kind == PK_VAR:
         var out = PhysBuffer(PK_VAR, 0)
+        if count == 0:
+            return out^
+        # One pass over the length prefixes fixes every offset and the total
+        # size, so the bytes are copied once into a buffer that never grows.
+        out.offsets.resize(count + 1, 0)
+        var ooff = out.offsets.unsafe_ptr()
         var pos = 0
-        for _ in range(count):
+        var total = 0
+        for i in range(count):
             _need(data, pos + 4, "PLAIN byte array length")
             var n = (
                 Int(data[pos])
@@ -191,8 +210,21 @@ def decode_plain(
                     String("parquet.encoding: negative byte array length ", n)
                 )
             _need(data, pos + n, "PLAIN byte array body")
-            out.append_bytes(data[pos : pos + n])
             pos += n
+            total += n
+            ooff.unsafe_store(i + 1, Int32(total))
+        out.bytes.resize(total, 0)
+        var dst = out.bytes.unsafe_ptr()
+        var src = data.unsafe_ptr()
+        pos = 0
+        for i in range(count):
+            var at = Int(ooff.unsafe_load(i))
+            var n = Int(ooff.unsafe_load(i + 1)) - at
+            pos += 4
+            for b in range(n):
+                dst.unsafe_store(at + b, src.unsafe_load(pos + b))
+            pos += n
+        out.count = count
         return out^
     var width = physical_width(phys, type_length)
     _need(data, count * width, "PLAIN fixed-width values")
@@ -203,31 +235,82 @@ def decode_plain(
 
 
 def gather(dict: PhysBuffer, indices: List[UInt32]) raises -> PhysBuffer:
-    """Materialise dictionary-encoded values from a dictionary page."""
+    """Materialise dictionary-encoded values from a dictionary page.
+
+    Fixed-width entries are a straight gather — one load and one store of the
+    whole element per index. Byte arrays take two passes: lengths into the
+    offsets, then the bytes.
+    """
+    var n = len(indices)
     var out = PhysBuffer(dict.kind, dict.width)
-    if dict.kind == PK_VAR:
-        out.offsets.reserve(len(indices) + 1)
-    elif dict.kind == PK_FIXED:
-        out.bytes.reserve(len(indices) * dict.width)
-    for i in range(len(indices)):
-        var k = Int(indices[i])
-        if k < 0 or k >= dict.count:
+    if n == 0:
+        return out^
+    var idx = indices.unsafe_ptr()
+    var entries = dict.count
+    for i in range(n):
+        if Int(idx.unsafe_load(i)) >= entries:
             raise Error(
                 String(
                     "parquet.encoding: dictionary index ",
-                    k,
+                    idx.unsafe_load(i),
                     " out of range (dictionary has ",
-                    dict.count,
+                    entries,
                     " entries)",
                 )
             )
-        if dict.kind == PK_BOOL:
-            out.append_bool(dict.bool_at(k))
-        elif dict.kind == PK_VAR:
-            out.append_bytes(dict.value_span(k))
-        else:
-            out.bytes.extend(dict.value_span(k))
-            out.count += 1
+
+    if dict.kind == PK_BOOL:
+        for i in range(n):
+            out.append_bool(dict.bool_at(Int(idx.unsafe_load(i))))
+        return out^
+
+    if dict.kind == PK_VAR:
+        var doff = dict.offsets.unsafe_ptr()
+        out.offsets.resize(n + 1, 0)
+        var ooff = out.offsets.unsafe_ptr()
+        var total = 0
+        for i in range(n):
+            var k = Int(idx.unsafe_load(i))
+            ooff.unsafe_store(i, Int32(total))
+            total += Int(doff.unsafe_load(k + 1)) - Int(doff.unsafe_load(k))
+        ooff.unsafe_store(n, Int32(total))
+        out.bytes.resize(total, 0)
+        var dst = out.bytes.unsafe_ptr()
+        var src = dict.bytes.unsafe_ptr()
+        for i in range(n):
+            var k = Int(idx.unsafe_load(i))
+            var at = Int(doff.unsafe_load(k))
+            var end = Int(doff.unsafe_load(k + 1))
+            var to = Int(ooff.unsafe_load(i))
+            for b in range(end - at):
+                dst.unsafe_store(to + b, src.unsafe_load(at + b))
+        out.count = n
+        return out^
+
+    var w = dict.width
+    out.bytes.resize(n * w, 0)
+    var dst = out.bytes.unsafe_ptr()
+    var src = dict.bytes.unsafe_ptr()
+    if w == 8:
+        var d8 = dst.bitcast[UInt64]()
+        var s8 = src.bitcast[UInt64]()
+        for i in range(n):
+            d8.unsafe_store(
+                i, s8.unsafe_load[alignment=1](Int(idx.unsafe_load(i)))
+            )
+    elif w == 4:
+        var d4 = dst.bitcast[UInt32]()
+        var s4 = src.bitcast[UInt32]()
+        for i in range(n):
+            d4.unsafe_store(
+                i, s4.unsafe_load[alignment=1](Int(idx.unsafe_load(i)))
+            )
+    else:
+        for i in range(n):
+            var at = Int(idx.unsafe_load(i)) * w
+            for b in range(w):
+                dst.unsafe_store(i * w + b, src.unsafe_load(at + b))
+    out.count = n
     return out^
 
 
@@ -245,12 +328,8 @@ def decode_dict_indices(
         raise Error(
             String("parquet.encoding: dictionary index bit width ", width)
         )
-    var dec = HybridDecoder(data[1:], width)
-    var raw = List[UInt64]()
-    dec.take(count, raw)
-    var out = List[UInt32](capacity=count)
-    for v in raw:
-        out.append(UInt32(v))
+    var out = List[UInt32](length=count, fill=0)
+    decode_hybrid_into[DType.uint32](data[1:], width, count, out, 0)
     return out^
 
 

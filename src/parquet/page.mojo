@@ -375,6 +375,16 @@ def read_column_chunk[
         physical_kind(leaf.physical),
         physical_width(leaf.physical, leaf.type_length),
     )
+    # Size the chunk's value buffer once from the metadata, so a chunk of many
+    # pages does not grow and copy it log-many times. The bounds keep a
+    # doctored `num_values` from asking for an absurd allocation.
+    var nv = Int(cm.num_values)
+    if nv > 0 and nv < (1 << 30):
+        if out.values.kind == PK_FIXED and out.values.width > 0:
+            if nv * out.values.width <= (1 << 28):
+                out.values.bytes.reserve(nv * out.values.width)
+        elif out.values.kind == PK_VAR and nv <= (1 << 26):
+            out.values.offsets.reserve(nv + 1)
     var offset = chunk_start(cm)
     var limit = offset + Int(cm.total_compressed_size)
     if offset < 0 or limit > len(file):

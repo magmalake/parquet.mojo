@@ -24,17 +24,24 @@ still have them line up.
 """
 
 from parquet.arrow import (
+    AT_BINARY,
+    AT_BOOL,
+    AT_DECIMAL128,
     AT_LIST,
     AT_MAP,
     AT_STRUCT,
+    AT_TIMESTAMP,
+    AT_UTF8,
     ArrayArena,
     ArrayData,
     bit_fill_valid,
     bit_set,
 )
 from parquet.convert import append_null, append_value
+from parquet.encoding import PK_BOOL, PK_FIXED, PK_VAR, PhysBuffer
 from parquet.page import ColumnData
-from parquet.schema import ParquetSchema
+from parquet.schema import LeafColumn, ParquetSchema
+from thrift import Type
 
 
 @fieldwise_init
@@ -166,6 +173,11 @@ def _build_leaf(
     ref leaf = s.leaves[lf]
     var max_def = leaf.max_def
     var out = _new_array(s, fi)
+    if cd.all_present and max_def >= require_def:
+        # Every slot in the range holds a value, so the whole run can move in
+        # one piece instead of a million calls to `append_value`.
+        if _bulk_copy(out, leaf, cd.values, sl.v0, sl.s1 - sl.s0):
+            return arena.add(out^)
     var vi = sl.v0
     for i in range(sl.s0, sl.s1):
         var d = cd.def_at(i, max_def)
@@ -181,6 +193,65 @@ def _build_leaf(
     if out.null_count == 0:
         out.validity.clear()
     return arena.add(out^)
+
+
+def _bulk_copy(
+    mut out: ArrayData, leaf: LeafColumn, vals: PhysBuffer, v0: Int, n: Int
+) raises -> Bool:
+    """Copy `n` values starting at `v0` straight into `out`'s Arrow buffers.
+
+    Returns `False` when the leaf's Arrow type is not simply its physical
+    bytes — a decimal, an `INT96` timestamp, or a narrow integer carried in a
+    wider physical type — and the caller has to go value by value.
+    """
+    if n < 0:
+        return False
+    var id = out.type.id
+    if id == AT_DECIMAL128:
+        return False
+    if id == AT_TIMESTAMP and leaf.physical == Type.INT96.value:
+        return False
+
+    if id == AT_UTF8 or id == AT_BINARY:
+        if vals.kind != PK_VAR or v0 + n + 1 > len(vals.offsets):
+            return False
+        var src = vals.offsets.unsafe_ptr()
+        var b0 = Int(src.unsafe_load(v0))
+        var b1 = Int(src.unsafe_load(v0 + n))
+        out.values.extend(Span(vals.bytes)[b0:b1])
+        out.offsets.resize(n + 1, 0)
+        var dst = out.offsets.unsafe_ptr()
+        for k in range(n + 1):
+            dst.unsafe_store(k, src.unsafe_load(v0 + k) - Int32(b0))
+        out.length = n
+        return True
+
+    if id == AT_BOOL:
+        if vals.kind != PK_BOOL:
+            return False
+        if v0 % 8 == 0:
+            out.values.extend(Span(vals.bytes)[v0 // 8 : (v0 + n + 7) // 8])
+            # The tail byte can carry bits past the end of the run. Arrow
+            # ignores them, but keeping them zero makes a bitmap compare
+            # stable.
+            if n % 8 != 0 and len(out.values) > 0:
+                out.values[len(out.values) - 1] &= (
+                    UInt8(1) << UInt8(n % 8)
+                ) - 1
+        else:
+            for k in range(n):
+                bit_set(out.values, k, vals.bool_at(v0 + k))
+        out.length = n
+        return True
+
+    var w = out.type.fixed_width()
+    if w == 0 or vals.kind != PK_FIXED or vals.width != w:
+        return False
+    if (v0 + n) * w > len(vals.bytes):
+        return False
+    out.values.extend(Span(vals.bytes)[v0 * w : (v0 + n) * w])
+    out.length = n
+    return True
 
 
 def _build_struct(

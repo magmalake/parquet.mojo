@@ -254,6 +254,64 @@ def levels_all_equal(
     return True
 
 
+def decode_hybrid_into[
+    dt: DType
+](
+    data: Span[UInt8, _],
+    width: Int,
+    count: Int,
+    mut out: List[Scalar[dt]],
+    at: Int,
+) raises:
+    """Decode `count` RLE/bit-packed hybrid values into `out[at : at + count]`,
+    which the caller has already sized.
+
+    Runs are handled whole — a repeated run is a fill, a bit-packed run is one
+    `unpack_lsb_into` — so nothing goes through a per-value decoder. This is
+    the hot path for dictionary indices.
+    """
+    if count == 0:
+        return
+    if at < 0 or at + count > len(out):
+        raise Error("parquet.rle: hybrid destination is too small")
+    var pos = 0
+    var done = 0
+    var dst = out.unsafe_ptr()
+    while done < count:
+        if pos >= len(data):
+            raise Error("parquet.rle: ran out of runs before all values")
+        var head = read_uleb128(data, pos)
+        pos = head[1]
+        var indicator = head[0]
+        if (indicator & 1) == 1:
+            var n = Int(indicator >> 1) * 8
+            if n <= 0:
+                raise Error(String("parquet.rle: bit-packed run of ", n))
+            if n > count - done:
+                n = count - done
+            pos = unpack_lsb_into[dt](data, pos, width, n, out, at + done)
+            done += n
+        else:
+            var n = Int(indicator >> 1)
+            if n <= 0:
+                raise Error(String("parquet.rle: RLE run of ", n, " values"))
+            if n > count - done:
+                n = count - done
+            var nbytes = (width + 7) // 8
+            if pos + nbytes > len(data):
+                raise Error(
+                    String("parquet.rle: truncated RLE run value at ", pos)
+                )
+            var v: UInt64 = 0
+            for k in range(nbytes):
+                v |= UInt64(data[pos + k]) << UInt64(8 * k)
+            pos += nbytes
+            var sv = v.cast[dt]()
+            for i in range(at + done, at + done + n):
+                dst.unsafe_store(i, sv)
+            done += n
+
+
 def decode_levels_into(
     data: Span[UInt8, _],
     width: Int,
