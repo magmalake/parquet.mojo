@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/magmalake/parquet.mojo/actions/workflows/ci.yml/badge.svg)](https://github.com/magmalake/parquet.mojo/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> Part of **magmalake** — data lake building blocks in Mojo.
+> Part of [**magmalake**](https://magmalake.org) — data lake building blocks in Mojo.
 
 **The first native Apache Parquet decoder in [Mojo](https://www.modular.com/mojo).**
 Every other Mojo dataframe today shells out to PyArrow through the Python
