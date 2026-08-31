@@ -39,7 +39,7 @@ test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I sr
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
 [package]
 name = "parquet-mojo"
-version = "0.3.2"
+version = "0.3.3"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -47,24 +47,31 @@ backend = { name = "pixi-build-mojo", version = "0.*" }
 [package.build.config.pkg]
 path = "src/parquet"
 name = "parquet"
+# The sibling tins arrive as .mojopkg in the host prefix; pixi-build-mojo does
+# not add them to the import path on its own.
+extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.0.0"
-thrift-mojo = { path = "../thrift.mojo" }
-hashes-mojo = { path = "../hashes.mojo" }
-snappy-mojo = { path = "../snappy.mojo" }
-avro-mojo = { path = "../avro.mojo" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "acb22d480f8081677acd3fe93fd7b82524982d01" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "5022d663ca5a3bae2df092fca4fceeb1b0cc393f" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "ae9d6a0b155a5063b57e2f6367b0e0b28f7b0a9e" }
+avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "0df43fc9037b98c280f74b14a80c319bae4f2934" }
 
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "95812f5d0c600354dc68c23c97e8a09f1e53c960" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
 [package.build-dependencies]
 mojo-compiler = "==1.0.0"
 
 [package.run-dependencies]
 mojo-compiler = ">=1.0.0,<2"
-thrift-mojo = { path = "../thrift.mojo" }
-hashes-mojo = { path = "../hashes.mojo" }
-snappy-mojo = { path = "../snappy.mojo" }
-avro-mojo = { path = "../avro.mojo" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "acb22d480f8081677acd3fe93fd7b82524982d01" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "5022d663ca5a3bae2df092fca4fceeb1b0cc393f" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "ae9d6a0b155a5063b57e2f6367b0e0b28f7b0a9e" }
+avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "0df43fc9037b98c280f74b14a80c319bae4f2934" }
 
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "95812f5d0c600354dc68c23c97e8a09f1e53c960" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
 [feature.nightly.dependencies]
 modular = ">=26.6.0.dev2026082605,<27"
 
