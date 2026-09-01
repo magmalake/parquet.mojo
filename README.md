@@ -46,6 +46,14 @@ for i in range(len(ids[0])):
 
 ## Install
 
+```sh
+pixi shelf add parquet-mojo
+```
+
+That resolves the tin from [mojoshelf](https://mojoshelf.org) and adds it — along with the tins it depends on — as **pixi git source dependencies**. magmalake tins are not published to a conda channel, so `pixi add parquet-mojo` will not find them.
+
+As a dependency declaration, or for a nightly consumer:
+
 ```toml
 [dependencies]
 parquet-mojo = { git = "https://github.com/magmalake/parquet.mojo" }
