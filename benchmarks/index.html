@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark history</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --line: #e4e0da;
+    --ink: #1b1917;
+    --muted: #6d675f;
+    --accent: #b4530a;
+    --good: #2f6f43;
+    --bad: #a8322c;
+    --bad-bg: #fdf1f0;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #171614;
+      --surface: #201e1b;
+      --line: #35322d;
+      --ink: #ece8e2;
+      --muted: #a09991;
+      --accent: #e08a3c;
+      --good: #6fbb87;
+      --bad: #e0736c;
+      --bad-bg: #2c1e1d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  h2 { font-size: 1.05rem; margin: 2.5rem 0 .5rem; letter-spacing: -.005em; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; }
+  .controls { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
+  select, input {
+    font: inherit; padding: .4rem .6rem; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--surface); color: var(--ink);
+  }
+  .host-note { color: var(--muted); font-size: .85rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: right; padding: .45rem .6rem; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; font-family: var(--mono); font-size: .85rem; }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+  td { font-variant-numeric: tabular-nums; }
+  tr.regressed td { background: var(--bad-bg); }
+  .delta-good { color: var(--good); }
+  .delta-bad { color: var(--bad); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  .cards { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: .5rem; }
+  .card {
+    border: 1px solid var(--bad); border-radius: 8px; padding: .7rem .9rem;
+    background: var(--bad-bg); min-width: 210px;
+  }
+  .card__name { font-family: var(--mono); font-size: .82rem; }
+  .card__pct { font-size: 1.3rem; font-weight: 700; color: var(--bad); }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .chart {
+    border: 1px solid var(--line); border-radius: 8px; padding: .75rem;
+    background: var(--surface);
+  }
+  .chart h3 { margin: 0 0 .4rem; font-size: .85rem; font-family: var(--mono); font-weight: 600; }
+  .empty { color: var(--muted); padding: 2rem 0; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Benchmark history</h1>
+  <p class="sub" id="sub">Loading…</p>
+
+  <div id="content" hidden>
+    <div class="controls">
+      <label>Machine
+        <select id="host"></select>
+      </label>
+      <input id="filter" type="search" placeholder="Filter benchmarks…" size="24">
+      <span class="host-note" id="host-note"></span>
+    </div>
+
+    <section id="attention" hidden>
+      <h2>Needs attention</h2>
+      <p class="sub">Slower than the previous window by more than normal variance.</p>
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <h2>Latest run</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>benchmark</th><th>rate</th><th>mean</th><th>spread</th><th>vs&nbsp;previous</th></tr>
+        </thead>
+        <tbody id="latest"></tbody>
+      </table>
+    </div>
+
+    <h2>Over time</h2>
+    <div class="grid" id="charts"></div>
+  </div>
+
+  <p class="empty" id="empty" hidden>
+    No <code>data.json</code> yet. It appears after the first benchmark run lands on
+    <code>main</code>.
+  </p>
+
+  <footer>
+    Each series is one benchmark on one machine. Runs from different machines are never
+    averaged together — a laptop and a CI runner are not points on the same line.
+    Published by <a href="https://github.com/magmalake/bench.mojo">bench.mojo</a>.
+  </footer>
+</div>
+
+<script>
+const WINDOW = 5;
+
+const fmtTime = (ns) => {
+  if (!isFinite(ns)) return "—";
+  if (ns < 1e3) return ns.toFixed(1) + " ns";
+  if (ns < 1e6) return (ns / 1e3).toFixed(2) + " µs";
+  if (ns < 1e9) return (ns / 1e6).toFixed(2) + " ms";
+  return (ns / 1e9).toFixed(2) + " s";
+};
+
+// Rates arrive in units of a billion per second, as the harness reports them.
+const fmtRate = (giga, unit) => {
+  if (giga == null) return "—";
+  const base = (unit || "G/s").replace(/^G/, "");
+  const perS = giga * 1e9;
+  if (perS >= 1e9) return (perS / 1e9).toFixed(2) + " G" + base;
+  if (perS >= 1e6) return (perS / 1e6).toFixed(2) + " M" + base;
+  if (perS >= 1e3) return (perS / 1e3).toFixed(2) + " K" + base;
+  return perS.toFixed(2) + " " + base;
+};
+
+const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+const stddev = (xs, m) =>
+  xs.length < 2 ? 0 : Math.sqrt(xs.reduce((a, x) => a + (x - m) ** 2, 0) / (xs.length - 1));
+
+/**
+ * One number per run where higher is always better, so regressions are always
+ * a fall. Throughput when the benchmark declares one, otherwise the reciprocal
+ * of the mean time.
+ */
+const goodness = (r) =>
+  r == null ? null : (r.throughput != null ? r.throughput : (r.mean_ns > 0 ? 1 / r.mean_ns : null));
+
+/**
+ * Compare the last WINDOW runs against the WINDOW before them. The threshold
+ * is the larger of 5% and twice the baseline's coefficient of variation, so a
+ * noisy benchmark has to move further before it is called a regression.
+ */
+function detect(series) {
+  const vals = series.filter((v) => v != null);
+  if (vals.length < 2) return { known: false };
+  if (vals.length < 2 * WINDOW) {
+    const pct = (vals[vals.length - 1] - vals[0]) / Math.abs(vals[0]);
+    return { known: false, changePct: pct, warming: true };
+  }
+  const recent = vals.slice(-WINDOW);
+  const base = vals.slice(-2 * WINDOW, -WINDOW);
+  const baseMean = mean(base);
+  if (baseMean === 0) return { known: false };
+  const cv = stddev(base, baseMean) / Math.abs(baseMean);
+  const threshold = Math.max(0.05, 2 * cv);
+  const changePct = (mean(recent) - baseMean) / Math.abs(baseMean);
+  return { known: true, changePct, threshold, regressed: changePct < -threshold };
+}
+
+let STATE = { history: null, host: null, filter: "" };
+const charts = [];
+
+fetch("data.json")
+  .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+  .then(start)
+  .catch(() => {
+    document.getElementById("sub").textContent = "";
+    document.getElementById("empty").hidden = false;
+  });
+
+function start(history) {
+  STATE.history = history;
+  const hostKeys = Object.keys(history.hosts || {});
+  if (!history.runs || !history.runs.length || !hostKeys.length) {
+    document.getElementById("sub").textContent = "";
+    document.getElementById("empty").hidden = false;
+    return;
+  }
+
+  const sel = document.getElementById("host");
+  // Default to whichever machine reported most recently.
+  const newestHost = history.runs[0].host;
+  for (const k of hostKeys) {
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = k;
+    if (k === newestHost) o.selected = true;
+    sel.append(o);
+  }
+  sel.hidden = hostKeys.length < 2;
+  STATE.host = newestHost;
+  sel.addEventListener("change", () => { STATE.host = sel.value; render(); });
+
+  const filter = document.getElementById("filter");
+  filter.addEventListener("input", () => { STATE.filter = filter.value.trim(); render(); });
+
+  document.getElementById("content").hidden = false;
+  render();
+}
+
+/** Runs for the selected host, oldest first — the order a trend reads in. */
+function runsForHost() {
+  return STATE.history.runs.filter((r) => r.host === STATE.host).slice().reverse();
+}
+
+function render() {
+  const runs = runsForHost();
+  const latest = runs[runs.length - 1];
+  const host = STATE.history.hosts[STATE.host] || {};
+
+  const bits = [host.cpu, `${host.os}/${host.arch}`, `${host.physical_cores} cores`];
+  if (host.memory_bytes) bits.push(`${Math.round(host.memory_bytes / 1024 ** 3)} GiB`);
+  document.getElementById("host-note").textContent = bits.filter(Boolean).join(" · ");
+
+  document.getElementById("sub").textContent =
+    `${runs.length} run${runs.length === 1 ? "" : "s"} on this machine · latest ` +
+    `${latest.short_commit} on ${latest.ref} at ${latest.timestamp}`;
+
+  const names = STATE.history.benchmarks.filter(
+    (n) => !STATE.filter || n.toLowerCase().includes(STATE.filter.toLowerCase()),
+  );
+
+  const verdicts = {};
+  for (const n of names) verdicts[n] = detect(runs.map((r) => goodness(r.results[n])));
+
+  // Needs attention
+  const bad = names.filter((n) => verdicts[n].regressed);
+  const cards = document.getElementById("cards");
+  cards.replaceChildren();
+  document.getElementById("attention").hidden = bad.length === 0;
+  for (const n of bad) {
+    const el = document.createElement("div");
+    el.className = "card";
+    el.innerHTML =
+      `<div class="card__name">${n}</div>` +
+      `<div class="card__pct">${(verdicts[n].changePct * 100).toFixed(1)}%</div>`;
+    cards.append(el);
+  }
+
+  // Latest run
+  const body = document.getElementById("latest");
+  body.replaceChildren();
+  for (const n of names) {
+    const r = latest.results[n];
+    const tr = document.createElement("tr");
+    if (!r) {
+      tr.innerHTML = `<td>${n}</td><td colspan="4" class="host-note">not in this run</td>`;
+      body.append(tr);
+      continue;
+    }
+    if (verdicts[n].regressed) tr.className = "regressed";
+    const v = verdicts[n];
+    let delta = "—";
+    if (v.changePct != null) {
+      const cls = v.regressed ? "delta-bad" : (v.changePct >= 0 ? "delta-good" : "");
+      const suffix = v.known ? "" : " ?";
+      delta = `<span class="${cls}">${(v.changePct * 100).toFixed(1)}%${suffix}</span>`;
+    }
+    tr.innerHTML =
+      `<td>${n}</td>` +
+      `<td>${fmtRate(r.throughput, r.throughput_unit)}</td>` +
+      `<td>${fmtTime(r.mean_ns)}</td>` +
+      `<td>${fmtTime(r.min_ns)} – ${fmtTime(r.max_ns)}</td>` +
+      `<td>${delta}</td>`;
+    body.append(tr);
+  }
+
+  drawCharts(runs, names);
+}
+
+function drawCharts(runs, names) {
+  while (charts.length) charts.pop().destroy();
+  const grid = document.getElementById("charts");
+  grid.replaceChildren();
+
+  const css = getComputedStyle(document.body);
+  const ink = css.getPropertyValue("--ink").trim();
+  const muted = css.getPropertyValue("--muted").trim();
+  const line = css.getPropertyValue("--line").trim();
+  const accent = css.getPropertyValue("--accent").trim();
+
+  for (const n of names) {
+    const points = runs.map((r) => r.results[n]).map((r) => (r ? r : null));
+    if (!points.some(Boolean)) continue;
+    const usesRate = points.some((p) => p && p.throughput != null);
+    const unit = (points.find((p) => p && p.throughput_unit) || {}).throughput_unit;
+
+    const box = document.createElement("div");
+    box.className = "chart";
+    box.innerHTML = `<h3>${n}</h3><canvas height="150"></canvas>`;
+    grid.append(box);
+
+    charts.push(new Chart(box.querySelector("canvas"), {
+      type: "line",
+      data: {
+        labels: runs.map((r) => r.short_commit),
+        datasets: [{
+          data: points.map((p) => (p == null ? null : (usesRate ? p.throughput : p.mean_ns))),
+          borderColor: accent,
+          backgroundColor: accent + "22",
+          borderWidth: 2,
+          pointRadius: runs.length > 40 ? 0 : 2,
+          tension: 0.15,
+          spanGaps: true,
+          fill: true,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (c) => (usesRate ? fmtRate(c.parsed.y, unit) : fmtTime(c.parsed.y)),
+              afterLabel: (c) => {
+                const p = points[c.dataIndex];
+                return p ? `${fmtTime(p.min_ns)} – ${fmtTime(p.max_ns)} over ${p.reps} reps` : "";
+              },
+            },
+          },
+        },
+        scales: {
+          x: { ticks: { color: muted, maxTicksLimit: 8 }, grid: { color: line } },
+          y: {
+            // Not zero-based: these are trends, and a fixed floor flattens them.
+            ticks: {
+              color: muted,
+              callback: (v) => (usesRate ? fmtRate(v, unit) : fmtTime(v)),
+            },
+            grid: { color: line },
+            title: {
+              display: true,
+              color: muted,
+              text: usesRate ? "higher is better" : "lower is better",
+            },
+          },
+        },
+        color: ink,
+      },
+    }));
+  }
+}
+</script>
+</body>
+</html>
