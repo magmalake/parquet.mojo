@@ -1,0 +1,26 @@
+# Benchmarks, and the history behind
+# https://magmalake.github.io/parquet.mojo/benchmarks/
+#
+# The pipeline lives in magmalake/.github so every tin shares one copy: it runs
+# `pixi run -e bench bench`, folds the report into this repo's gh-pages history,
+# and republishes the dashboard. Pull requests run the benchmarks and publish
+# nothing.
+#
+# The wide benchmarks are skipped here: they need build/bench-wide.parquet,
+# which `tools/bench_pyarrow.py --make` generates and which is deliberately not
+# committed. Run them locally for the 1M-row numbers.
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    uses: magmalake/.github/.github/workflows/bench-report.yml@main
+    permissions:
+      contents: write
+    with:
+      args: "--skip bench_read_wide bench_write_wide"

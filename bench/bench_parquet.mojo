@@ -173,15 +173,6 @@ def bench_write_big(mut b: Benchmark) raises:
 def _print_shape() raises:
     """File sizes and row counts, once, so a MB/s figure can be derived from
     the table without the benchmark computing one."""
-    try:
-        _ = _read_file(WIDE)
-    except:
-        raise Error(
-            "build/bench-wide.parquet is missing. Generate it with"
-            " `python tools/bench_pyarrow.py --make`, or run with"
-            " `-- --skip bench_read_wide bench_write_wide`."
-        )
-
     var names: List[String] = [
         String(FIXTURES, "big.parquet"),
         String(FIXTURES, "prune.parquet"),
@@ -191,11 +182,21 @@ def _print_shape() raises:
     ]
     print("parquet.mojo benchmarks (single threaded)")
     for i in range(len(names)):
-        var data = _read_file(names[i])
-        print(
-            "  ", names[i], ": ", _rows_in(data), " rows, ",
-            len(data) // 1024, " KiB", sep="",
-        )
+        # A missing file is reported, not raised: the wide fixture is
+        # generated rather than committed, and `--skip bench_read_wide
+        # bench_write_wide` has to be able to run without it. A benchmark
+        # that actually needs the file still fails when it is selected.
+        try:
+            var data = _read_file(names[i])
+            print(
+                "  ", names[i], ": ", _rows_in(data), " rows, ",
+                len(data) // 1024, " KiB", sep="",
+            )
+        except:
+            print(
+                "  ", names[i], ": missing — generate it with"
+                " `python tools/bench_pyarrow.py --make`", sep="",
+            )
 
 
 def main() raises:

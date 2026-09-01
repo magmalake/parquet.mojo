@@ -100,7 +100,7 @@ SHLIB_EXT = ".so"
 # path. Stable only: a precompiled Mojo package is stamped with the compiler
 # version that built it and refused by any other, and tins build with 1.0.0.
 [feature.bench.dependencies]
-bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "3334bd5b5dd4de27c93db37c926e06364c4fbe72" }
+bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "971759f58b862cfaa8fdef8708cd42f52ac719f9" }
 
 [feature.bench.tasks]
 bench = "mojo run -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo"
