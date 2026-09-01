@@ -45,7 +45,7 @@ jobs:
         with:
           # Pinned: pixi.lock is written by this version, and a newer pixi
           # rejects the committed lock with "lock file not up-to-date".
-          pixi-version: v0.78.0
+          pixi-version: v0.71.1
           manifest-path: parquet.mojo/pixi.toml
           environments: ${{ matrix.env }}
 
@@ -104,7 +104,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          pixi-version: v0.78.0
+          pixi-version: v0.71.1
           manifest-path: parquet.mojo/pixi.toml
           environments: ${{ matrix.env }}
 
@@ -140,7 +140,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          pixi-version: v0.78.0
+          pixi-version: v0.71.1
           manifest-path: parquet.mojo/pixi.toml
           environments: default
 
