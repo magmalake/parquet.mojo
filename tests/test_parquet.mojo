@@ -99,6 +99,8 @@ from thrift import (
     read_parquet_file,
 )
 
+from std.benchmark.compiler import keep
+
 comptime FIXTURES = "tests/fixtures/"
 
 
@@ -1370,6 +1372,51 @@ def test_written_schema_shapes() raises:
             r.schema.leaves[i].max_rep,
             String("leaf ", i, " max_rep"),
         )
+
+
+# ── borrowing the file bytes ───────────────────────────────────────────────
+
+
+def test_from_span_reads_the_same_table_as_the_owning_constructor() raises:
+    var bytes = fixture_bytes("big")
+
+    var owned = ParquetReader[DefaultCodecs](bytes.copy())
+    var want = owned.read_table()
+
+    var borrowed = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var got = borrowed.read_table()
+
+    assert_equal(got.num_rows, want.num_rows)
+    assert_equal(len(borrowed.meta.row_groups), len(owned.meta.row_groups))
+    assert_equal(len(borrowed.schema.leaves), len(owned.schema.leaves))
+    keep(bytes)
+
+
+def test_from_span_reads_the_same_buffer_twice() raises:
+    """The reason the borrowing path exists: many reads, one allocation."""
+    var bytes = fixture_bytes("big")
+    var first = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var rows_first = first.read_table().num_rows
+    var second = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var rows_second = second.read_table().num_rows
+    assert_equal(rows_first, rows_second)
+    keep(bytes)
+
+
+def test_owning_reader_survives_a_move() raises:
+    """`data` points into `_owned`, so a move must not invalidate it. Moving a
+    `List` moves the handle and leaves the heap buffer where it was."""
+    var r = ParquetReader[DefaultCodecs](fixture_bytes("big"))
+    var moved = r^
+    assert_equal(moved.read_table().num_rows, 100000)
+
+
+def test_projection_works_on_a_borrowed_reader() raises:
+    var bytes = fixture_bytes("prune")
+    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var all_cols = r.read_table()
+    assert_equal(all_cols.num_rows, 1000)
+    keep(bytes)
 
 
 def main() raises:
