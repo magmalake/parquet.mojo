@@ -99,11 +99,20 @@ SHLIB_EXT = ".so"
 # -I $CONDA_PREFIX/lib/mojo is what puts its precompiled package on the import
 # path. Stable only: a precompiled Mojo package is stamped with the compiler
 # version that built it and refused by any other, and tins build with 1.0.0.
+# Benchmarks consume the sibling tins as *tins*, not as source paths. They can,
+# because this environment is stable-only: the package pixi-build-mojo emits is
+# built with mojo-compiler 1.0.0 and loads fine here. The test, cli and profile
+# tasks still use `-I ../x.mojo/src` because they also run on nightly, which
+# refuses that package — see the note at the top of this file.
 [feature.bench.dependencies]
 bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "971759f58b862cfaa8fdef8708cd42f52ac719f9" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "5c474cbc4ccec1d98f5750598786d4e93d0fd931" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7f56128396cf7f4dc7620ac23dc0b725f4b8a26f" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "ae9d6a0b155a5063b57e2f6367b0e0b28f7b0a9e" }
+avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "0df43fc9037b98c280f74b14a80c319bae4f2934" }
 
 [feature.bench.tasks]
-bench = "mojo run -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo"
+bench = "mojo run -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo"
 
 [environments]
 default = ["nightly"]

@@ -6,13 +6,6 @@
 # and republishes the dashboard. Pull requests run the benchmarks and publish
 # nothing.
 #
-# Two things are specific to this repo.
-#
-# The bench task takes its Mojo sources for thrift, hashes, snappy and avro
-# from checkouts next door, the same way ci.yml does — a shipped .mojopkg is
-# stamped with the compiler that built it, so the source is what travels. The
-# setup step below puts them there.
-#
 # The wide benchmarks are skipped: they need build/bench-wide.parquet, which
 # `tools/bench_pyarrow.py --make` generates and which is deliberately not
 # committed. Run them locally for the 1M-row numbers.
@@ -31,7 +24,3 @@ jobs:
       contents: write
     with:
       args: "--skip bench_read_wide bench_write_wide"
-      setup: |
-        for tin in thrift hashes snappy avro; do
-          git clone --depth 1 -q "https://github.com/magmalake/$tin.mojo" "../$tin.mojo"
-        done
