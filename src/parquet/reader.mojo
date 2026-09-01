@@ -339,10 +339,27 @@ def array_str(a: ArrayData) raises -> Tuple[List[String], List[Bool]]:
     return (vals^, valid^)
 
 
+comptime FileBytes = Span[UInt8, ImmUntrackedOrigin]
+"""How `ParquetReader` holds the file, whether or not it owns the bytes.
+
+The origin is untracked because a borrowing reader has no lifetime relation
+the compiler can express, and a real origin parameter here would infect every
+type that holds a reader.
+"""
+
+
+def _as_file_bytes(ref data: List[UInt8]) -> FileBytes:
+    return rebind[FileBytes](Span(data))
+
+
 struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     """A Parquet file, projected and batched."""
 
-    var data: List[UInt8]
+    var _owned: List[UInt8]
+    """The file bytes when this reader owns them; empty when it borrows."""
+    var data: FileBytes
+    """The file bytes, however they are held. Points into `_owned` when this
+    reader owns them."""
     var meta: FileMetaData
     var schema: ParquetSchema
     var batch_size: Int
@@ -373,8 +390,35 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     chunk is present, in which case the value index is the slot index."""
 
     def __init__(out self, var data: List[UInt8]) raises:
-        self.data = data^
-        self.meta = read_footer(Span(self.data))
+        """Take ownership of the file bytes."""
+        var owned = data^
+        # Build over the buffer first, then hand it to the reader. Moving the
+        # `List` afterwards moves the handle, not the heap buffer the span
+        # points at, so `self.data` stays valid.
+        self = Self(unsafe_borrowing=_as_file_bytes(owned))
+        self._owned = owned^
+
+    @staticmethod
+    def from_span(data: Span[UInt8, _]) raises -> Self:
+        """Read a file out of a buffer this reader does **not** own.
+
+        The caller must keep `data` alive for as long as the reader and must
+        not mutate it; nothing checks either. Use it when the bytes already
+        exist somewhere that outlives the read -- a mapped file, a shared
+        arena, a benchmark timing many reads over one buffer. Prefer the
+        owning constructor otherwise.
+        """
+        return Self(unsafe_borrowing=rebind[FileBytes](data))
+
+    def __init__(out self, *, unsafe_borrowing: FileBytes) raises:
+        """Initialise every field over a buffer owned by someone else.
+
+        `from_span` is the public spelling. This exists so the owning
+        constructor can share it rather than keeping a second copy in sync.
+        """
+        self._owned = List[UInt8]()
+        self.data = unsafe_borrowing
+        self.meta = read_footer(self.data)
         self.schema = build_schema(self.meta.schema)
         self.batch_size = 65536
         self.verify_crc = True
@@ -396,7 +440,9 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_value = List[List[Int]]()
 
     def __init__(out self, *, deinit move: Self):
-        self.data = move.data^
+        self._owned = move._owned^
+        # Still valid: the heap buffer did not move, only the handle to it.
+        self.data = move.data
         self.meta = move.meta^
         self.schema = move.schema^
         self.batch_size = move.batch_size
@@ -479,7 +525,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var n = Int(chunk.offset_index_length.value())
         if off < 0 or n < 0 or off + n > len(self.data):
             raise Error("parquet: offset index runs past the end of the file")
-        var p = TCompactProtocolReader(Span(self.data)[off : off + n])
+        var p = TCompactProtocolReader(self.data[off : off + n])
         var oi = OffsetIndex()
         oi.read(p)
         return oi^
@@ -492,7 +538,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var n = Int(chunk.column_index_length.value())
         if off < 0 or n < 0 or off + n > len(self.data):
             raise Error("parquet: column index runs past the end of the file")
-        var p = TCompactProtocolReader(Span(self.data)[off : off + n])
+        var p = TCompactProtocolReader(self.data[off : off + n])
         var ci = ColumnIndex()
         ci.read(p)
         return ci^
@@ -696,7 +742,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                         )
                     )
                 cd = read_column_chunk[Self.Codecs](
-                    Span(self.data),
+                    self.data,
                     chunk.meta_data.value(),
                     self.schema.leaves[i],
                     self.verify_crc,

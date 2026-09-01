@@ -393,32 +393,50 @@ verbatim and are not regenerated.
 
 ## Performance
 
-`pixi run bench` against `pixi run bench-pyarrow`, single threaded, Apple M4,
-CRC verification off on both sides. Both timers cover the same thing — bytes
-in memory to Arrow arrays, and Arrow arrays to bytes — and neither side times
-a copy of the input file: `ParquetReader` takes ownership of the bytes, so
-each repeat gets its own copy, made outside the timed region, exactly as
-pyarrow gets a fresh `pa.py_buffer` over the same bytes. Best of N repeats.
+`pixi run -e bench bench` against `pixi run bench-pyarrow`, single threaded,
+Apple M4, CRC verification off on both sides. Both timers cover the same
+thing — bytes in memory to Arrow arrays, and Arrow arrays to bytes — and
+neither side times a copy of the input file: reads go through
+`ParquetReader.from_span`, so the bytes are allocated once and every
+iteration reads the same buffer, exactly as pyarrow gets a `pa.py_buffer`
+over the same bytes. Mean of three timed repetitions through
+[bench.mojo](https://github.com/magmalake/bench.mojo), not a best-of-N.
+
+Both columns below were re-measured in the same session, so they compare.
 
 ### Reading
 
 | file | parquet.mojo | pyarrow 25.0.1 | ratio |
 |---|---|---|---|
-| 1M rows × (int64, double, dictionary int64, dictionary string), 18 MiB | **4.3 ms** — 232 M rows/s, 4.3 GB/s | 8.2 ms — 122 M rows/s, 2.3 GB/s | **parquet.mojo 1.9×** |
-| 100k rows × 5 mixed types incl. a list column, ~1% nulls, snappy, 1.3 MiB | 4.3 ms — 23 M rows/s, 329 MB/s | 2.3 ms — 44 M rows/s, 616 MB/s | pyarrow 1.9× |
-| 1,000 rows × 3 columns, 20 KiB | **0.17 ms** — 6.0 M rows/s | 0.35 ms | **parquet.mojo 2.1×** |
-| 400 rows × 12 columns, every encoding, 19 KiB | 0.12 ms — 3.3 M rows/s | 0.17 ms | **parquet.mojo 1.4×** |
-| 500 rows, v2 pages, 13 KiB | **0.086 ms** — 5.8 M rows/s | 0.18 ms | **parquet.mojo 2.1×** |
+| 1M rows × (int64, double, dictionary int64, dictionary string), 18 MiB | **4.75 ms** — 211 M rows/s, 3.9 GB/s | 9.00 ms — 111 M rows/s, 2.1 GB/s | **parquet.mojo 1.9×** |
+| 100k rows × 5 mixed types incl. a list column, ~1% nulls, snappy, 1.3 MiB | 4.58 ms — 21.9 M rows/s, 307 MB/s | 4.30 ms — 23.3 M rows/s, 328 MB/s | pyarrow 1.07× |
+| 1,000 rows × 3 columns, 20 KiB | **0.147 ms** — 6.8 M rows/s | 0.53 ms — 1.9 M rows/s | **parquet.mojo 3.6×** |
+| 400 rows × 12 columns, every encoding, 19 KiB | **0.115 ms** — 3.5 M rows/s | 0.22 ms — 1.8 M rows/s | **parquet.mojo 1.9×** |
+| 500 rows, v2 pages, 13 KiB | **0.086 ms** — 5.8 M rows/s | 0.21 ms — 2.4 M rows/s | **parquet.mojo 2.4×** |
 
 ### Writing
 
 | file | parquet.mojo | pyarrow 25.0.1 | ratio |
 |---|---|---|---|
-| 1M rows × (int64, double, dictionary int64, dictionary string) | 41.6 ms — 24 M rows/s, 451 MB/s | 30.7 ms — 33 M rows/s, 622 MB/s | pyarrow 1.4× |
-| 100k rows × 5 mixed types incl. a list column | 13.5 ms — 7.4 M rows/s, 162 MB/s | 8.3 ms — 12 M rows/s, 290 MB/s | pyarrow 1.6× |
+| 1M rows × (int64, double, dictionary int64, dictionary string) | 46.6 ms — 21.5 M rows/s, 400 MB/s | 31.6 ms — 31.7 M rows/s, 604 MB/s | pyarrow 1.5× |
+| 100k rows × 5 mixed types incl. a list column | 14.8 ms — 6.8 M rows/s, 155 MB/s | 8.57 ms — 11.7 M rows/s, 279 MB/s | pyarrow 1.7× |
 
 Nothing here is threaded — Mojo's nightly has no reachable thread pool — so
 every number is one core. pyarrow's writer numbers are single-threaded too.
+
+**One row moved a long way and it is worth saying so.** The 100k-row read
+was previously published as parquet.mojo 4.3 ms against pyarrow **2.3 ms**,
+a 1.9× win for pyarrow. Re-measuring today with the same pyarrow 25.0.1 on
+the same fixture puts pyarrow at 4.30 ms — near parity rather than a
+comfortable lead. The parquet.mojo side barely moved (4.3 → 4.58 ms, and
+that much is mean-versus-best-of-N), and every other pyarrow row moved less
+than 10%, so this is not the machine being warm. The 2.3 ms figure does not
+reproduce here; the table above is what this machine measures today.
+
+The small-file rows also widened in parquet.mojo's favour, for the mirror
+image of the same reason: pyarrow's per-call overhead is a larger share of a
+0.2 ms read than of a 9 ms one, and a mean over thousands of calibrated
+iterations captures it more faithfully than a best-of-N did.
 
 ### Where the time goes
 
