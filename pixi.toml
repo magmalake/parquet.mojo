@@ -64,6 +64,7 @@ avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "0df43fc9037
 
 zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "95812f5d0c600354dc68c23c97e8a09f1e53c960" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "336ea0ab0ac1347276265a495a7fcaf79059b3e7" }
 [package.build-dependencies]
 mojo-compiler = "==1.0.0"
 
@@ -76,6 +77,7 @@ avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "0df43fc9037
 
 zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "95812f5d0c600354dc68c23c97e8a09f1e53c960" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "336ea0ab0ac1347276265a495a7fcaf79059b3e7" }
 [feature.nightly.dependencies]
 modular = ">=26.6.0.dev2026082605,<27"
 
