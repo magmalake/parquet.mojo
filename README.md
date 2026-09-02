@@ -404,6 +404,15 @@ over the same bytes. Mean of three timed repetitions through
 
 Both columns below were re-measured in the same session, so they compare.
 
+Every push to `main` re-runs these on a GitHub runner and appends to a history
+published at
+[magmalake.github.io/parquet.mojo/benchmarks](https://magmalake.github.io/parquet.mojo/benchmarks/).
+Those numbers are slower and noisier than the tables below, which were taken on
+an M4 — each history is keyed by machine, so the two stay separate series and
+are never averaged together. The two 1M-row rows are absent there: they need
+`build/bench-wide.parquet`, which is generated rather than committed, so CI
+skips them. The pyarrow comparison is a local check too.
+
 ### Reading
 
 | file | parquet.mojo | pyarrow 25.0.1 | ratio |
