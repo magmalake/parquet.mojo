@@ -25,6 +25,7 @@ from parquet.bitio import (
     levels_all_equal,
     unpack_msb,
 )
+from parquet.alp import decode_alp
 from parquet.codec import CodecSet
 from parquet.encoding import (
     PK_BOOL,
@@ -363,6 +364,18 @@ def _decode_values(
             out.count = v.count
             return out^
         return v^
+    if encoding == Encoding.ALP.value:
+        if phys == Type.DOUBLE.value:
+            return decode_alp[DType.float64](data, count)
+        if phys == Type.FLOAT.value:
+            return decode_alp[DType.float32](data, count)
+        raise Error(
+            String(
+                "parquet.page: ALP on physical type ",
+                Type(phys).name(),
+                ", which is not FLOAT or DOUBLE",
+            )
+        )
     if encoding == Encoding.BYTE_STREAM_SPLIT.value:
         if width == 0:
             raise Error(

@@ -38,16 +38,14 @@ def _expected_unreadable(name: String) -> String:
     """Why a `data/` file is not expected to read, or "" if it should.
 
     Two of these are deliberately corrupt and rejecting them is the correct
-    answer; two need a feature we have not built. Naming them here rather than
-    folding them into the pass count means a *new* failure stands out instead
-    of blending into a known-bad list.
+    answer; the last needs a codec we have not built. Naming them here rather
+    than folding them into the pass count means a *new* failure stands out
+    instead of blending into a known-bad list.
     """
     if name == "datapage_v1-corrupt-checksum.parquet":
         return "corrupt CRC, rejected on purpose"
     if name == "rle-dict-uncompressed-corrupt-checksum.parquet":
         return "corrupt CRC, rejected on purpose"
-    if name == "alp_extended.zstd.parquet":
-        return "ALP encoding not implemented"
     if name == "large_string_map.brotli.parquet":
         return "BROTLI codec not implemented"
     return String()
