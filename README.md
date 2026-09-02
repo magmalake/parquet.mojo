@@ -238,7 +238,7 @@ metadata, which this reader does not parse — see [Gaps](#gaps)).
 | `DELTA_LENGTH_BYTE_ARRAY` | ✅ |
 | `DELTA_BYTE_ARRAY` | ✅ byte arrays and `FIXED_LEN_BYTE_ARRAY` |
 | `BYTE_STREAM_SPLIT` | ✅ float, double, int32, int64 and `FLBA` |
-| `ALP` | ❌ not implemented (Parquet 2.12, no writer emits it yet) |
+| `ALP` | ✅ read (Parquet 2.12) — FLOAT and DOUBLE, bit-identical to the PLAIN reference columns the corpus ships beside them |
 
 ### Codecs
 
@@ -312,9 +312,9 @@ which returns how many row groups survived.
 
 ## Tests
 
-`pixi run test` — **48 tests**, on `default` (nightly) and `stable` (Mojo
-1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 6 more for ZSTD
-and LZ4, including a write/read round trip through each and the
+`pixi run test` — **52 tests**, on `default` (nightly) and `stable` (Mojo
+1.0.0), Linux and macOS. `pixi run -e codecs test-codecs` adds 5 more for ZSTD,
+BROTLI and LZ4, including a write/read round trip through each and the
 ZSTD-compressed Iceberg fixtures.
 
 **pyarrow is the oracle.** `tools/gen_fixtures.py` writes 24 fixtures with
