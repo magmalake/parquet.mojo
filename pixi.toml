@@ -32,6 +32,7 @@ bench-pyarrow = { cmd = "bash tools/bench_pyarrow.sh" }
 # The ZSTD / LZ4 codecs are FFI tins, so they live in their own environments:
 # `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.0.0).
 [feature.codecs.tasks]
+conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -o build/parquet-conformance && ./build/parquet-conformance" }
 test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────

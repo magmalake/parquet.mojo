@@ -590,7 +590,11 @@ def read_column_chunk[
                         " values",
                     )
                 )
-            if compressed:
+            # A v2 page whose values are all null carries no value bytes at
+            # all. Zero bytes is not a valid stream for any codec — Snappy
+            # reads it as a truncated varint — so there is nothing to
+            # decompress, and the empty span is already the answer.
+            if compressed and len(vbytes) > 0:
                 var raw = Codecs.decompress(
                     codec, vbytes, usize - rep_len - def_len
                 )
@@ -631,5 +635,20 @@ def read_column_chunk[
         )
     if leaf.max_rep == 0:
         out.reps.clear()
+    elif len(out.reps) > 0 and out.reps[0] != 0:
+        # A repetition level says which level of nesting is being continued, so
+        # the first slot of a chunk cannot continue anything — it has to start
+        # a record, at level 0. Anything else means the levels are misaligned,
+        # and assembly downstream would silently attach values to a record that
+        # does not exist.
+        raise Error(
+            String(
+                "parquet.page: column '",
+                leaf.dotted(),
+                "' starts with repetition level ",
+                out.reps[0],
+                ", so the chunk does not begin a record",
+            )
+        )
     out.all_present = len(out.defs) == 0
     return out^

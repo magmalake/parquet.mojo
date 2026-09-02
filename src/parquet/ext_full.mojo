@@ -52,9 +52,16 @@ struct AllCodecs(CodecSet):
             # A raw LZ4 block: the uncompressed size comes from the page header.
             return lz4.decompress_block(data, uncompressed_size)
         if codec == CompressionCodec.LZ4.value:
-            # The deprecated Hadoop framing: repeated
-            # <big-endian uncompressed size><big-endian block size><block>.
-            return lz4.decompress_hadoop(data, uncompressed_size)
+            # The deprecated `LZ4` codec never pinned its framing down, so
+            # files in the wild carry either the Hadoop wrapper — repeated
+            # <big-endian uncompressed size><big-endian block size><block> —
+            # or a bare LZ4 block with no wrapper at all. Nothing in the file
+            # says which, so the only way to tell is to try the wrapper and
+            # fall back. parquet-testing ships one of each.
+            try:
+                return lz4.decompress_hadoop(data, uncompressed_size)
+            except:
+                return lz4.decompress_block(data, uncompressed_size)
         raise unsupported_codec(codec)
 
     @staticmethod

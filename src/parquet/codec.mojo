@@ -26,7 +26,7 @@ magmalake shim for one yet. A file with a Brotli column raises a message that
 says so; every other column of that file still reads.
 """
 
-from avro.deflate import deflate, inflate
+from avro.deflate import deflate, inflate, inflate_at
 from hashes import crc32
 from snappy import compress as snappy_compress, decompress as snappy_decompress
 from thrift import CompressionCodec
@@ -76,6 +76,48 @@ def unsupported_codec(codec: Int32) -> Error:
     )
 
 
+def _inflate_one_member(
+    data: Span[UInt8, _], start: Int, mut out: List[UInt8]
+) raises -> Int:
+    """Inflate the gzip member at `start`, appending it to `out`.
+
+    Returns the offset just past the member's 8-byte CRC32/ISIZE trailer,
+    which is where the next member begins if there is one.
+    """
+    if start + 18 > len(data):
+        raise Error("parquet.gzip: truncated gzip member")
+    if data[start + 2] != 8:
+        raise Error(
+            String(
+                "parquet.gzip: unsupported compression method ", data[start + 2]
+            )
+        )
+    var flags = data[start + 3]
+    var pos = start + 10
+    if (flags & 0x04) != 0:  # FEXTRA
+        if pos + 2 > len(data):
+            raise Error("parquet.gzip: truncated FEXTRA")
+        var xlen = Int(data[pos]) | (Int(data[pos + 1]) << 8)
+        pos += 2 + xlen
+    if (flags & 0x08) != 0:  # FNAME
+        while pos < len(data) and data[pos] != 0:
+            pos += 1
+        pos += 1
+    if (flags & 0x10) != 0:  # FCOMMENT
+        while pos < len(data) and data[pos] != 0:
+            pos += 1
+        pos += 1
+    if (flags & 0x02) != 0:  # FHCRC
+        pos += 2
+    if pos >= len(data):
+        raise Error("parquet.gzip: gzip header runs past the page")
+    var end = 0
+    var body = inflate_at(data[pos:], end)
+    out.extend(Span(body))
+    # `end` is relative to the slice; + 8 steps over CRC32 and ISIZE.
+    return pos + end + 8
+
+
 def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
     """Strip a gzip (RFC 1952) wrapper and inflate the DEFLATE stream inside.
 
@@ -83,34 +125,26 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
     10-byte header and its optional extra/name/comment/CRC fields have to come
     off first. A zlib (RFC 1950) stream is accepted too — some writers emit
     one — and so is a bare DEFLATE stream.
+
+    A gzip stream may be several members concatenated (RFC 1952 §2.2), and a
+    page written that way decodes to the members joined in order. Stopping at
+    the first one silently loses the rest, so the members are looped over here.
     """
     if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
-        if len(data) < 18:
-            raise Error("parquet.gzip: truncated gzip member")
-        if data[2] != 8:
-            raise Error(
-                String("parquet.gzip: unsupported compression method ", data[2])
-            )
-        var flags = data[3]
-        var pos = 10
-        if (flags & 0x04) != 0:  # FEXTRA
-            if pos + 2 > len(data):
-                raise Error("parquet.gzip: truncated FEXTRA")
-            var xlen = Int(data[pos]) | (Int(data[pos + 1]) << 8)
-            pos += 2 + xlen
-        if (flags & 0x08) != 0:  # FNAME
-            while pos < len(data) and data[pos] != 0:
-                pos += 1
-            pos += 1
-        if (flags & 0x10) != 0:  # FCOMMENT
-            while pos < len(data) and data[pos] != 0:
-                pos += 1
-            pos += 1
-        if (flags & 0x02) != 0:  # FHCRC
-            pos += 2
-        if pos >= len(data):
-            raise Error("parquet.gzip: gzip header runs past the page")
-        return inflate(data[pos : len(data) - 8])
+        var out = List[UInt8]()
+        var at = 0
+        while at < len(data):
+            # Trailing NUL padding after the last member is legal and some
+            # writers emit it; anything else that is not a header is corrupt.
+            if data[at] == 0:
+                at += 1
+                continue
+            if at + 2 > len(data) or data[at] != 0x1F or data[at + 1] != 0x8B:
+                raise Error(
+                    "parquet.gzip: trailing bytes are not a gzip member"
+                )
+            at = _inflate_one_member(data, at, out)
+        return out^
     if (
         len(data) >= 2
         and (data[0] & 0x0F) == 8
