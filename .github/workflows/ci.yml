@@ -62,10 +62,10 @@ jobs:
           ./build/parquet-mojo cat tests/fixtures/fieldids.parquet --columns id,name --json
 
   codecs:
-    # ZSTD and LZ4 are FFI tins: the pixi git source dependencies install
-    # libzstd / liblz4 and their dlopen shims, while the Mojo sources come
-    # from the checkouts next door (their shipped .mojopkg is built with
-    # stable 1.0.0 and nightly refuses to load it).
+    # ZSTD, BROTLI and LZ4 are FFI tins: the pixi git source dependencies
+    # install libzstd / libbrotli / liblz4 and their dlopen shims, while the
+    # Mojo sources come from the checkouts next door (their shipped .mojopkg is
+    # built with stable 1.0.0 and nightly refuses to load it).
     name: codecs ${{ matrix.env == 'codecs' && 'nightly' || 'stable' }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -101,6 +101,10 @@ jobs:
         with:
           repository: magmalake/lz4.mojo
           path: lz4.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/brotli.mojo
+          path: brotli.mojo
 
       - uses: prefix-dev/setup-pixi@v0.9.0
         with:

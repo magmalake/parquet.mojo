@@ -37,17 +37,21 @@ def _read_fully(path: String) raises -> Int:
 def _expected_unreadable(name: String) -> String:
     """Why a `data/` file is not expected to read, or "" if it should.
 
-    Two of these are deliberately corrupt and rejecting them is the correct
-    answer; the last needs a codec we have not built. Naming them here rather
-    than folding them into the pass count means a *new* failure stands out
-    instead of blending into a known-bad list.
+    Two are deliberately corrupt and rejecting them is the correct answer; the
+    last is a real gap. Naming them here rather than folding them into the pass
+    count means a *new* failure stands out instead of blending into a known-bad
+    list.
     """
     if name == "datapage_v1-corrupt-checksum.parquet":
         return "corrupt CRC, rejected on purpose"
     if name == "rle-dict-uncompressed-corrupt-checksum.parquet":
         return "corrupt CRC, rejected on purpose"
     if name == "large_string_map.brotli.parquet":
-        return "BROTLI codec not implemented"
+        # Its BROTLI pages decode fine — this is not a codec gap. The column
+        # chunk holds more than 2 GiB of BYTE_ARRAY data, which an Arrow 32-bit
+        # offset cannot address; reading it needs large_binary or the column
+        # split across record batches.
+        return "one column chunk exceeds 2 GiB of BYTE_ARRAY data"
     return String()
 
 

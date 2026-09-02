@@ -60,6 +60,38 @@ def physical_kind(phys: Int32) -> Int:
     return PK_FIXED
 
 
+comptime _MAX_VAR_BYTES = 0x7FFF_FFFF
+"""How many bytes of `BYTE_ARRAY` data one column chunk can hold.
+
+Arrow's `binary`/`string` layout addresses value bytes with **32-bit** offsets,
+and `PhysBuffer.offsets` is `List[Int32]` to match. Past 2 GiB in a single
+chunk those offsets wrap negative, and the wrap does not surface here — it
+surfaces much later as an out-of-bounds slice during assembly, which trips a
+bounds assert and takes the process down instead of raising. So the four places
+that grow a `PK_VAR` buffer check for it.
+
+Actually reading such a file needs either Arrow's `large_binary` (64-bit
+offsets) or the column split across several record batches. parquet.mojo does
+neither yet; `large_string_map.brotli.parquet` in apache/parquet-testing is the
+one file in the corpus that hits this.
+"""
+
+
+def _var_bytes_overflow(total: Int) -> Error:
+    return Error(
+        String(
+            "parquet.encoding: column chunk holds ",
+            total,
+            (
+                " bytes of BYTE_ARRAY data, past the 2 GiB an Arrow 32-bit"
+                " offset can address — this file needs 64-bit offsets"
+                " (large_binary) or the column split across record batches,"
+                " neither of which parquet.mojo supports yet"
+            ),
+        )
+    )
+
+
 struct PhysBuffer(Copyable, Defaultable, Movable):
     """Decoded values still in their physical Parquet representation."""
 
@@ -110,9 +142,11 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
             self.bytes[byte] |= UInt8(1) << UInt8(self.count % 8)
         self.count += 1
 
-    def append_bytes(mut self, src: Span[UInt8, _]):
+    def append_bytes(mut self, src: Span[UInt8, _]) raises:
         """Append one `PK_VAR` value."""
         self.bytes.extend(src)
+        if len(self.bytes) > _MAX_VAR_BYTES:
+            raise _var_bytes_overflow(len(self.bytes))
         self.offsets.append(Int32(len(self.bytes)))
         self.count += 1
 
@@ -143,6 +177,8 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
         if self.kind == PK_VAR:
             var base = len(self.bytes)
             self.bytes.extend(Span(other.bytes))
+            if len(self.bytes) > _MAX_VAR_BYTES:
+                raise _var_bytes_overflow(len(self.bytes))
             for i in range(1, len(other.offsets)):
                 self.offsets.append(Int32(base) + other.offsets[i])
             self.count += other.count
@@ -244,6 +280,8 @@ def decode_plain_into(
             _need(data, pos + n, "PLAIN byte array body")
             pos += n
             total += n
+            if vbase + total > _MAX_VAR_BYTES:
+                raise _var_bytes_overflow(vbase + total)
             ooff.unsafe_store(obase + i, Int32(vbase + total))
         # Eight bytes of slack let a short value — which is most of them —
         # move in a single 8-byte store; the overhang is overwritten by the
@@ -334,6 +372,8 @@ def gather_into(
         for i in range(n):
             var k = Int(idx.unsafe_load(i))
             total += Int(doff.unsafe_load(k + 1)) - Int(doff.unsafe_load(k))
+            if total > _MAX_VAR_BYTES:
+                raise _var_bytes_overflow(total)
             ooff.unsafe_store(obase + i, Int32(total))
         # As in `decode_plain_into`: eight bytes of slack so a short value
         # moves in one store.

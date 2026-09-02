@@ -250,20 +250,23 @@ metadata, which this reader does not parse — see [Gaps](#gaps)).
 | `SNAPPY` | ✅ (snappy.mojo, pure Mojo) | ✅ |
 | `GZIP` | ✅ (avro.mojo's inflate; gzip, zlib and bare DEFLATE framing) | ✅ |
 | `ZSTD` | ❌ | ✅ (zstd.mojo → libzstd) |
+| `BROTLI` | ❌ | ✅ (brotli.mojo → libbrotli) |
 | `LZ4_RAW` | ❌ | ✅ (lz4.mojo → liblz4) |
 | `LZ4` (Hadoop-framed, deprecated) | ❌ | ✅ |
-| `BROTLI` | ❌ | ❌ |
+
+Between the two sets, that is every codec the Parquet spec defines.
 
 ```mojo
 from parquet import ParquetReader
-from parquet.ext_full import AllCodecs      # -I ../zstd.mojo/src -I ../lz4.mojo/src
+# -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src
+from parquet.ext_full import AllCodecs
 
 var r = ParquetReader[AllCodecs].open("part-0.parquet")
 ```
 
-**Brotli is not implemented** in either set: there is no Mojo Brotli and no
-magmalake shim for one. A Brotli column raises a message that says so, and every
-other column of the same file still reads.
+A reader on `DefaultCodecs` that meets one of the four FFI codecs raises a
+message naming it and pointing at `AllCodecs`; every other column of the same
+file still reads.
 
 ## For Iceberg
 
@@ -504,8 +507,13 @@ that can take one.
 
 ## Gaps
 
-* **Brotli** — no Mojo implementation and no shim yet. Named explicitly when a
-  file needs it.
+* **More than 2 GiB of `BYTE_ARRAY` data in one column chunk** — Arrow's
+  `binary`/`string` layout addresses value bytes with 32-bit offsets, so such a
+  chunk raises rather than wrapping its offsets negative. Reading one needs
+  64-bit offsets (`large_binary`) or the column split across record batches.
+  `large_string_map.brotli.parquet` in apache/parquet-testing is the one file in
+  that corpus that hits it — its Brotli pages decode fine; the offsets are the
+  gap.
 * **Encryption** — a `PARE` footer or an encrypted column raises. Parquet
   modular encryption is not implemented.
 * **`ARROW:schema` metadata** — pyarrow stores an Arrow IPC schema in the

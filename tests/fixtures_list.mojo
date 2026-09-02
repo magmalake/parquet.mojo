@@ -68,12 +68,7 @@ def default_codec_columns() -> List[String]:
 
 
 def full_codec_columns() -> List[String]:
-    """Everything but Brotli, which no Mojo library implements yet."""
-    return [
-        String("none"),
-        String("snappy"),
-        String("gzip"),
-        String("zstd"),
-        String("lz4"),
-        String("ints"),
-    ]
+    """Every column of `codecs.parquet` — `AllCodecs` covers all seven Parquet
+    codecs, so this is `codec_columns()`. Kept as its own name because the
+    default set still covers only a subset."""
+    return codec_columns()

@@ -10,20 +10,21 @@ everything that needs no FFI:
 | `SNAPPY` | `snappy.mojo`, pure Mojo |
 | `GZIP` | `avro.mojo`'s pure-Mojo `deflate.inflate`, with the gzip wrapper parsed here |
 
-`ZSTD`, `LZ4_RAW` and the legacy Hadoop-framed `LZ4` need `zstd.mojo` and
-`lz4.mojo`, which dlopen libzstd and liblz4, so they live in `parquet.ext_full`
-and its `AllCodecs`:
+`ZSTD`, `BROTLI`, `LZ4_RAW` and the legacy Hadoop-framed `LZ4` need `zstd.mojo`,
+`brotli.mojo` and `lz4.mojo`, which dlopen libzstd, libbrotli and liblz4, so
+they live in `parquet.ext_full` and its `AllCodecs`:
 
 ```mojo
 from parquet import ParquetReader
-from parquet.ext_full import AllCodecs      # -I ../zstd.mojo/src -I ../lz4.mojo/src
+# -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src
+from parquet.ext_full import AllCodecs
 
 var r = ParquetReader[AllCodecs].open("part-0.parquet")
 ```
 
-`BROTLI` is not implemented in either set: there is no Mojo Brotli and no
-magmalake shim for one yet. A file with a Brotli column raises a message that
-says so; every other column of that file still reads.
+Between the two sets that is every codec the Parquet spec defines. A reader on
+`DefaultCodecs` that meets one of the four FFI codecs raises a message naming
+it and pointing at `AllCodecs`; every other column of that file still reads.
 """
 
 from avro.deflate import deflate, inflate, inflate_at
@@ -69,8 +70,8 @@ def unsupported_codec(codec: Int32) -> Error:
             codec_name(codec),
             (
                 " is not available — use parquet.ext_full.AllCodecs for"
-                " ZSTD/LZ4 (needs -I ../zstd.mojo/src -I ../lz4.mojo/src);"
-                " BROTLI is not implemented"
+                " ZSTD/BROTLI/LZ4 (needs -I ../zstd.mojo/src"
+                " -I ../brotli.mojo/src -I ../lz4.mojo/src)"
             ),
         )
     )

@@ -36,8 +36,8 @@ bench-pyarrow = { cmd = "bash tools/bench_pyarrow.sh" }
 # The ZSTD / LZ4 codecs are FFI tins, so they live in their own environments:
 # `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.0.0).
 [feature.codecs.tasks]
-conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -o build/parquet-conformance && ./build/parquet-conformance" }
-test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
+conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-conformance && ./build/parquet-conformance" }
+test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
@@ -83,15 +83,17 @@ modular = ">=26.6.0.dev2026082605,<27"
 mojo-compiler = "==1.0.0"
 
 # ── optional codecs ─────────────────────────────────────────────────────────
-# ZSTD and LZ4 are FFI tins; these git source dependencies are what put
-# libzstd / liblz4 and their dlopen shims into the environment. The Mojo code
-# still comes from `-I ../zstd.mojo/src -I ../lz4.mojo/src` because the
-# shipped `.mojopkg`s are built with stable 1.0.0 and nightly cannot load
-# them. Path dependencies would break `pixi install` for a bare clone, since
-# pixi solves every environment even when it installs one.
+# ZSTD, BROTLI and LZ4 are FFI tins; these git source dependencies are what put
+# libzstd / libbrotli / liblz4 and their dlopen shims into the environment. The
+# Mojo code still comes from `-I ../zstd.mojo/src -I ../brotli.mojo/src
+# -I ../lz4.mojo/src` because the shipped packages are built with stable 1.0.0
+# and nightly cannot load them. Path dependencies would break `pixi install`
+# for a bare clone, since pixi solves every environment even when it installs
+# one.
 [feature.codecs.dependencies]
 zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo" }
 
 [target.osx-arm64.activation.env]
 SHLIB_EXT = ".dylib"
