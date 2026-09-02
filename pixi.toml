@@ -18,7 +18,11 @@ check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-mojo" }
 profile = { cmd = "mkdir -p build && mojo build bench/profile_parquet.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-profile && ./build/parquet-profile" }
 fmt = { cmd = "mojo format src tests bench" }
-format-check = { cmd = "mojo format --check src tests bench" }
+# `mojo format` has no check mode in 1.0.0 — it rejects `--check` outright — so
+# the check is: format, then assert the tree did not move. It rewrites the files
+# as a side effect, which is what CI wants and is harmless locally; run it with
+# your own work committed or stashed.
+format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- src tests bench" }
 # Regenerate tests/fixtures/*.parquet and their pyarrow oracles (needs `uv`).
 fixtures = { cmd = "bash tools/gen_fixtures.sh" }
 # Build the Arrow C Data Interface shared library and import it into pyarrow.

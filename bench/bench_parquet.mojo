@@ -189,13 +189,24 @@ def _print_shape() raises:
         try:
             var data = _read_file(names[i])
             print(
-                "  ", names[i], ": ", _rows_in(data), " rows, ",
-                len(data) // 1024, " KiB", sep="",
+                "  ",
+                names[i],
+                ": ",
+                _rows_in(data),
+                " rows, ",
+                len(data) // 1024,
+                " KiB",
+                sep="",
             )
         except:
             print(
-                "  ", names[i], ": missing — generate it with"
-                " `python tools/bench_pyarrow.py --make`", sep="",
+                "  ",
+                names[i],
+                (
+                    ": missing — generate it with"
+                    " `python tools/bench_pyarrow.py --make`"
+                ),
+                sep="",
             )
 
 

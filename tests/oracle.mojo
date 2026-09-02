@@ -64,8 +64,8 @@ comptime HEX = "0123456789abcdef"
 def hex_of(data: Span[UInt8, _]) -> String:
     var out = String()
     for b in data:
-        out += HEX[byte = Int(b >> 4)]
-        out += HEX[byte = Int(b & 15)]
+        out += HEX[byte=Int(b >> 4)]
+        out += HEX[byte=Int(b & 15)]
     return out^
 
 
@@ -100,11 +100,11 @@ def _u128_dec(lo_in: UInt64, hi_in: UInt64) -> String:
         var r = bot % 10
         hi = q_hi
         lo = (q_top << 32) | q_bot
-        digits += HEX[byte = Int(r)]
+        digits += HEX[byte=Int(r)]
     var out = String()
     var n = digits.byte_length()
     for i in range(n):
-        out += digits[byte = n - 1 - i]
+        out += digits[byte=n - 1 - i]
     return out^
 
 
@@ -136,8 +136,8 @@ def double_bits(v: Float64) -> String:
     var out = String()
     for k in range(8):
         var b = UInt8((u >> UInt64(8 * (7 - k))) & 0xFF)
-        out += HEX[byte = Int(b >> 4)]
-        out += HEX[byte = Int(b & 15)]
+        out += HEX[byte=Int(b >> 4)]
+        out += HEX[byte=Int(b & 15)]
     return out^
 
 
@@ -169,9 +169,13 @@ def render_scalar(a: ArrayData, i: Int) raises -> String:
     if id == AT_FLOAT64:
         return double_bits(bitcast[DType.float64](_load_le(a, i, 8)))
     if id == AT_FLOAT32:
-        return double_bits(Float64(bitcast[DType.float32](UInt32(_load_le(a, i, 4)))))
+        return double_bits(
+            Float64(bitcast[DType.float32](UInt32(_load_le(a, i, 4))))
+        )
     if id == AT_FLOAT16:
-        return double_bits(Float64(bitcast[DType.float16](UInt16(_load_le(a, i, 2)))))
+        return double_bits(
+            Float64(bitcast[DType.float16](UInt16(_load_le(a, i, 2))))
+        )
     if id == AT_UINT8 or id == AT_UINT16 or id == AT_UINT32 or id == AT_UINT64:
         return String(_load_le(a, i, a.type.fixed_width()))
     var w = a.type.fixed_width()
@@ -189,10 +193,9 @@ def _child(arena: ArrayArena, a: ArrayData, k: Int) -> Int:
     return a.children[k]
 
 
-def canon_value(
-    arena: ArrayArena, node: Int, i: Int, mut out: String
-) raises:
-    """The canonical text `tools/oracle_pyarrow.py` hashes, for a digest check."""
+def canon_value(arena: ArrayArena, node: Int, i: Int, mut out: String) raises:
+    """The canonical text `tools/oracle_pyarrow.py` hashes, for a digest check.
+    """
     ref a = arena.nodes[node]
     if not bit_get(Span(a.validity), i):
         out += "N"
@@ -227,7 +230,12 @@ def canon_value(
 
 
 def match_value(
-    doc: JsonDoc, expect: Int, arena: ArrayArena, node: Int, i: Int, where: String
+    doc: JsonDoc,
+    expect: Int,
+    arena: ArrayArena,
+    node: Int,
+    i: Int,
+    field_path: String,
 ) raises:
     ref a = arena.nodes[node]
     var valid = bit_get(Span(a.validity), i)
@@ -235,19 +243,23 @@ def match_value(
         if valid:
             raise Error(
                 String(
-                    where,
+                    field_path,
                     ": expected null, got ",
-                    render_scalar(a, i) if not a.type.is_nested() else String("a value"),
+                    render_scalar(a, i) if not a.type.is_nested() else String(
+                        "a value"
+                    ),
                 )
             )
         return
     if not valid:
-        raise Error(String(where, ": expected a value, got null"))
+        raise Error(String(field_path, ": expected a value, got null"))
     var id = a.type.id
     if id == AT_LIST or id == AT_LARGE_LIST:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
-        assert_equal(doc.len_of(expect), hi - lo, String(where, ": list length"))
+        assert_equal(
+            doc.len_of(expect), hi - lo, String(field_path, ": list length")
+        )
         for k in range(hi - lo):
             match_value(
                 doc,
@@ -255,24 +267,36 @@ def match_value(
                 arena,
                 a.children[0],
                 lo + k,
-                String(where, "[", k, "]"),
+                String(field_path, "[", k, "]"),
             )
         return
     if id == AT_MAP:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
-        assert_equal(doc.len_of(expect), hi - lo, String(where, ": map size"))
+        assert_equal(
+            doc.len_of(expect), hi - lo, String(field_path, ": map size")
+        )
         var entries = a.children[0]
         var kf = arena.nodes[entries].children[0]
         var vf = arena.nodes[entries].children[1]
         for k in range(hi - lo):
             var pair = doc.child(expect, k)
-            assert_equal(doc.len_of(pair), 2, String(where, ": map entry"))
+            assert_equal(doc.len_of(pair), 2, String(field_path, ": map entry"))
             match_value(
-                doc, doc.child(pair, 0), arena, kf, lo + k, String(where, ".key")
+                doc,
+                doc.child(pair, 0),
+                arena,
+                kf,
+                lo + k,
+                String(field_path, ".key"),
             )
             match_value(
-                doc, doc.child(pair, 1), arena, vf, lo + k, String(where, ".value")
+                doc,
+                doc.child(pair, 1),
+                arena,
+                vf,
+                lo + k,
+                String(field_path, ".value"),
             )
         return
     if id == AT_STRUCT:
@@ -280,7 +304,9 @@ def match_value(
             ref ca = arena.nodes[c]
             var kid = doc.get(expect, ca.name)
             if kid < 0:
-                raise Error(String(where, ": oracle has no field '", ca.name, "'"))
-            match_value(doc, kid, arena, c, i, String(where, ".", ca.name))
+                raise Error(
+                    String(field_path, ": oracle has no field '", ca.name, "'")
+                )
+            match_value(doc, kid, arena, c, i, String(field_path, ".", ca.name))
         return
-    assert_equal(render_scalar(a, i), doc.as_string(expect), where)
+    assert_equal(render_scalar(a, i), doc.as_string(expect), field_path)
