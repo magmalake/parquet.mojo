@@ -64,15 +64,17 @@ jobs:
   codecs:
     # ZSTD, BROTLI and LZ4 are FFI tins: the pixi git source dependencies
     # install libzstd / libbrotli / liblz4 and their dlopen shims, while the
-    # Mojo sources come from the checkouts next door (their shipped .mojopkg is
-    # built with stable 1.0.0 and nightly refuses to load it).
-    name: codecs ${{ matrix.env == 'codecs' && 'nightly' || 'stable' }} / ${{ matrix.os }}
+    # Mojo sources come from the checkouts next door. Stable only: the source
+    # build also drops a `.mojoc` compiled with 1.0.0 into the environment,
+    # and a nightly compiler refuses to load it (`codecs` stays in pixi.toml
+    # for local use with a matching compiler).
+    name: codecs stable / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        env: [codecs, codecs-stable]
+        env: [codecs-stable]
     steps:
       - uses: actions/checkout@v4
         with:
