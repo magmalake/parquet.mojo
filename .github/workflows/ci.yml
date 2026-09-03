@@ -49,8 +49,13 @@ jobs:
           manifest-path: parquet.mojo/pixi.toml
           environments: ${{ matrix.env }}
 
-      - name: Unit tests and CLI build
+      - name: Unit tests, CLI build, and lint (mojolint --lsp)
         working-directory: parquet.mojo
+        # `check` now depends on `lint` (src, tests) and `lint-tools` (tools);
+        # `lint` falls back to text mode with one expected `note:` on
+        # `src/parquet/ext_full.mojo` (imports zstd/lz4/brotli, not on this
+        # -I list) — resolved fully by `lint-codecs` in the codecs job below,
+        # which has the sibling checkouts for it.
         run: pixi run -e ${{ matrix.env }} check
 
       - name: CLI smoke
@@ -117,6 +122,56 @@ jobs:
       - name: Codec tests
         working-directory: parquet.mojo
         run: pixi run -e ${{ matrix.env }} test-codecs
+
+      - name: Codec lint (mojolint --lsp)
+        working-directory: parquet.mojo
+        run: pixi run -e ${{ matrix.env }} lint-codecs
+
+  lint-bench:
+    # bench/ imports the shared harness (magmalake/bench.mojo) and the
+    # sibling tins by source path, so linting it needs all of them checked
+    # out next door — mojolint needs real sources, not the precompiled
+    # packages the `bench` environment installs for the actual `bench` task.
+    name: lint bench / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: parquet.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/thrift.mojo
+          path: thrift.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/hashes.mojo
+          path: hashes.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/snappy.mojo
+          path: snappy.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/avro.mojo
+          path: avro.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/bench.mojo
+          path: bench.mojo
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.78.0
+          manifest-path: parquet.mojo/pixi.toml
+          environments: bench
+
+      - name: Lint bench (mojolint --lsp)
+        working-directory: parquet.mojo
+        run: pixi run -e bench lint-bench
 
   parity:
     # The two cross-language checks: pyarrow importing our Arrow C Data
