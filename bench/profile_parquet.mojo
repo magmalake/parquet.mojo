@@ -95,6 +95,7 @@ from parquet.writer import (
     _plain_into,
     _stat_less,
     build_write_schema,
+    dict_value_cap,
     min_max,
     shred,
     shred_flat,
@@ -594,11 +595,7 @@ def _write_chunk_stages(
     var indices = List[UInt16]()
     var dict = PhysBuffer()
     if use_dict:
-        var cap = 65535
-        if n_values // 2 < cap:
-            cap = n_values // 2
-        if cap < 64:
-            cap = 64
+        var cap = dict_value_cap(n_values)
         var builder = DictBuilder(buf.values.kind, buf.values.width, cap)
         indices.resize(n_values, 0)
         var out_idx = indices.unsafe_ptr()

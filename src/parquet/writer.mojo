@@ -1123,6 +1123,52 @@ def column_statistics(
 
 # ── dictionaries ───────────────────────────────────────────────────────────
 
+comptime DICT_MAX_VALUES = 8192
+"""How many distinct values a column chunk's dictionary may hold.
+
+Past this the build is abandoned and the chunk is written `PLAIN`, so this is
+both the size rule and the ceiling on the work a chunk that will never be
+dictionary-encoded can cost: `DICT_MAX_VALUES` inserts, not one per value.
+
+8192 is where a dictionary stops paying on compressible data. Writing 65,536
+values with SNAPPY, dictionary against `PLAIN`, on values drawn cyclically from
+a pool of that size:
+
+| distinct | `INT64` | `DOUBLE` | `BYTE_ARRAY` |
+| --- | --- | --- | --- |
+| 512 | 0.23× | 0.23× | 0.14× |
+| 2048 | 0.47× | 0.47× | 0.29× |
+| 8192 | 0.74× | 0.74× | 0.53× |
+| 16384 | 1.02× | 1.02× | 0.79× |
+| 32768 | 1.28× | 1.31× | 1.10× |
+
+At 32768 — which is what a cap of `n_values / 2` allows — the dictionary makes
+the fixed-width chunks 30% *bigger*. On values that do not compress the
+dictionary keeps winning further out (0.82× at 32768 distinct `INT64`), so a
+chunk with 8k–32k distinct incompressible values is the case this cap gives up
+on; a mid-chunk fallback that kept what it had already encoded, the way
+parquet-cpp does, would not have to choose.
+
+The dictionary indices are `UInt16`, so the cap can never exceed 65535.
+"""
+
+
+@always_inline
+def dict_value_cap(n_values: Int) -> Int:
+    """The largest dictionary index `n_values` values may produce, or abandon.
+
+    Half the chunk is the older, weaker bound and still applies to a short
+    chunk, where 8192 distinct values are not reachable anyway; the floor of 64
+    keeps a tiny chunk — which cannot pay for a dictionary page either way —
+    from abandoning on its second value.
+    """
+    var cap = DICT_MAX_VALUES
+    if n_values // 2 < cap:
+        cap = n_values // 2
+    if cap < 64:
+        cap = 64
+    return cap
+
 
 @always_inline
 def _hash_bytes(v: Span[UInt8, _]) -> UInt64:
@@ -1409,9 +1455,10 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             self.options.write_statistics or self.options.write_page_index
         )
 
-        # Dictionary, if it pays for itself. The build stops the moment the
-        # dictionary is too big to be worth it, rather than indexing the whole
-        # chunk and throwing the answer away.
+        # Dictionary, if it pays for itself. The build stops at
+        # `dict_value_cap` distinct values — the point where a dictionary is no
+        # longer smaller than PLAIN — rather than indexing half the chunk and
+        # throwing the answer away.
         var use_dict = (
             self.options.use_dictionary
             and buf.values.kind != PK_BOOL
@@ -1423,11 +1470,7 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         var dict_uncompressed: Int64 = 0
         var dict_compressed: Int64 = 0
         if use_dict:
-            var cap = 65535
-            if n_values // 2 < cap:
-                cap = n_values // 2
-            if cap < 64:
-                cap = 64
+            var cap = dict_value_cap(n_values)
             var builder = DictBuilder(buf.values.kind, buf.values.width, cap)
             indices.resize(n_values, 0)
             var out_idx = indices.unsafe_ptr()
