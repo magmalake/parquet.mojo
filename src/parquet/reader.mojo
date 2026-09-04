@@ -352,6 +352,16 @@ def _as_file_bytes(ref data: List[UInt8]) -> FileBytes:
     return rebind[FileBytes](Span(data))
 
 
+def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
+    return String(
+        "parquet: column '",
+        leaf.dotted(),
+        "' decoded fewer ",
+        which,
+        " levels than it has value slots",
+    )
+
+
 struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     """A Parquet file, projected and batched."""
 
@@ -767,39 +777,69 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                             )
                         )
                     if not cd.all_present:
-                        value.reserve(rows + 1)
-                        ref defs = cd.defs
+                        # One entry per row plus a sentinel: the size is known
+                        # up front, so the index is `rows` stores into a sized
+                        # buffer rather than `rows` appends to a growing one.
+                        if rows > len(cd.defs):
+                            raise Error(
+                                _short_levels(
+                                    self.schema.leaves[i], "definition"
+                                )
+                            )
+                        value.resize(rows + 1, 0)
+                        var vp = value.unsafe_ptr()
+                        var defs = cd.defs.unsafe_ptr()
                         for k in range(rows):
-                            value.append(nvals)
-                            if Int(defs[k]) == max_def:
+                            vp.unsafe_store(k, nvals)
+                            if Int(defs.unsafe_load(k)) == max_def:
                                 nvals += 1
-                        value.append(nvals)
+                        vp.unsafe_store(rows, nvals)
                 else:
-                    slot.reserve(rows + 1)
-                    if not cd.all_present:
-                        value.reserve(rows + 1)
-                    for k in range(cd.num_slots):
-                        if Int(cd.reps[k]) == 0:
-                            slot.append(k)
-                            if not cd.all_present:
-                                value.append(nvals)
-                        if cd.def_at(k, max_def) == max_def:
+                    var nslots = cd.num_slots
+                    var all_present = cd.all_present
+                    if nslots > len(cd.reps):
+                        raise Error(
+                            _short_levels(self.schema.leaves[i], "repetition")
+                        )
+                    if not all_present and nslots > len(cd.defs):
+                        raise Error(
+                            _short_levels(self.schema.leaves[i], "definition")
+                        )
+                    slot.resize(rows + 1, 0)
+                    if not all_present:
+                        value.resize(rows + 1, 0)
+                    var sp = slot.unsafe_ptr()
+                    var vp = value.unsafe_ptr()
+                    var reps = cd.reps.unsafe_ptr()
+                    var defs = cd.defs.unsafe_ptr()
+                    var records = 0
+                    for k in range(nslots):
+                        if reps.unsafe_load(k) == 0:
+                            # A chunk that starts more records than the row
+                            # group claims is caught right after the loop; up
+                            # to then, only write inside the sized buffer.
+                            if records < rows:
+                                sp.unsafe_store(records, k)
+                                if not all_present:
+                                    vp.unsafe_store(records, nvals)
+                            records += 1
+                        if all_present or Int(defs.unsafe_load(k)) == max_def:
                             nvals += 1
-                    slot.append(cd.num_slots)
-                    if not cd.all_present:
-                        value.append(nvals)
-                    if len(slot) != rows + 1:
+                    if records != rows:
                         raise Error(
                             String(
                                 "parquet: column '",
                                 self.schema.leaves[i].dotted(),
                                 "' assembles ",
-                                len(slot) - 1,
+                                records,
                                 " record(s) in a row group of ",
                                 rows,
                                 " rows",
                             )
                         )
+                    sp.unsafe_store(rows, nslots)
+                    if not all_present:
+                        vp.unsafe_store(rows, nvals)
             self._chunks.append(cd^)
             self._row_flat.append(flat)
             self._row_slot.append(slot^)
