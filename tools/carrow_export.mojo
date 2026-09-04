@@ -15,10 +15,10 @@ from parquet import ParquetReader, export_c
 
 @export("pq_export_column")
 def pq_export_column(
-    path: UnsafePointer[UInt8, ImmUntrackedOrigin],
+    path: Pointer[UInt8, ImmUntrackedOrigin],
     col: Int32,
-    arr_out: UnsafePointer[UInt8, MutUntrackedOrigin],
-    sch_out: UnsafePointer[UInt8, MutUntrackedOrigin],
+    arr_out: Pointer[UInt8, MutUntrackedOrigin],
+    sch_out: Pointer[UInt8, MutUntrackedOrigin],
 ) abi("C") -> Int32:
     """Export column `col` of the NUL-terminated file `path`.
 
@@ -36,12 +36,12 @@ def pq_export_column(
             return -1
         var e = export_c(batch.arena, batch.roots[ci])
         var raw = e.into_raw()
-        var a = UnsafePointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=raw[0])
-        var s = UnsafePointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=raw[1])
+        var a = Pointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=raw[0])
+        var s = Pointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=raw[1])
         for i in range(80):
-            arr_out[unsafe_offset=i] = a[i]
+            arr_out[unsafe_offset=i] = a[unsafe_offset=i]
         for i in range(72):
-            sch_out[unsafe_offset=i] = s[i]
+            sch_out[unsafe_offset=i] = s[unsafe_offset=i]
         return 0
     except:
         return -1
