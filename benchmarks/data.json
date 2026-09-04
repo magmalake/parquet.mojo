@@ -23,6 +23,86 @@
   },
   "runs": [
     {
+      "commit": "b5ff8877b54f37785e78a62d3fd33cc644079915",
+      "short_commit": "b5ff887",
+      "timestamp": "2026-09-04T12:28:13Z",
+      "ref": "main",
+      "host": "linux-x86_64-amd-epyc-7763-64-core-processor-2c",
+      "config": {
+        "min_runtime_secs": 1.0,
+        "num_warmup_iters": 2,
+        "num_repetitions": 3,
+        "max_iters": 100000000
+      },
+      "results": {
+        "bench_read_big": {
+          "mean_ns": 7705352.590413943,
+          "min_ns": 7678889.052287581,
+          "max_ns": 7739754.522875817,
+          "median_ns": 7697414.196078432,
+          "stddev_ns": 31199.598650485725,
+          "iters": 153,
+          "reps": 3,
+          "throughput": 0.012977991445116705,
+          "throughput_unit": "GElems/s",
+          "throughput_metric": "elements",
+          "throughput_count": 100000
+        },
+        "bench_read_prune": {
+          "mean_ns": 283370.5450733753,
+          "min_ns": 283205.9017004426,
+          "max_ns": 283533.2420218961,
+          "median_ns": 283372.4914977871,
+          "stddev_ns": 163.6788408387501,
+          "iters": 4293,
+          "reps": 3,
+          "throughput": 0.003528948288330611,
+          "throughput_unit": "GElems/s",
+          "throughput_metric": "elements",
+          "throughput_count": 1000
+        },
+        "bench_read_encodings": {
+          "mean_ns": 206062.34394940428,
+          "min_ns": 205982.22513975945,
+          "max_ns": 206182.9920379468,
+          "median_ns": 206021.81467050652,
+          "stddev_ns": 106.34285912989056,
+          "iters": 5903,
+          "reps": 3,
+          "throughput": 0.0019411600990922164,
+          "throughput_unit": "GElems/s",
+          "throughput_metric": "elements",
+          "throughput_count": 400
+        },
+        "bench_read_v2pages": {
+          "mean_ns": 147751.74403262563,
+          "min_ns": 147137.6399184359,
+          "max_ns": 148625.7484706729,
+          "median_ns": 147491.84370876814,
+          "stddev_ns": 777.3531369758284,
+          "iters": 8337,
+          "reps": 3,
+          "throughput": 0.0033840548094619654,
+          "throughput_unit": "GElems/s",
+          "throughput_metric": "elements",
+          "throughput_count": 500
+        },
+        "bench_write_big": {
+          "mean_ns": 30919053.315789476,
+          "min_ns": 30889797.736842107,
+          "max_ns": 30965464.210526317,
+          "median_ns": 30901898.0,
+          "stddev_ns": 40645.81718735983,
+          "iters": 38,
+          "reps": 3,
+          "throughput": 0.003234251675776013,
+          "throughput_unit": "GElems/s",
+          "throughput_metric": "elements",
+          "throughput_count": 100000
+        }
+      }
+    },
+    {
       "commit": "d6cd38b96d3370b313ce7913a4a1645d6e46e663",
       "short_commit": "d6cd38b",
       "timestamp": "2026-09-04T03:27:28Z",
