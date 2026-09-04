@@ -194,10 +194,9 @@ def _decode_vector[
 
     var at = base + 4
     _need(data, at, for_bytes + 1, "frame of reference")
-    var frame = Int64(0)
+    var frame: Int64
 
-    @parameter
-    if is_double:
+    comptime if is_double:
         var raw = UInt64(0)
         for k in range(8):
             raw |= UInt64(data[at + k]) << UInt64(8 * k)
@@ -230,8 +229,7 @@ def _decode_vector[
     # negative-power table would be the strictly faithful reading.
     var start = out.count
 
-    @parameter
-    if is_double:
+    comptime if is_double:
         var up = _pow10_f64(factor)
         var down = _pow10_f64(exponent)
         for i in range(n):

@@ -33,6 +33,8 @@ e.into_raw()               # hand ownership to the consumer
 ```
 """
 
+from std.memory.alloc import unsafe_alloc
+
 from parquet.arrow import (
     AT_BINARY,
     AT_BOOL,
@@ -83,40 +85,40 @@ struct CArrowArray(Copyable, Movable):
 
 
 def release_array(
-    p: UnsafePointer[CArrowArray, MutUntrackedOrigin]
+    p: Pointer[CArrowArray, MutUntrackedOrigin]
 ) abi("C") -> None:
     """Free the whole exported array tree. `private_data` is the block."""
     var block = p[].private_data
     p[].release = 0
     if block != 0:
-        var base = UnsafePointer[UInt64, MutUntrackedOrigin](
+        var base = Pointer[UInt64, MutUntrackedOrigin](
             unsafe_from_address=block
         )
         base.unsafe_free()
 
 
 def release_schema(
-    p: UnsafePointer[CArrowSchema, MutUntrackedOrigin]
+    p: Pointer[CArrowSchema, MutUntrackedOrigin]
 ) abi("C") -> None:
     """Free the whole exported schema tree."""
     var block = p[].private_data
     p[].release = 0
     if block != 0:
-        var base = UnsafePointer[UInt64, MutUntrackedOrigin](
+        var base = Pointer[UInt64, MutUntrackedOrigin](
             unsafe_from_address=block
         )
         base.unsafe_free()
 
 
 def release_child_array(
-    p: UnsafePointer[CArrowArray, MutUntrackedOrigin]
+    p: Pointer[CArrowArray, MutUntrackedOrigin]
 ) abi("C") -> None:
     """A child is owned by its root; releasing one only marks it released."""
     p[].release = 0
 
 
 def release_child_schema(
-    p: UnsafePointer[CArrowSchema, MutUntrackedOrigin]
+    p: Pointer[CArrowSchema, MutUntrackedOrigin]
 ) abi("C") -> None:
     p[].release = 0
 
@@ -146,13 +148,13 @@ def _align8(n: Int) -> Int:
 struct _Block(Movable):
     """A bump allocator over one `alloc[UInt64]` region."""
 
-    var base: UnsafePointer[UInt64, MutUntrackedOrigin]
+    var base: Pointer[UInt64, MutUntrackedOrigin]
     var size: Int
     var used: Int
 
     def __init__(out self, size: Int):
         self.size = _align8(size)
-        self.base = alloc[UInt64](self.size // 8)
+        self.base = unsafe_alloc[UInt64](self.size // 8)
         self.used = 0
         var p = self.base.unsafe_bitcast[UInt8]()
         for i in range(self.size):
@@ -182,13 +184,13 @@ struct _Block(Movable):
             )
         return Int(self.base) + at
 
-    def bytes_at(self, addr: Int) -> UnsafePointer[UInt8, MutUntrackedOrigin]:
-        return UnsafePointer[UInt8, MutUntrackedOrigin](
+    def bytes_at(self, addr: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
+        return Pointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=addr
         )
 
-    def words_at(self, addr: Int) -> UnsafePointer[Int64, MutUntrackedOrigin]:
-        return UnsafePointer[Int64, MutUntrackedOrigin](
+    def words_at(self, addr: Int) -> Pointer[Int64, MutUntrackedOrigin]:
+        return Pointer[Int64, MutUntrackedOrigin](
             unsafe_from_address=addr
         )
 
@@ -307,12 +309,12 @@ struct ExportedArray(Movable):
         if not self._owned:
             return
         self._owned = False
-        var a = UnsafePointer[CArrowArray, MutUntrackedOrigin](
+        var a = Pointer[CArrowArray, MutUntrackedOrigin](
             unsafe_from_address=self.array
         )
         if a[].release != 0:
             release_array(a)
-        var s = UnsafePointer[CArrowSchema, MutUntrackedOrigin](
+        var s = Pointer[CArrowSchema, MutUntrackedOrigin](
             unsafe_from_address=self.schema
         )
         if s[].release != 0:
@@ -374,16 +376,16 @@ def _export_schema(
 
 
 comptime SchemaReleaseFn = def(
-    UnsafePointer[CArrowSchema, MutUntrackedOrigin]
+    Pointer[CArrowSchema, MutUntrackedOrigin]
 ) thin abi("C") -> None
 comptime ArrayReleaseFn = def(
-    UnsafePointer[CArrowArray, MutUntrackedOrigin]
+    Pointer[CArrowArray, MutUntrackedOrigin]
 ) thin abi("C") -> None
 
 
 def _store_schema_release(struct_addr: Int, is_root: Bool):
     """Write the `release` function pointer into a C `ArrowSchema` (word 7)."""
-    var slot = UnsafePointer[SchemaReleaseFn, MutUntrackedOrigin](
+    var slot = Pointer[SchemaReleaseFn, MutUntrackedOrigin](
         unsafe_from_address=struct_addr + 56
     )
     slot[] = release_schema if is_root else release_child_schema
@@ -391,7 +393,7 @@ def _store_schema_release(struct_addr: Int, is_root: Bool):
 
 def _store_array_release(struct_addr: Int, is_root: Bool):
     """Write the `release` function pointer into a C `ArrowArray` (word 8)."""
-    var slot = UnsafePointer[ArrayReleaseFn, MutUntrackedOrigin](
+    var slot = Pointer[ArrayReleaseFn, MutUntrackedOrigin](
         unsafe_from_address=struct_addr + 64
     )
     slot[] = release_array if is_root else release_child_array

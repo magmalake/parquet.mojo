@@ -886,12 +886,12 @@ def test_bloom_filter() raises:
 
 
 def _word(addr: Int, i: Int) -> Int64:
-    var p = UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
+    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
     return p[unsafe_offset=i]
 
 
 def _cstring(addr: Int) -> String:
-    var p = UnsafePointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
+    var p = Pointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
     return String(unsafe_from_utf8_ptr=p)
 
 
@@ -935,7 +935,7 @@ def test_c_data_interface_buffers() raises:
     assert_equal(_word(e.array, 1), 2)  # two nulls
     var bufs = Int(_word(e.array, 5))
     assert_true(_word(bufs, 0) != 0)  # validity present
-    var values = UnsafePointer[Int64, ImmUntrackedOrigin](
+    var values = Pointer[Int64, ImmUntrackedOrigin](
         unsafe_from_address=Int(_word(bufs, 1))
     )
     assert_equal(values[unsafe_offset=0], -9223372036854775808)
@@ -946,7 +946,7 @@ def test_c_data_interface_buffers() raises:
     assert_equal(_cstring(Int(_word(e2.schema, 0))), "u")
     assert_equal(_word(e2.array, 3), 3)  # validity, offsets, data
     var b2 = Int(_word(e2.array, 5))
-    var offs = UnsafePointer[Int32, ImmUntrackedOrigin](
+    var offs = Pointer[Int32, ImmUntrackedOrigin](
         unsafe_from_address=Int(_word(b2, 1))
     )
     assert_equal(offs[unsafe_offset=0], 0)
@@ -968,7 +968,7 @@ def test_c_data_interface_extension_metadata() raises:
     assert_equal(_cstring(Int(_word(e.schema, 0))), "w:16")
     var md = Int(_word(e.schema, 2))
     assert_true(md != 0, "uuid column should carry extension metadata")
-    var p = UnsafePointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=md)
+    var p = Pointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=md)
     var n_keys = (
         Int(p[unsafe_offset=0])
         | (Int(p[unsafe_offset=1]) << 8)
