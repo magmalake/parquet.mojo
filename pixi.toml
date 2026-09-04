@@ -142,7 +142,7 @@ snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1f
 avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "589f3893627ee4263c756f679369c1b3f3ca5f7c" }
 
 [feature.bench.tasks]
-bench = "mojo run -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo"
+bench = "mkdir -p build && mojo build -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo -o build/bench-parquet && ./build/bench-parquet"
 # bench/ imports the shared harness and the sibling tins by source path
 # (mojolint needs real sources to resolve, not the precompiled packages the
 # dependencies above install into $CONDA_PREFIX/lib/mojo).
