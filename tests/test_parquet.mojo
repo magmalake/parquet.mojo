@@ -12,6 +12,7 @@ from fixtures_list import (
     iceberg_fixtures,
     iceberg_zstd_fixtures,
 )
+from fingerprint import read_error, read_fingerprint
 from oracle import canon_value, decimal_string, double_bits, hex_of, load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import (
@@ -1918,6 +1919,164 @@ def test_projection_works_on_a_borrowed_reader() raises:
     var all_cols = r.read_table()
     assert_equal(all_cols.num_rows, 1000)
     keep(bytes)
+
+
+# ── more than one core ──────────────────────────────────────────────────────
+#
+# `ParquetReader.num_workers` fans the column chunks of a row group out over
+# threads. The contract these tests pin down is that it changes *nothing* the
+# caller can observe except how long the read takes: the same bytes, the same
+# batch boundaries, and the same error from the same corrupt file.
+
+
+def worker_counts() -> List[Int]:
+    """Worker counts every fixture is re-read at. 10 is this machine's core
+    count; every fixture has fewer leaves than that, so this also covers the
+    clamp down to the number of projected columns."""
+    return [2, 4, 10]
+
+
+def test_num_workers_is_bit_identical() raises:
+    """Every fixture, read at 1, 2, 4 and 10 workers, byte for byte.
+
+    The fingerprint folds in the Arrow buffers themselves — values, validity,
+    offsets, large offsets — as well as every length, null count, type name and
+    field id, so a threaded read that got one bit, one null count or one offset
+    wrong fails here. A value-level or row-count comparison would not.
+    """
+    var workers = worker_counts()
+    var checked = 0
+    for f in core_fixtures():
+        var path = String(FIXTURES, f, ".parquet")
+        var want = read_fingerprint[DefaultCodecs](path, 1, 65536)
+        for w in range(len(workers)):
+            assert_equal(
+                read_fingerprint[DefaultCodecs](path, workers[w], 65536),
+                want,
+                String(f, " at ", workers[w], " workers"),
+            )
+            checked += 1
+    for f in iceberg_fixtures():
+        var path = String(FIXTURES, "iceberg/", f, ".parquet")
+        var want = read_fingerprint[DefaultCodecs](path, 1, 65536)
+        for w in range(len(workers)):
+            assert_equal(
+                read_fingerprint[DefaultCodecs](path, workers[w], 65536),
+                want,
+                String("iceberg/", f, " at ", workers[w], " workers"),
+            )
+            checked += 1
+    assert_true(checked >= 90, String("only ", checked, " comparisons"))
+    print("    worker-count comparisons:", checked)
+
+
+def test_num_workers_is_bit_identical_across_batches() raises:
+    """The same, at a batch size that cuts every row group into many batches.
+
+    Threading happens in `_load` and batching in `_assemble`, so a per-row
+    index built on a worker thread has to survive being sliced repeatedly.
+    Kept to the fixtures with nesting, nulls and many pages, because a tiny
+    batch size on a 100k-row fixture is all re-assembly and no new coverage.
+    """
+    var names: List[String] = [
+        String("nested"),
+        String("legacy_list"),
+        String("allnull"),
+        String("manypages"),
+        String("encodings"),
+        String("logical"),
+    ]
+    var workers = worker_counts()
+    var checked = 0
+    for f in names:
+        var path = String(FIXTURES, f, ".parquet")
+        var want = read_fingerprint[DefaultCodecs](path, 1, 64)
+        for w in range(len(workers)):
+            assert_equal(
+                read_fingerprint[DefaultCodecs](path, workers[w], 64),
+                want,
+                String(f, " at ", workers[w], " workers, batch size 64"),
+            )
+            checked += 1
+    assert_true(checked >= 18, String("only ", checked, " comparisons"))
+
+
+def test_num_workers_zero_uses_every_core() raises:
+    """`num_workers = 0` is "one per core", not "no workers"."""
+    var path = String(FIXTURES, "big.parquet")
+    assert_equal(
+        read_fingerprint[DefaultCodecs](path, 0, 65536),
+        read_fingerprint[DefaultCodecs](path, 1, 65536),
+    )
+
+
+def test_num_workers_survives_projection() raises:
+    """A projection shrinks the task set; one surviving column must still take
+    the sequential path and give the same answer."""
+    var cols: List[String] = [String("i")]
+    var want = String()
+    for w in [1, 2, 8]:
+        var r = ParquetReader[DefaultCodecs].open(
+            String(FIXTURES, "big.parquet")
+        )
+        r.num_workers = w
+        r.select_columns(cols)
+        var t = r.read_table()
+        var got = String(t.num_rows, ":", t.num_columns(), ":", t.name(0))
+        if w == 1:
+            want = got^
+        else:
+            assert_equal(got, want, String("projection at ", w, " workers"))
+
+
+def _corrupt_chunk(var data: List[UInt8], leaf: Int) raises -> List[UInt8]:
+    """Scribble over the first page of one column chunk of row group 0."""
+    var r = ParquetReader[DefaultCodecs].from_span(Span(data))
+    ref cm = r.meta.row_groups[0].columns[leaf].meta_data.value()
+    var at = Int(cm.data_page_offset)
+    if cm.dictionary_page_offset:
+        var d = Int(cm.dictionary_page_offset.value())
+        if d > 0 and d < at:
+            at = d
+    for k in range(at, at + 48):
+        data[k] = 0xA5
+    return data^
+
+
+def test_num_workers_surfaces_a_corrupt_file() raises:
+    """A task cannot raise — pthread has no exception channel — so a failure
+    comes back through the task's own slot. It has to reach the caller as a
+    raise from `read_table`, not a hang and not a short table."""
+    var bad = _corrupt_chunk(fixture_bytes("big"), 0)
+    var want = read_error[DefaultCodecs](Span(bad), 1)
+    assert_true(want != "", "the corrupt fixture read cleanly at 1 worker")
+    var workers = worker_counts()
+    for w in range(len(workers)):
+        assert_equal(
+            read_error[DefaultCodecs](Span(bad), workers[w]),
+            want,
+            String("corrupt read at ", workers[w], " workers"),
+        )
+
+
+def test_corrupt_file_error_does_not_depend_on_the_winner() raises:
+    """Two bad columns, so two tasks fail and the order they fail in is a race.
+    The error reported is the lowest-numbered leaf's either way, because the
+    slots are scanned in leaf order after the join."""
+    var bytes = fixture_bytes("big")
+    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var leaves = len(r.schema.leaves)
+    assert_true(leaves >= 3, String("big.parquet has only ", leaves, " leaves"))
+    var bad = _corrupt_chunk(_corrupt_chunk(bytes^, 0), leaves - 1)
+    var want = read_error[DefaultCodecs](Span(bad), 1)
+    assert_true(want != "", "the doubly corrupt fixture read cleanly")
+    var workers = worker_counts()
+    for w in range(len(workers)):
+        assert_equal(
+            read_error[DefaultCodecs](Span(bad), workers[w]),
+            want,
+            String("two corrupt columns at ", workers[w], " workers"),
+        )
 
 
 def main() raises:

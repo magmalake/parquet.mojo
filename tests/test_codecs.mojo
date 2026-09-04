@@ -5,6 +5,7 @@ These need `zstd.mojo`, `brotli.mojo` and `lz4.mojo` checked out next door and
 their shims installed, which the `codecs` environment does.
 """
 
+from fingerprint import read_fingerprint
 from fixtures_list import (
     core_fixtures,
     full_codec_columns,
@@ -16,7 +17,7 @@ from parity import check_fixture, check_path, check_table
 from parquet import ParquetReader, ParquetWriter, WriterOptions
 from thrift import CompressionCodec
 from parquet.ext_full import AllCodecs
-from std.testing import TestSuite, assert_true
+from std.testing import TestSuite, assert_equal, assert_true
 
 
 def test_all_codecs_read_every_column() raises:
@@ -80,6 +81,33 @@ def test_iceberg_zstd_data_files() raises:
             String("tests/fixtures/iceberg/", f), f, List[String](), 65536
         )
     assert_true(total > 80, String("only ", total, " Iceberg values checked"))
+
+
+def test_num_workers_is_bit_identical_with_ffi_codecs() raises:
+    """The threaded read, on the codecs that go through FFI.
+
+    `codecs.parquet` has one column per codec, so a threaded read of it has
+    ZSTD, BROTLI, LZ4 and the pure-Mojo codecs all decompressing at the same
+    time on different threads — including the first call of the process, which
+    is where each of those tins lazily `dlopen`s its shared library.
+    """
+    var paths: List[String] = [
+        String("tests/fixtures/codecs.parquet"),
+        String("tests/fixtures/iceberg/deletes_data.parquet"),
+        String("tests/fixtures/iceberg/evolved.parquet"),
+    ]
+    var workers: List[Int] = [2, 4, 10]
+    var checked = 0
+    for p in paths:
+        var want = read_fingerprint[AllCodecs](p, 1, 65536)
+        for w in range(len(workers)):
+            assert_equal(
+                read_fingerprint[AllCodecs](p, workers[w], 65536),
+                want,
+                String(p, " at ", workers[w], " workers"),
+            )
+            checked += 1
+    assert_true(checked >= 9, String("only ", checked, " comparisons"))
 
 
 def main() raises:

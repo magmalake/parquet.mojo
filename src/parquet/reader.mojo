@@ -54,8 +54,10 @@ from parquet.stats import (
     decode_stats,
 )
 from std.memory import bitcast
+from threads import num_cpus, parallel_for
 from thrift import (
     ColumnIndex,
+    ColumnMetaData,
     FileMetaData,
     OffsetIndex,
     RowGroup,
@@ -352,6 +354,18 @@ def _as_file_bytes(ref data: List[UInt8]) -> FileBytes:
     return rebind[FileBytes](Span(data))
 
 
+def _no_chunk_meta(rg: Int, leaf: Int) -> Error:
+    return Error(
+        String(
+            "parquet: column chunk ",
+            leaf,
+            " of row group ",
+            rg,
+            " has no metadata (an encrypted column?)",
+        )
+    )
+
+
 def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
     return String(
         "parquet: column '",
@@ -360,6 +374,239 @@ def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
         which,
         " levels than it has value slots",
     )
+
+
+# ── the unit of a row-group load, and its fan-out ───────────────────────────
+#
+# `_load` decodes one column chunk per leaf and then walks its levels once to
+# build the per-row indices `_assemble` slices with. That whole per-leaf body
+# is `_decode_leaf`, which reads only its inputs and writes only its own four
+# outputs — which is what makes it safe to run several of them at once.
+# `ParquetReader.num_workers` says how many; 1, the default, calls it straight
+# from `_load` on the calling thread with no threading machinery in the way.
+
+
+def _decode_leaf[
+    Codecs: CodecSet
+](
+    file: FileBytes,
+    cm: ColumnMetaData,
+    leaf: LeafColumn,
+    verify_crc: Bool,
+    rows: Int,
+    mut data: ColumnData,
+    mut flat: Bool,
+    mut slot: List[Int],
+    mut value: List[Int],
+) raises:
+    """Decode one column chunk of one row group, and index it by row.
+
+    A pure function of its inputs: it reads the file bytes, which nothing
+    mutates for the life of a reader, and writes only into its own four
+    outputs. Both the sequential and the threaded path in `_load` call this and
+    nothing else, so what a column decodes to cannot depend on which one ran,
+    or on how many workers it ran with.
+
+    The outputs are written rather than returned so that a threaded task can
+    aim them straight at its own slots in `_LoadCtx`, with nothing to move
+    afterwards.
+    """
+    data = read_column_chunk[Codecs](file, cm, leaf, verify_crc)
+    var max_def = leaf.max_def
+    var max_rep = leaf.max_rep
+    var nvals = 0
+    if max_rep == 0:
+        # One slot per row, so the slot index *is* the row index and `slot`
+        # never has to be built.
+        flat = True
+        if data.num_slots != rows:
+            raise Error(
+                String(
+                    "parquet: column '",
+                    leaf.dotted(),
+                    "' has ",
+                    data.num_slots,
+                    " value(s) in a row group of ",
+                    rows,
+                    " rows",
+                )
+            )
+        if not data.all_present:
+            # One entry per row plus a sentinel: the size is known up front, so
+            # the index is `rows` stores into a sized buffer rather than `rows`
+            # appends to a growing one.
+            if rows > len(data.defs):
+                raise Error(_short_levels(leaf, "definition"))
+            value.resize(rows + 1, 0)
+            var vp = value.unsafe_ptr()
+            var defs = data.defs.unsafe_ptr()
+            for k in range(rows):
+                vp.unsafe_store(k, nvals)
+                if Int(defs.unsafe_load(k)) == max_def:
+                    nvals += 1
+            vp.unsafe_store(rows, nvals)
+        return
+    var nslots = data.num_slots
+    var all_present = data.all_present
+    if nslots > len(data.reps):
+        raise Error(_short_levels(leaf, "repetition"))
+    if not all_present and nslots > len(data.defs):
+        raise Error(_short_levels(leaf, "definition"))
+    slot.resize(rows + 1, 0)
+    if not all_present:
+        value.resize(rows + 1, 0)
+    var sp = slot.unsafe_ptr()
+    var vp = value.unsafe_ptr()
+    var reps = data.reps.unsafe_ptr()
+    var defs = data.defs.unsafe_ptr()
+    var records = 0
+    for k in range(nslots):
+        if reps.unsafe_load(k) == 0:
+            # A chunk that starts more records than the row group claims is
+            # caught right after the loop; up to then, only write inside the
+            # sized buffer.
+            if records < rows:
+                sp.unsafe_store(records, k)
+                if not all_present:
+                    vp.unsafe_store(records, nvals)
+            records += 1
+        if all_present or Int(defs.unsafe_load(k)) == max_def:
+            nvals += 1
+    if records != rows:
+        raise Error(
+            String(
+                "parquet: column '",
+                leaf.dotted(),
+                "' assembles ",
+                records,
+                " record(s) in a row group of ",
+                rows,
+                " rows",
+            )
+        )
+    sp.unsafe_store(rows, nslots)
+    if not all_present:
+        vp.unsafe_store(rows, nvals)
+
+
+struct _LoadCtx(Movable):
+    """Everything a threaded row-group load reads, and where it writes.
+
+    The outputs are sized to one slot per *leaf* — not per task — and filled in
+    at the leaf's own index, so the lists come out in exactly the order the
+    sequential loop appends them in and `_load` can move them straight into the
+    reader. Task `k` reads `metas[k]`/`leaves[k]` and writes only the four
+    slots at `which[k]`, so the tasks share nothing and need no lock; the file
+    bytes they all read are immutable for the life of the reader.
+    """
+
+    var file: FileBytes
+    var metas: List[ColumnMetaData]
+    """The chunk metadata of each *needed* leaf, copied so no worker reads
+    through the reader while `_load` holds it mutably."""
+    var leaves: List[LeafColumn]
+    var which: List[Int]
+    """Task `k` decodes leaf `which[k]`."""
+    var rows: Int
+    var verify_crc: Bool
+    var chunks: List[ColumnData]
+    var flat: List[Bool]
+    var slot: List[List[Int]]
+    var value: List[List[Int]]
+    var errors: List[String]
+    """Per leaf, empty when it decoded. A task cannot raise — pthread has no
+    exception channel — so a failure lands in its own leaf's slot and `_load`
+    re-raises it in leaf order after the join, which is why the error a corrupt
+    file gives does not depend on which worker lost."""
+
+    def __init__(
+        out self,
+        file: FileBytes,
+        var metas: List[ColumnMetaData],
+        var leaves: List[LeafColumn],
+        var which: List[Int],
+        nleaves: Int,
+        rows: Int,
+        verify_crc: Bool,
+    ):
+        self.file = file
+        self.metas = metas^
+        self.leaves = leaves^
+        self.which = which^
+        self.rows = rows
+        self.verify_crc = verify_crc
+        self.chunks = List[ColumnData]()
+        self.flat = List[Bool]()
+        self.slot = List[List[Int]]()
+        self.value = List[List[Int]]()
+        self.errors = List[String]()
+        for _ in range(nleaves):
+            self.chunks.append(ColumnData())
+            self.flat.append(False)
+            self.slot.append(List[Int]())
+            self.value.append(List[Int]())
+            self.errors.append(String())
+
+    def __init__(out self, *, deinit move: Self):
+        self.file = move.file
+        self.metas = move.metas^
+        self.leaves = move.leaves^
+        self.which = move.which^
+        self.rows = move.rows
+        self.verify_crc = move.verify_crc
+        self.chunks = move.chunks^
+        self.flat = move.flat^
+        self.slot = move.slot^
+        self.value = move.value^
+        self.errors = move.errors^
+
+    # The four outputs, moved out; the context keeps an empty list in place.
+    # A field cannot be transferred out of the middle of a live value, and the
+    # context is still live at this point, so each one swaps rather than moves.
+
+    def take_chunks(mut self) -> List[ColumnData]:
+        var taken = self.chunks^
+        self.chunks = List[ColumnData]()
+        return taken^
+
+    def take_flat(mut self) -> List[Bool]:
+        var taken = self.flat^
+        self.flat = List[Bool]()
+        return taken^
+
+    def take_slot(mut self) -> List[List[Int]]:
+        var taken = self.slot^
+        self.slot = List[List[Int]]()
+        return taken^
+
+    def take_value(mut self) -> List[List[Int]]:
+        var taken = self.value^
+        self.value = List[List[Int]]()
+        return taken^
+
+
+def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
+    """One column chunk, on whichever worker drew task `k`.
+
+    Writes only the four output slots at leaf index `which[k]` — or, on a
+    failure, that leaf's error slot — none of which another task touches, and
+    reads only fields nothing writes while the fan-out runs.
+    """
+    var i = ctx.which[k]
+    try:
+        _decode_leaf[Codecs](
+            ctx.file,
+            ctx.metas[k],
+            ctx.leaves[k],
+            ctx.verify_crc,
+            ctx.rows,
+            ctx.chunks[i],
+            ctx.flat[i],
+            ctx.slot[i],
+            ctx.value[i],
+        )
+    except e:
+        ctx.errors[i] = String(e)
 
 
 struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
@@ -374,6 +621,23 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var schema: ParquetSchema
     var batch_size: Int
     var verify_crc: Bool
+    var num_workers: Int
+    """How many OS threads decode the column chunks of a row group at once.
+
+    `1`, the default, decodes every chunk on the calling thread and is what
+    every existing caller gets: the sequential path is the same code it always
+    was, with no pool started and no task context built. `0` means one worker
+    per core. Anything else is that many workers, clamped down to the number of
+    projected leaves — a two-column read gains nothing from ten threads.
+
+    A column chunk is the unit because it is where the time is: on the wide
+    benchmark, dictionary gather, value decoding, decompression and the
+    per-row index together are about 85% of a read, and they are all inside
+    it. Chunks are independent through decode, so the tasks share nothing but
+    the immutable file bytes and the output is identical whatever the worker
+    count — asserted over the whole fixture corpus by
+    `test_num_workers_is_bit_identical`.
+    """
     var _row_groups: List[Int]
     var _roots: List[Int]
     """Selected top-level Arrow field indices."""
@@ -432,6 +696,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self.schema = build_schema(self.meta.schema)
         self.batch_size = 65536
         self.verify_crc = True
+        self.num_workers = 1
         self._row_groups = List[Int]()
         for i in range(len(self.meta.row_groups)):
             self._row_groups.append(i)
@@ -457,6 +722,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self.schema = move.schema^
         self.batch_size = move.batch_size
         self.verify_crc = move.verify_crc
+        self.num_workers = move.num_workers
         self._row_groups = move._row_groups^
         self._roots = move._roots^
         self._needed = move._needed^
@@ -734,116 +1000,94 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                     " leaves",
                 )
             )
+        var workers = self.num_workers
+        if workers == 0:
+            workers = num_cpus()
+        if workers > 1:
+            var projected = 0
+            for i in range(nleaves):
+                if self._needed[i]:
+                    projected += 1
+            if workers > projected:
+                workers = projected
+        if workers > 1:
+            self._load_threaded(rg, rows, nleaves, workers)
+            return
         for i in range(nleaves):
+            if not self._needed[i]:
+                self._chunks.append(ColumnData())
+                self._row_flat.append(False)
+                self._row_slot.append(List[Int]())
+                self._row_value.append(List[Int]())
+                continue
+            ref chunk = self.meta.row_groups[rg].columns[i]
+            if not chunk.meta_data:
+                raise _no_chunk_meta(rg, i)
             var cd = ColumnData()
+            var flat = False
             var slot = List[Int]()
             var value = List[Int]()
-            var flat = False
-            if self._needed[i]:
-                ref chunk = self.meta.row_groups[rg].columns[i]
-                if not chunk.meta_data:
-                    raise Error(
-                        String(
-                            "parquet: column chunk ",
-                            i,
-                            " of row group ",
-                            rg,
-                            " has no metadata (an encrypted column?)",
-                        )
-                    )
-                cd = read_column_chunk[Self.Codecs](
-                    self.data,
-                    chunk.meta_data.value(),
-                    self.schema.leaves[i],
-                    self.verify_crc,
-                )
-                var max_def = self.schema.leaves[i].max_def
-                var max_rep = self.schema.leaves[i].max_rep
-                var nvals = 0
-                if max_rep == 0:
-                    # One slot per row, so the slot index *is* the row index
-                    # and `slot` never has to be built.
-                    flat = True
-                    if cd.num_slots != rows:
-                        raise Error(
-                            String(
-                                "parquet: column '",
-                                self.schema.leaves[i].dotted(),
-                                "' has ",
-                                cd.num_slots,
-                                " value(s) in a row group of ",
-                                rows,
-                                " rows",
-                            )
-                        )
-                    if not cd.all_present:
-                        # One entry per row plus a sentinel: the size is known
-                        # up front, so the index is `rows` stores into a sized
-                        # buffer rather than `rows` appends to a growing one.
-                        if rows > len(cd.defs):
-                            raise Error(
-                                _short_levels(
-                                    self.schema.leaves[i], "definition"
-                                )
-                            )
-                        value.resize(rows + 1, 0)
-                        var vp = value.unsafe_ptr()
-                        var defs = cd.defs.unsafe_ptr()
-                        for k in range(rows):
-                            vp.unsafe_store(k, nvals)
-                            if Int(defs.unsafe_load(k)) == max_def:
-                                nvals += 1
-                        vp.unsafe_store(rows, nvals)
-                else:
-                    var nslots = cd.num_slots
-                    var all_present = cd.all_present
-                    if nslots > len(cd.reps):
-                        raise Error(
-                            _short_levels(self.schema.leaves[i], "repetition")
-                        )
-                    if not all_present and nslots > len(cd.defs):
-                        raise Error(
-                            _short_levels(self.schema.leaves[i], "definition")
-                        )
-                    slot.resize(rows + 1, 0)
-                    if not all_present:
-                        value.resize(rows + 1, 0)
-                    var sp = slot.unsafe_ptr()
-                    var vp = value.unsafe_ptr()
-                    var reps = cd.reps.unsafe_ptr()
-                    var defs = cd.defs.unsafe_ptr()
-                    var records = 0
-                    for k in range(nslots):
-                        if reps.unsafe_load(k) == 0:
-                            # A chunk that starts more records than the row
-                            # group claims is caught right after the loop; up
-                            # to then, only write inside the sized buffer.
-                            if records < rows:
-                                sp.unsafe_store(records, k)
-                                if not all_present:
-                                    vp.unsafe_store(records, nvals)
-                            records += 1
-                        if all_present or Int(defs.unsafe_load(k)) == max_def:
-                            nvals += 1
-                    if records != rows:
-                        raise Error(
-                            String(
-                                "parquet: column '",
-                                self.schema.leaves[i].dotted(),
-                                "' assembles ",
-                                records,
-                                " record(s) in a row group of ",
-                                rows,
-                                " rows",
-                            )
-                        )
-                    sp.unsafe_store(rows, nslots)
-                    if not all_present:
-                        vp.unsafe_store(rows, nvals)
+            _decode_leaf[Self.Codecs](
+                self.data,
+                chunk.meta_data.value(),
+                self.schema.leaves[i],
+                self.verify_crc,
+                rows,
+                cd,
+                flat,
+                slot,
+                value,
+            )
             self._chunks.append(cd^)
             self._row_flat.append(flat)
             self._row_slot.append(slot^)
             self._row_value.append(value^)
+        self._loaded_rg = rg
+
+    def _load_threaded(
+        mut self, rg: Int, rows: Int, nleaves: Int, workers: Int
+    ) raises:
+        """`_load`'s body on `workers` threads, one task per projected leaf.
+
+        The metadata each task needs is copied into the context on the calling
+        thread, before any worker starts, so a chunk with no metadata still
+        raises from here and in leaf order — the same error the sequential path
+        gives, whatever `num_workers` is.
+        """
+        var metas = List[ColumnMetaData]()
+        var leaves = List[LeafColumn]()
+        var which = List[Int]()
+        for i in range(nleaves):
+            if not self._needed[i]:
+                continue
+            ref chunk = self.meta.row_groups[rg].columns[i]
+            if not chunk.meta_data:
+                raise _no_chunk_meta(rg, i)
+            metas.append(chunk.meta_data.value().copy())
+            leaves.append(self.schema.leaves[i].copy())
+            which.append(i)
+        var n = len(which)
+        var ctx = _LoadCtx(
+            self.data,
+            metas^,
+            leaves^,
+            which^,
+            nleaves,
+            rows,
+            self.verify_crc,
+        )
+        # The typed `parallel_for` holds `ctx` for the whole call, joins
+        # included, so nothing has to mention it afterwards to keep it alive.
+        parallel_for[_decode_leaf_task[Self.Codecs]](
+            n, ctx, num_workers=workers
+        )
+        for i in range(nleaves):
+            if ctx.errors[i]:
+                raise Error(ctx.errors[i])
+        self._chunks = ctx.take_chunks()
+        self._row_flat = ctx.take_flat()
+        self._row_slot = ctx.take_slot()
+        self._row_value = ctx.take_value()
         self._loaded_rg = rg
 
     def _ranges_for(self, slot: Int) -> List[Tuple[Int, Int]]:
