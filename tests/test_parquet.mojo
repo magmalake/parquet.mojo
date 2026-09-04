@@ -12,7 +12,7 @@ from fixtures_list import (
     iceberg_fixtures,
     iceberg_zstd_fixtures,
 )
-from oracle import decimal_string, double_bits, hex_of, load_oracle
+from oracle import canon_value, decimal_string, double_bits, hex_of, load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import (
     AT_BINARY,
@@ -335,6 +335,226 @@ def test_nested_shapes_and_levels() raises:
     ref st = r.schema.fields[r.schema.field_by_name("st")]
     assert_equal(st.type.id, AT_STRUCT)
     assert_equal(len(st.children), 2)
+
+
+def _canon_rows(
+    fixture: StringSlice, column: StringSlice, batch_size: Int
+) raises -> List[String]:
+    """One column, one rendered string per row, in the oracle's own notation.
+
+    `L<n>:` opens a list of `n` elements, `O<n>:` a struct of `n` fields,
+    `S<n>:` a scalar of `n` bytes and `N` is a null — so a value in the wrong
+    place, a null in the wrong place and an element attached to the wrong row
+    are all visible as different text.
+    """
+    var r = _reader(fixture)
+    r.batch_size = batch_size
+    r.select_columns([String(column)])
+    var t = r.read_table()
+    var out = List[String]()
+    for b in range(len(t.batches)):
+        ref batch = t.batches[b]
+        for i in range(batch.num_rows):
+            var s = String()
+            canon_value(batch.arena, batch.roots[0], i, s)
+            out.append(s^)
+    return out^
+
+
+def _assert_rows(
+    fixture: StringSlice, column: StringSlice, want: List[String]
+) raises:
+    """Assert every row of `column`, at batch sizes that put the row-group
+    boundary, the batch boundary and the byte boundary of the validity bitmap
+    in different places relative to each other."""
+    var sizes: List[Int] = [1, 2, 3, 4, 7, 8, 9, 16, 65536]
+    for bs in sizes:
+        var got = _canon_rows(fixture, column, bs)
+        assert_equal(
+            len(got),
+            len(want),
+            String(fixture, ".", column, ": row count at batch size ", bs),
+        )
+        for i in range(len(want)):
+            assert_equal(
+                got[i],
+                want[i],
+                String(fixture, ".", column, "[", i, "] at batch size ", bs),
+            )
+
+
+def test_list_children_are_cell_exact() raises:
+    """The nested cases the vectorised leaf path has to get right.
+
+    A list's element array is built by filtering definition levels and packing
+    the validity bitmap eight *rows* at a time, which is a different index from
+    the slot it reads — so the ways it can go wrong are a child with nulls, a
+    list of lists, a list of structs, a map, and a batch whose rows do not
+    start on a byte boundary. Every one of those is pinned here value by value.
+    """
+    # list<int32> with nulls in the child, empty lists and null lists.
+    _assert_rows(
+        "nested",
+        "li",
+        [
+            String("L3:S1:1S1:2S1:3"),
+            String("L0:"),
+            String("N"),
+            String("L1:S1:4"),
+            String("L2:NS1:5"),
+            String("L3:S1:6NS1:7"),
+            String("L0:"),
+            String("N"),
+            String("L2:S1:8S1:9"),
+            String("L1:S2:10"),
+        ],
+    )
+    # list<list<utf8>>: the inner list is itself built with a threshold.
+    _assert_rows(
+        "nested",
+        "lls",
+        [
+            String("L2:L1:S1:aL2:S1:bS1:c"),
+            String("L0:"),
+            String("N"),
+            String("L1:L0:"),
+            String("L1:N"),
+            String("L1:L1:S1:d"),
+            String("L2:L0:L1:S1:e"),
+            String("N"),
+            String("L1:L2:S1:fN"),
+            String("L1:L1:S1:g"),
+        ],
+    )
+    # list<struct<n: int64>>: a struct passes the threshold straight through.
+    _assert_rows(
+        "nested",
+        "lst",
+        [
+            String("L1:O1:S1:nS1:1"),
+            String("L0:"),
+            String("N"),
+            String("L2:O1:S1:nNO1:S1:nS1:2"),
+            String("L1:N"),
+            String("L1:O1:S1:nS1:3"),
+            String("L0:"),
+            String("N"),
+            String("L1:O1:S1:nS1:4"),
+            String("L1:O1:S1:nS1:5"),
+        ],
+    )
+    # map<utf8, int64>: two leaves under one repeated group, one of them
+    # required and one nullable.
+    _assert_rows(
+        "nested",
+        "m",
+        [
+            String("L1:L2:S1:kS1:1"),
+            String("L0:"),
+            String("N"),
+            String("L2:L2:S1:aS1:1L2:S1:bS1:2"),
+            String("L1:L2:S1:zN"),
+            String("L1:L2:S1:qS1:9"),
+            String("L0:"),
+            String("N"),
+            String("L1:L2:S1:yS1:3"),
+            String("L1:L2:S1:xS1:4"),
+        ],
+    )
+    # list<binary>: a variable-length child, so the element offsets are built
+    # by the same filtered pass as the validity.
+    _assert_rows(
+        "nested",
+        "lb",
+        [
+            String("L1:S2:01"),
+            String("L0:"),
+            String("N"),
+            String("L2:S4:0203N"),
+            String("L1:S0:"),
+            String("L1:S2:ff"),
+            String("L0:"),
+            String("N"),
+            String("L1:S4:6162"),
+            String("L1:S4:6364"),
+        ],
+    )
+    # A 2-level (pre-Parquet-2) list, whose element is `required`.
+    _assert_rows(
+        "legacy_list",
+        "li",
+        [
+            String("L2:S1:1S1:2"),
+            String("L0:"),
+            String("N"),
+            String("L1:S1:3"),
+            String("L3:S1:4S1:5S1:6"),
+            String("L0:"),
+            String("L1:S1:7"),
+            String("N"),
+            String("L1:S1:8"),
+            String("L1:S1:9"),
+        ],
+    )
+
+
+def test_list_offsets_and_child_null_counts() raises:
+    """The numbers the vectorised path computes for itself: how long the
+    element array is, how many of its entries are null, and which rows the
+    elements belong to."""
+    var r = _reader("nested")
+    r.select_columns([String("li")])
+    var t = r.read_table()
+    assert_equal(len(t.batches), 1)
+    ref batch = t.batches[0]
+    ref li = batch.column(0)
+    assert_equal(li.type.id, AT_LIST)
+    assert_equal(li.length, 10)
+    assert_equal(li.null_count, 2)
+    var want_off: List[Int] = [0, 3, 3, 3, 4, 6, 9, 9, 9, 11, 12]
+    assert_equal(len(li.offsets), len(want_off), "li: offset count")
+    for k in range(len(want_off)):
+        assert_equal(
+            Int(li.offsets[k]), want_off[k], String("li.offsets[", k, "]")
+        )
+    ref el = batch.child(batch.roots[0], 0)
+    assert_equal(el.type.id, AT_INT32)
+    assert_equal(el.length, 12)
+    assert_equal(el.null_count, 2)
+
+    var r2 = _reader("nested")
+    r2.select_columns([String("lls")])
+    var t2 = r2.read_table()
+    ref b2 = t2.batches[0]
+    ref lls = b2.column(0)
+    assert_equal(lls.length, 10)
+    assert_equal(lls.null_count, 2)
+    var want_out: List[Int] = [0, 2, 2, 2, 3, 4, 5, 7, 7, 8, 9]
+    assert_equal(len(lls.offsets), len(want_out), "lls: offset count")
+    for k in range(len(want_out)):
+        assert_equal(
+            Int(lls.offsets[k]), want_out[k], String("lls.offsets[", k, "]")
+        )
+    ref inner = b2.child(b2.roots[0], 0)
+    assert_equal(inner.type.id, AT_LIST)
+    assert_equal(inner.length, 9)
+    assert_equal(inner.null_count, 1)
+    ref leaf = b2.child(b2.roots[0], 0)
+    assert_equal(len(leaf.children), 1)
+    ref strs = b2.arena.nodes[leaf.children[0]]
+    assert_equal(strs.type.id, AT_UTF8)
+    assert_equal(strs.length, 8)
+    assert_equal(strs.null_count, 1)
+
+
+def test_big_list_column_at_odd_batch_boundaries() raises:
+    """100k rows of `list<int32>`, 20k of them null, checked against pyarrow at
+    batch sizes that neither divide the row group nor land on a byte boundary
+    of the packed validity bitmap."""
+    var sizes: List[Int] = [101, 4999]
+    for bs in sizes:
+        var n = check_fixture[DefaultCodecs](String("big"), [String("l")], bs)
+        assert_true(n > 200, String("batch size ", bs))
 
 
 def test_select_fields_prunes_to_one_sub_field() raises:

@@ -176,7 +176,18 @@ def _build_leaf(
     if require_def == 0 or (cd.all_present and max_def >= require_def):
         # Every slot in the range becomes a row, so the array can be built one
         # buffer at a time rather than one row at a time.
-        if _fill_leaf(out, leaf, cd, sl.s0, sl.v0, sl.s1 - sl.s0, max_def):
+        if _fill_leaf[False](
+            out, leaf, cd, sl.s0, sl.v0, sl.s1 - sl.s0, max_def, 0
+        ):
+            return arena.add(out^)
+    elif max_def >= require_def:
+        # A list or map element: only the slots at or above the element's
+        # definition level become rows — the rest are containers that are null
+        # or empty — but the slots that are left still go buffer at a time,
+        # with the filter folded into the same two passes.
+        if _fill_leaf[True](
+            out, leaf, cd, sl.s0, sl.v0, sl.s1 - sl.s0, max_def, require_def
+        ):
             return arena.add(out^)
     var vi = sl.v0
     for i in range(sl.s0, sl.s1):
@@ -195,7 +206,9 @@ def _build_leaf(
     return arena.add(out^)
 
 
-def _fill_leaf(
+def _fill_leaf[
+    filtered: Bool
+](
     mut out: ArrayData,
     leaf: LeafColumn,
     cd: ColumnData,
@@ -203,13 +216,21 @@ def _fill_leaf(
     v0: Int,
     n: Int,
     max_def: Int,
+    require_def: Int,
 ) raises -> Bool:
-    """Build a leaf array for `n` consecutive slots in one pass per buffer.
+    """Build a leaf array from `n` consecutive slots in one pass per buffer.
 
-    The caller has established that every one of those slots becomes a row, so
-    the only question left per slot is whether it holds a value. That makes
-    the validity bitmap one pass over the definition levels and the values one
-    pass over the value buffer, instead of a call to `append_value` per row.
+    With `filtered = False` the caller has established that every one of those
+    slots becomes a row, so the only question left per slot is whether it holds
+    a value. With `filtered = True` — a list's or a map's element — a slot
+    becomes a row only when its definition level reaches `require_def`, and the
+    slots below it are containers that are null or empty. Either way the
+    validity bitmap is one pass over the definition levels and the values are
+    one pass over the value buffer, instead of a call to `append_value` per row.
+
+    The filter never skips a value: `require_def <= max_def` is the caller's
+    precondition (and re-checked here), so every slot at `max_def` — every slot
+    that consumed a value — is also a slot that becomes a row.
 
     Returns `False` — leaving `out` untouched — when the Arrow bytes are not
     the Parquet bytes: a decimal, an `INT96` timestamp, or a narrow integer
@@ -217,6 +238,9 @@ def _fill_leaf(
     """
     if n < 0:
         return False
+    comptime if filtered:
+        if require_def > max_def:
+            return False
     var id = out.type.id
     if id == AT_DECIMAL128:
         return False
@@ -235,8 +259,11 @@ def _fill_leaf(
         return False
 
     # ── validity ──────────────────────────────────────────────────────────
+    # `rows` is the output length: `n` unless the filter drops slots, in which
+    # case the bitmap is written at the *row* index `m`, not the slot index.
     var dense = cd.all_present
     var present = n
+    var rows = n
     if not dense:
         if s0 + n > len(cd.defs):
             return False
@@ -245,17 +272,26 @@ def _fill_leaf(
         var vb = out.validity.unsafe_ptr()
         var byte = UInt8(0)
         present = 0
+        var m = 0
         for k in range(n):
-            if Int(defs.unsafe_load(s0 + k)) == max_def:
-                byte |= UInt8(1) << UInt8(k & 7)
+            var d = Int(defs.unsafe_load(s0 + k))
+            comptime if filtered:
+                if d < require_def:
+                    continue
+            if d == max_def:
+                byte |= UInt8(1) << UInt8(m & 7)
                 present += 1
-            if (k & 7) == 7:
-                vb.unsafe_store(k >> 3, byte)
+            if (m & 7) == 7:
+                vb.unsafe_store(m >> 3, byte)
                 byte = 0
-        if (n & 7) != 0:
-            vb.unsafe_store(n >> 3, byte)
-    out.length = n
-    out.null_count = n - present
+            m += 1
+        if (m & 7) != 0:
+            vb.unsafe_store(m >> 3, byte)
+        rows = m
+        comptime if filtered:
+            out.validity.resize((rows + 7) // 8, 0)
+    out.length = rows
+    out.null_count = rows - present
     if out.null_count == 0:
         out.validity.clear()
         dense = True
@@ -268,32 +304,38 @@ def _fill_leaf(
         var base = Int(voff.unsafe_load(v0))
         var last = Int(voff.unsafe_load(v0 + present))
         out.values.extend(Span(vals.bytes)[base:last])
-        out.offsets.resize(n + 1, 0)
+        out.offsets.resize(rows + 1, 0)
         var ooff = out.offsets.unsafe_ptr()
         if dense:
-            for k in range(n + 1):
+            for k in range(rows + 1):
                 ooff.unsafe_store(k, voff.unsafe_load(v0 + k) - Int32(base))
         else:
             var defs = cd.defs.unsafe_ptr()
             var vi = v0
             var run = 0
+            var m = 0
             for k in range(n):
-                ooff.unsafe_store(k, Int32(run))
-                if Int(defs.unsafe_load(s0 + k)) == max_def:
+                var d = Int(defs.unsafe_load(s0 + k))
+                comptime if filtered:
+                    if d < require_def:
+                        continue
+                ooff.unsafe_store(m, Int32(run))
+                if d == max_def:
                     run += Int(voff.unsafe_load(vi + 1)) - Int(
                         voff.unsafe_load(vi)
                     )
                     vi += 1
-            ooff.unsafe_store(n, Int32(run))
+                m += 1
+            ooff.unsafe_store(rows, Int32(run))
         return True
 
     if id == AT_BOOL:
-        out.values.resize((n + 7) // 8, 0)
+        out.values.resize((rows + 7) // 8, 0)
         var vp = out.values.unsafe_ptr()
         var byte = UInt8(0)
         var vi = v0
         if dense:
-            for k in range(n):
+            for k in range(rows):
                 if vals.bool_at(v0 + k):
                     byte |= UInt8(1) << UInt8(k & 7)
                 if (k & 7) == 7:
@@ -301,49 +343,81 @@ def _fill_leaf(
                     byte = 0
         else:
             var defs = cd.defs.unsafe_ptr()
+            var m = 0
             for k in range(n):
-                if Int(defs.unsafe_load(s0 + k)) == max_def:
+                var d = Int(defs.unsafe_load(s0 + k))
+                comptime if filtered:
+                    if d < require_def:
+                        continue
+                if d == max_def:
                     if vals.bool_at(vi):
-                        byte |= UInt8(1) << UInt8(k & 7)
+                        byte |= UInt8(1) << UInt8(m & 7)
                     vi += 1
-                if (k & 7) == 7:
-                    vp.unsafe_store(k >> 3, byte)
+                if (m & 7) == 7:
+                    vp.unsafe_store(m >> 3, byte)
                     byte = 0
-        if (n & 7) != 0:
-            vp.unsafe_store(n >> 3, byte)
+                m += 1
+        if (rows & 7) != 0:
+            vp.unsafe_store(rows >> 3, byte)
         return True
 
     if (v0 + present) * w > len(vals.bytes):
         raise Error(_short_values(leaf))
     if dense:
-        out.values.extend(Span(vals.bytes)[v0 * w : (v0 + n) * w])
+        out.values.extend(Span(vals.bytes)[v0 * w : (v0 + rows) * w])
         return True
-    out.values.resize(n * w, 0)
+    out.values.resize(rows * w, 0)
     var dst = out.values.unsafe_ptr()
     var src = vals.bytes.unsafe_ptr()
     var defs = cd.defs.unsafe_ptr()
     var vi = v0
+    var m = 0
     if w == 8:
         var d8 = dst.unsafe_bitcast[UInt64]()
         var s8 = src.unsafe_bitcast[UInt64]()
         for k in range(n):
-            if Int(defs.unsafe_load(s0 + k)) == max_def:
-                d8.unsafe_store(k, s8.unsafe_load[alignment=1](vi))
+            var d = Int(defs.unsafe_load(s0 + k))
+            comptime if filtered:
+                if d < require_def:
+                    continue
+            if d == max_def:
+                d8.unsafe_store(m, s8.unsafe_load[alignment=1](vi))
                 vi += 1
+            m += 1
     elif w == 4:
         var d4 = dst.unsafe_bitcast[UInt32]()
         var s4 = src.unsafe_bitcast[UInt32]()
         for k in range(n):
-            if Int(defs.unsafe_load(s0 + k)) == max_def:
-                d4.unsafe_store(k, s4.unsafe_load[alignment=1](vi))
+            var d = Int(defs.unsafe_load(s0 + k))
+            comptime if filtered:
+                if d < require_def:
+                    continue
+            if d == max_def:
+                d4.unsafe_store(m, s4.unsafe_load[alignment=1](vi))
                 vi += 1
+            m += 1
     else:
         for k in range(n):
-            if Int(defs.unsafe_load(s0 + k)) == max_def:
+            var d = Int(defs.unsafe_load(s0 + k))
+            comptime if filtered:
+                if d < require_def:
+                    continue
+            if d == max_def:
                 for b in range(w):
-                    dst.unsafe_store(k * w + b, src.unsafe_load(vi * w + b))
+                    dst.unsafe_store(m * w + b, src.unsafe_load(vi * w + b))
                 vi += 1
+            m += 1
     return True
+
+
+def _short_levels(s: ParquetSchema, fi: Int, which: StringSlice) -> String:
+    return String(
+        "parquet.assemble: list '",
+        s.fields[fi].name,
+        "' asks for ",
+        which,
+        " levels past the end of the decoded chunk",
+    )
 
 
 def _short_values(leaf: LeafColumn) -> String:
@@ -424,20 +498,52 @@ def _build_list(
     var elem_rep = s.fields[fi].elem_rep_level
     var def_level = s.fields[fi].def_level
     var out = _new_array(s, fi)
-    out.offsets.append(0)
-    var elems = 0
     var leaf_max_def = s.leaves[lf].max_def
+    var n = sl.s1 - sl.s0
+    if n < 0:
+        n = 0
+
+    # A slot starts at most one row, so `n` bounds both buffers: size them once
+    # and trim at the end, instead of appending an offset and growing the
+    # validity bitmap a byte at a time per row.
+    out.offsets.resize(n + 1, 0)
+    out.validity.resize((n + 7) // 8, 0)
+    var ooff = out.offsets.unsafe_ptr()
+    var vb = out.validity.unsafe_ptr()
+
+    # The level lookups are hoisted out of the loop: `all_present` and whether
+    # the chunk has repetition levels at all are properties of the chunk, not
+    # of the slot.
+    var all_present = cd.all_present
+    if not all_present and sl.s1 > len(cd.defs):
+        raise Error(_short_levels(s, fi, "definition"))
+    var has_reps = len(cd.reps) > 0
+    if has_reps and sl.s1 > len(cd.reps):
+        raise Error(_short_levels(s, fi, "repetition"))
+    var defs = cd.defs.unsafe_ptr()
+    var reps = cd.reps.unsafe_ptr()
+
+    var byte = UInt8(0)
+    var rows = 0
+    var present = 0
+    var elems = 0
     for i in range(sl.s0, sl.s1):
-        var d = cd.def_at(i, leaf_max_def)
-        var r = cd.rep_at(i)
+        var d = leaf_max_def if all_present else Int(defs.unsafe_load(i))
+        var r = Int(reps.unsafe_load(i)) if has_reps else 0
         if d < require_def:
             continue
         if r <= rep_level:
-            if out.length > 0:
-                out.offsets.append(Int32(elems))
-            _mark(out, out.length, d >= def_level)
-            out.length += 1
-        elif out.length == 0:
+            # `elems` is the element count so far, which is exactly where this
+            # row starts — and where the previous one ended.
+            ooff.unsafe_store(rows, Int32(elems))
+            if d >= def_level:
+                byte |= UInt8(1) << UInt8(rows & 7)
+                present += 1
+            if (rows & 7) == 7:
+                vb.unsafe_store(rows >> 3, byte)
+                byte = 0
+            rows += 1
+        elif rows == 0:
             raise Error(
                 String(
                     "parquet.assemble: list '",
@@ -449,8 +555,13 @@ def _build_list(
             )
         if d >= elem_def and r <= elem_rep:
             elems += 1
-    if out.length > 0:
-        out.offsets.append(Int32(elems))
+    if (rows & 7) != 0:
+        vb.unsafe_store(rows >> 3, byte)
+    ooff.unsafe_store(rows, Int32(elems))
+    out.offsets.resize(rows + 1, 0)
+    out.validity.resize((rows + 7) // 8, 0)
+    out.length = rows
+    out.null_count = rows - present
     if out.null_count == 0:
         out.validity.clear()
     if arena.nodes[child].length != elems:
