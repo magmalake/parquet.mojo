@@ -18,6 +18,12 @@ writes a `String` rather than a decoded buffer. TSan slows a program down by
 five to fifteen times, so the round count is small by default and
 `STRESS_ROUNDS` raises it.
 
+Four of the seven fixtures have more than one row group — `prune` has ten —
+so `read_table` runs both axes here: several row groups in flight at once,
+each fanned out across its columns, all drawing from one pool. The error leg
+runs twice, with the corruption in the first row group and in the last, so a
+window that raced its error slots has two shapes to get wrong.
+
 Environment:
 
 - `STRESS_ROUNDS` — passes over the fixture list (default 8).
@@ -53,11 +59,12 @@ def _rounds() raises -> Int:
     return Int(v)
 
 
-def _corrupt_big() raises -> List[UInt8]:
-    """`big.parquet` with the first page of column 0 scribbled over."""
+def _corrupt_big(rg: Int) raises -> List[UInt8]:
+    """`big.parquet` with the first page of row group `rg`, column 0,
+    scribbled over."""
     var data = read_parquet_file(String(FIXTURES, "big.parquet"))
     var r = ParquetReader[DefaultCodecs].from_span(Span(data))
-    ref cm = r.meta.row_groups[0].columns[0].meta_data.value()
+    ref cm = r.meta.row_groups[rg].columns[0].meta_data.value()
     var at = Int(cm.data_page_offset)
     if cm.dictionary_page_offset:
         var d = Int(cm.dictionary_page_offset.value())
@@ -91,17 +98,30 @@ def main() raises:
                 reads += 1
 
     # The error path: several tasks racing to write into their own error slots
-    # while the rest write decoded buffers.
-    var bad = _corrupt_big()
-    var expected = read_error[DefaultCodecs](Span(bad), 1)
-    assert_true(expected != "", "the corrupt fixture read cleanly")
-    for _ in range(rounds):
-        for w in range(len(workers)):
-            assert_equal(
-                read_error[DefaultCodecs](Span(bad), workers[w]),
-                expected,
-                String("corrupt read at ", workers[w], " workers"),
-            )
-            reads += 1
+    # while the rest write decoded buffers. Once with the damage in the first
+    # row group, once in the last — a window decodes both at the same time, so
+    # the second is the one where an error in a *later* row group has to beat
+    # the successful decode of an earlier one to the caller.
+    for rg in [0, 3]:
+        var bad = _corrupt_big(rg)
+        var expected = read_error[DefaultCodecs](Span(bad), 1)
+        assert_true(
+            expected != "",
+            String("the fixture corrupt in row group ", rg, " read cleanly"),
+        )
+        for _ in range(rounds):
+            for w in range(len(workers)):
+                assert_equal(
+                    read_error[DefaultCodecs](Span(bad), workers[w]),
+                    expected,
+                    String(
+                        "row group ",
+                        rg,
+                        " corrupt, at ",
+                        workers[w],
+                        " workers",
+                    ),
+                )
+                reads += 1
 
     print("stress: ", reads, " threaded read(s), all identical")

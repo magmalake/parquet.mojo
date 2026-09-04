@@ -12,7 +12,7 @@ from fixtures_list import (
     iceberg_fixtures,
     iceberg_zstd_fixtures,
 )
-from fingerprint import read_error, read_fingerprint
+from fingerprint import read_error, read_fingerprint, table_fingerprint
 from oracle import canon_value, decimal_string, double_bits, hex_of, load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import (
@@ -60,6 +60,7 @@ from parquet import (
     Predicate,
     ScalarValue,
     ParquetWriter,
+    Table,
     WriterOptions,
     build_schema,
     export_c,
@@ -2031,8 +2032,15 @@ def test_num_workers_survives_projection() raises:
 
 def _corrupt_chunk(var data: List[UInt8], leaf: Int) raises -> List[UInt8]:
     """Scribble over the first page of one column chunk of row group 0."""
+    return _corrupt_chunk_in(data^, 0, leaf)
+
+
+def _corrupt_chunk_in(
+    var data: List[UInt8], rg: Int, leaf: Int
+) raises -> List[UInt8]:
+    """Scribble over the first page of one column chunk of row group `rg`."""
     var r = ParquetReader[DefaultCodecs].from_span(Span(data))
-    ref cm = r.meta.row_groups[0].columns[leaf].meta_data.value()
+    ref cm = r.meta.row_groups[rg].columns[leaf].meta_data.value()
     var at = Int(cm.data_page_offset)
     if cm.dictionary_page_offset:
         var d = Int(cm.dictionary_page_offset.value())
@@ -2076,6 +2084,258 @@ def test_corrupt_file_error_does_not_depend_on_the_winner() raises:
             read_error[DefaultCodecs](Span(bad), workers[w]),
             want,
             String("two corrupt columns at ", workers[w], " workers"),
+        )
+
+
+# ── the second axis: row groups ─────────────────────────────────────────────
+#
+# `read_table` also fans out across row groups, so a row group can now be
+# decoded before one that precedes it in the file. Everything below is about
+# the one thing that can make wrong: **order**. A test that counts rows, sums
+# a column or compares a set of values passes with two row groups swapped, so
+# these name the boundaries and say what has to be on each side of them.
+
+
+def _read_workers(
+    path: StringSlice, workers: Int, batch_size: Int
+) raises -> Table:
+    var r = ParquetReader[DefaultCodecs].open(path)
+    r.num_workers = workers
+    r.batch_size = batch_size
+    return r.read_table()
+
+
+def test_row_groups_assemble_in_file_order() raises:
+    """`big.parquet` is four row groups of 25 000 rows, and its `i` column is
+    the row's own index — so a value names the position it must occupy.
+
+    Checked three ways at every worker count: every row of `i` holds its own
+    index and every row of `f` holds half of it, the rows either side of the
+    three row-group boundaries hold exactly what the file has there, and the
+    two columns' nulls fall where the fixture puts them — every 101st row of
+    `i` and every 97th of `f`, two periods that share no factor with the 25 000
+    rows of a row group. So a row group landing in the wrong place moves the
+    values *and* breaks the null pattern, while a row *count* check sees
+    neither. `i` and `f` also decode in different tasks, which is what makes
+    this a check on assembly and not only on one column's decode.
+    """
+    var path = String(FIXTURES, "big.parquet")
+    var boundaries: List[Int] = [24999, 25000, 49999, 50000, 74999, 75000]
+    for w in [1, 2, 3, 4, 8, 10]:
+        var t = _read_workers(path, w, 65536)
+        assert_equal(t.num_rows, 100000, String("row count at ", w))
+        var iv = t.column_i64(0)
+        var fv = t.column_f64(1)
+        assert_equal(len(iv[0]), 100000)
+        assert_false(iv[1][0], String("row 0 of `i` is null, at ", w))
+        assert_false(fv[1][0], String("row 0 of `f` is null, at ", w))
+        for k in range(len(boundaries)):
+            var n = boundaries[k]
+            assert_equal(
+                iv[0][n], Int64(n), String("i[", n, "] at ", w, " workers")
+            )
+            assert_equal(
+                fv[0][n],
+                Float64(n) * 0.5,
+                String("f[", n, "] at ", w, " workers"),
+            )
+        var bad = -1
+        for n in range(100000):
+            var i_here = (n % 101) != 0
+            var f_here = (n % 97) != 0
+            if iv[1][n] != i_here or fv[1][n] != f_here:
+                bad = n
+                break
+            if i_here and iv[0][n] != Int64(n):
+                bad = n
+                break
+            if f_here and fv[0][n] != Float64(n) * 0.5:
+                bad = n
+                break
+        assert_equal(bad, -1, String("first out-of-order row at ", w))
+
+
+def test_row_groups_hold_their_order_across_window_boundaries() raises:
+    """`prune.parquet` is ten row groups of 100 rows, so a window of two,
+    three or four takes five, four and three passes to cover it, and the seam
+    between one window and the next is crossed four, three and two times.
+
+    A window that restarted at the wrong slot, decoded a row group twice or
+    dropped one would show up here as a `k` that is not its own row index.
+    """
+    var path = String(FIXTURES, "prune.parquet")
+    for w in [1, 2, 3, 4, 5, 8, 10, 16]:
+        var t = _read_workers(path, w, 65536)
+        assert_equal(t.num_rows, 1000, String("row count at ", w))
+        var k = t.column_i64(0)
+        var bad = -1
+        for n in range(1000):
+            if k[0][n] != Int64(n):
+                bad = n
+                break
+        assert_equal(bad, -1, String("first out-of-order row at ", w))
+
+
+def test_row_group_selection_keeps_its_own_order() raises:
+    """Row groups come out in the order they were *selected*, not the order
+    they sit in the file or the order the workers happened to finish them in.
+
+    Row groups 3 and 1 of `big.parquet`, in that order: rows 75 000..99 999
+    followed by rows 25 000..49 999.
+    """
+    for w in [1, 2, 4, 10]:
+        var r = ParquetReader[DefaultCodecs].open(
+            String(FIXTURES, "big.parquet")
+        )
+        r.num_workers = w
+        var pick: List[Int] = [3, 1]
+        r.select_row_groups(pick^)
+        var t = r.read_table()
+        assert_equal(t.num_rows, 50000, String("row count at ", w))
+        var iv = t.column_i64(0)
+        assert_equal(iv[0][0], Int64(75000), String("first row at ", w))
+        assert_equal(iv[0][24999], Int64(99999), String("last of rg3 at ", w))
+        assert_equal(iv[0][25000], Int64(25000), String("first of rg1 at ", w))
+        assert_equal(iv[0][49999], Int64(49999), String("last row at ", w))
+
+
+def test_a_single_row_group_is_untouched_by_the_second_axis() raises:
+    """A file — or a selection — with one row group has no second axis, and
+    must come out exactly as it did before. Every Iceberg fixture and most of
+    the corpus is one row group, so this is the common case, not a corner.
+    """
+    var checked = 0
+    for f in core_fixtures():
+        var path = String(FIXTURES, f, ".parquet")
+        var r = ParquetReader[DefaultCodecs].open(path)
+        if r.num_row_groups() != 1:
+            continue
+        var want = read_fingerprint[DefaultCodecs](path, 1, 65536)
+        for w in [2, 4, 10]:
+            assert_equal(
+                read_fingerprint[DefaultCodecs](path, w, 65536),
+                want,
+                String(f, " (one row group) at ", w, " workers"),
+            )
+            checked += 1
+    assert_true(checked >= 45, String("only ", checked, " comparisons"))
+    # And one row group *selected* out of four, which takes the same path.
+    for w in [1, 2, 4, 10]:
+        var r = ParquetReader[DefaultCodecs].open(
+            String(FIXTURES, "big.parquet")
+        )
+        r.num_workers = w
+        var pick: List[Int] = [2]
+        r.select_row_groups(pick^)
+        var t = r.read_table()
+        assert_equal(t.num_rows, 25000)
+        var iv = t.column_i64(0)
+        assert_equal(iv[0][0], Int64(50000), String("first row at ", w))
+        assert_equal(iv[0][24999], Int64(74999), String("last row at ", w))
+
+
+def test_streaming_reads_one_row_group_at_a_time() raises:
+    """The memory contract `read_table` is allowed to trade and `read_batch`
+    is not.
+
+    `read_table` may hold several row groups' decode state at once — it was
+    going to hold every row group's *output* anyway. The batch iterator makes
+    the opposite promise: one row group in flight, whatever `num_workers` is.
+    Asserted where it lives, on `_prefetched`, because there is no other way
+    to observe it — and asserted at a worker count high enough that a
+    look-ahead, if one were ever added, would trip it.
+    """
+    var r = ParquetReader[DefaultCodecs].open(String(FIXTURES, "big.parquet"))
+    r.num_workers = 8
+    r.batch_size = 4096
+    var streamed = Table()
+    while r.has_next():
+        var b = r.read_batch()
+        assert_equal(
+            len(r._prefetched),
+            0,
+            "the streaming path decoded a row group ahead",
+        )
+        streamed.num_rows += b.num_rows
+        streamed.batches.append(b^)
+    assert_equal(streamed.num_rows, 100000)
+    var iv = streamed.column_i64(0)
+    assert_equal(iv[0][25000], Int64(25000))
+    assert_equal(iv[0][99999], Int64(99999))
+    # And the same bytes as the threaded `read_table` that skipped ahead.
+    assert_equal(
+        table_fingerprint(streamed),
+        read_fingerprint[DefaultCodecs](
+            String(FIXTURES, "big.parquet"), 8, 4096
+        ),
+    )
+
+
+def test_page_pruning_survives_the_second_axis() raises:
+    """Pruning leaves gaps inside a row group and can empty one outright, and
+    a prefetched window has to agree with the iterator about which row groups
+    are visited at all."""
+    var want_rows = 0
+    var want: UInt32 = 0
+    for w in [1, 2, 4, 10]:
+        var r = ParquetReader[DefaultCodecs].open(
+            String(FIXTURES, "pageindex.parquet")
+        )
+        r.num_workers = w
+        r.batch_size = 64
+        var preds: List[Predicate] = [
+            Predicate(String("k"), OP_GE, ScalarValue.of_int(200)),
+        ]
+        var left = r.prune_pages(preds)
+        var t = r.read_table()
+        var got = table_fingerprint(t)
+        if w == 1:
+            want_rows = t.num_rows
+            want = got
+            assert_true(left > 0, "pruning left nothing to read")
+            assert_true(
+                t.num_rows < 500, String("pruning kept every row: ", t.num_rows)
+            )
+        else:
+            assert_equal(t.num_rows, want_rows, String("rows at ", w))
+            assert_equal(got, want, String("pruned read at ", w, " workers"))
+
+
+def test_a_corrupt_row_group_raises_wherever_it_sits() raises:
+    """The first failure in *visit* order is the one the caller sees, at every
+    worker count — including when it is in the last row group, which a window
+    decodes at the same time as the first.
+
+    No hang, no short table: `read_table` raises, and with the same words.
+    """
+    for rg in [0, 2, 3]:
+        var bad = _corrupt_chunk_in(fixture_bytes("big"), rg, 0)
+        var want = read_error[DefaultCodecs](Span(bad), 1)
+        assert_true(
+            want != "", String("row group ", rg, " read cleanly at 1 worker")
+        )
+        for w in [2, 4, 10]:
+            assert_equal(
+                read_error[DefaultCodecs](Span(bad), w),
+                want,
+                String("row group ", rg, " corrupt, at ", w, " workers"),
+            )
+
+
+def test_the_earliest_corrupt_row_group_wins() raises:
+    """Two bad row groups decoded side by side: which task fails first is a
+    race, but the error reported is always the earlier row group's, because
+    the slots are scanned in group-then-leaf order after the join."""
+    var bad = _corrupt_chunk_in(
+        _corrupt_chunk_in(fixture_bytes("big"), 1, 0), 3, 0
+    )
+    var want = read_error[DefaultCodecs](Span(bad), 1)
+    assert_true(want != "", "the doubly corrupt fixture read cleanly")
+    for w in [2, 4, 10]:
+        assert_equal(
+            read_error[DefaultCodecs](Span(bad), w),
+            want,
+            String("two corrupt row groups at ", w, " workers"),
         )
 
 

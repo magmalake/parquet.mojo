@@ -104,7 +104,7 @@ tins — see [Codecs](#codecs).
 | `.page_row_ranges(rg, predicates)` | the row ranges those pages cover |
 | `.batch_size` | rows per batch (default 65536) |
 | `.verify_crc` | check page CRC32s when present (default true) |
-| `.num_workers` | threads decoding a row group's column chunks (default 1; `0` means one per core) — see [More than one core](#more-than-one-core) |
+| `.num_workers` | threads decoding column chunks, and — in `read_table` — row groups (default 1; `0` means one per core) — see [More than one core](#more-than-one-core) |
 | `.read_batch()` / `.has_next()` / `.rewind()` | iterate batches |
 | `.read_table()` | every selected row group, as a `Table` |
 
@@ -522,52 +522,68 @@ r.num_workers = 4        # 1 = sequential (the default); 0 = one per core
 var t = r.read_table()
 ```
 
-**The unit is a column chunk.** Reading a row group is `read_column_chunk` per
-projected leaf, then one pass over that chunk's levels to build the per-row
-index — and by the table above that is about 85% of a read. Chunks are
-independent through decode, so the tasks share nothing but the immutable file
-bytes: each writes only its own leaf's four output slots, and a task that
-fails writes a string into its own error slot, which the caller re-raises in
-leaf order after the join. The same corrupt file therefore gives the same
-error at any worker count, and `test_num_workers_is_bit_identical` asserts
-byte-for-byte equal Arrow buffers, null counts and offsets across the whole
-fixture corpus at 1, 2, 4 and 10 workers.
+**A task is a *(row group, column chunk)* pair.** Reading a row group is
+`read_column_chunk` per projected leaf, then one pass over that chunk's levels
+to build the per-row index — and by the table above that is about 85% of a
+read. Chunks are independent through decode, so the tasks share nothing but
+the immutable file bytes: each writes only its own four output slots, and a
+task that fails writes a string into its own error slot, which the caller
+re-raises in group-then-leaf order after the join. The same corrupt file
+therefore gives the same error at any worker count, and
+`test_num_workers_is_bit_identical` asserts byte-for-byte equal Arrow buffers,
+null counts and offsets across the whole fixture corpus.
 
-`num_workers = 1` is the default and is a separate branch: no context is
+**Two axes, one budget.** Columns alone are bounded by the *slowest chunk*:
+the wide file's fourth column is a dictionary string column that is most of
+the decode on its own, so once it has a thread there is nothing left to
+overlap and three columns idle. Row groups are the axis with width exactly
+there, and `read_table` uses it — it flattens every *(row group, leaf)* pair
+of a window of row groups into **one** work list for **one** pool, so
+`num_workers = 4` is four threads and not four row groups times however many
+columns. Nesting a pool per row group would oversubscribe; flattening cannot.
+It also keeps a one-row-group file — most of this corpus, and every Iceberg
+data file here — as parallel as it was: splitting the budget by row group
+instead measures 1.7× *slower* on that case, because there is only one row
+group to split.
+
+**The streaming path is unchanged.** `read_batch` holds exactly one row
+group's decode state at every worker count, because that is the contract an
+iterator makes. `read_table` was always going to materialise every row group,
+so it is allowed the second axis — bounded at `num_workers` row groups of
+intermediate state, never growing with the size of the file.
+`num_workers = 1`, the default, is a separate branch throughout: no context is
 built, no thread is started, and `_load` calls the same `_decode_leaf` the
 tasks do, straight through.
 
-Measured on the M4, p50 of three timed repetitions (p90 in brackets), CRC
-verification off, against pyarrow 25.0.1 given the same file — once pinned to
-one thread and once with `use_threads=True` and its default CPU count:
+Measured on the M4 (4 performance cores, 6 efficiency), p50 of three timed
+repetitions (p90 in brackets), CRC verification off, against pyarrow 25.0.1
+given the same file — once pinned to one thread and once with
+`use_threads=True` and its default CPU count:
 
 | workers | 1M × 4 cols, 18 MiB | 100k × 5 cols incl. a list, snappy |
 |---|---|---|
-| 1 | 4.74 ms (4.82) | 3.26 ms (3.28) |
-| 2 | 3.60 ms (3.69) | 2.42 ms (2.46) |
-| 4 | **3.40 ms** (3.46) | 1.97 ms (2.01) |
-| 8 | 3.43 ms (3.47) | **1.84 ms** (2.51) |
-| 10 | 3.42 ms (3.48) | 1.84 ms (2.21) |
-| pyarrow, 1 thread | 8.17 ms (8.80) | 2.43 ms (2.48) |
-| pyarrow, 10 threads | 2.75 ms (2.89) | 0.72 ms (0.80) |
+| 1 | 4.91 ms (4.97) | 3.27 ms (3.29) |
+| 2 | 3.57 ms (3.64) | 2.42 ms (2.45) |
+| 4 | 2.49 ms (2.55) | 1.78 ms (1.81) |
+| 8 | **2.38 ms** (2.99) | **1.66 ms** (2.58) |
+| 10 | 2.55 ms (3.08) | 2.20 ms (2.80) |
+| pyarrow, 1 thread | 8.19 ms (8.65) | 2.47 ms (2.58) |
+| pyarrow, 10 threads | 2.73 ms (2.83) | 0.70 ms (0.83) |
 
-**Scaling bends at 2 on the wide file and at 4 on the mixed one, and neither
-is a scheduling problem.** Per-chunk parallelism is bounded by the *slowest
-chunk*, not by the core count: the wide file's fourth column is a dictionary
-string column that is most of the decode on its own, so once it has a thread
-of its own there is nothing left to overlap — 1.39× and then flat, three
-columns idle. The mixed file's work is spread more evenly and gets to 1.77×,
-but past four workers only the p50 improves while p90 gets worse, which is
-what an M4 with four performance cores and six efficiency cores looks like.
+**Where it bends now.** 2.06× on the wide file and 1.97× on the mixed one, at
+eight workers, and past that both get worse: ten threads on four performance
+cores is not ten cores' worth of anything. What sets the ceiling is no longer
+the widest column — it is the part that is still sequential. `pixi run
+profile` puts Arrow assembly at 16% of the wide read and 32% of the mixed one,
+and assembly happens on the calling thread after the fan-out; add the footer
+parse and Amdahl's law lands within a few percent of both numbers. That is
+also why the mixed file, with twice the sequential fraction, scales worse.
 
-**Against threaded pyarrow, this loses.** On the wide file pyarrow at ten
-threads is 1.24× faster than the best number here, having started 1.72×
-*slower* on one thread; on the mixed file it is 2.6× faster, from a 1.34× lead
-on one thread. pyarrow parallelises across row groups as well as columns and
-so is not bounded by one fat column. Doing the same here — decoding several
-row groups at once — is the obvious next axis and is not implemented: it
-changes the streaming contract, since `read_batch` currently holds exactly one
-row group's chunks in memory.
+**Against threaded pyarrow: one win, one loss.** On the wide file this is now
+**1.15× faster** than pyarrow with all ten of its threads (2.38 ms against
+2.73 ms), having been 1.24× behind before row groups — though pyarrow keeps a
+tighter p90. On the mixed file pyarrow is still **2.4× faster** (0.70 ms
+against 1.66 ms), and the sequential assembly pass above is where that goes.
 
 ## Gaps
 
