@@ -6,9 +6,14 @@
 # and republishes the dashboard. Pull requests run the benchmarks and publish
 # nothing.
 #
-# The wide benchmarks are skipped: they need build/bench-wide.parquet, which
-# `tools/bench_pyarrow.py --make` generates and which is deliberately not
-# committed. Run them locally for the 1M-row numbers.
+# Every wide benchmark is skipped -- the scaling ones too: they need
+# build/bench-wide.parquet, which `tools/bench_pyarrow.py --make` generates
+# and which is deliberately not committed. Run them locally for the 1M-row
+# numbers.
+#
+# Adding a benchmark that reads WIDE means adding it here as well, or this
+# job fails on a missing fixture rather than on anything to do with the
+# benchmark.
 name: Benchmarks
 
 on:
@@ -23,4 +28,7 @@ jobs:
     permissions:
       contents: write
     with:
-      args: "--skip bench_read_wide bench_write_wide"
+      args: >-
+        --skip bench_read_wide bench_write_wide
+        bench_read_wide_w1 bench_read_wide_w2 bench_read_wide_w4
+        bench_read_wide_w8 bench_read_wide_w10
