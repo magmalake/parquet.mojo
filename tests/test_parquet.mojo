@@ -51,6 +51,9 @@ from parquet import (
     TU_MICRO,
     TU_MILLI,
     TU_NANO,
+    ArrayArena,
+    ArrayData,
+    ArrowType,
     DefaultCodecs,
     ParquetReader,
     Predicate,
@@ -62,6 +65,7 @@ from parquet import (
     array_str,
 )
 from parquet.rle_encode import encode_hybrid, encode_levels
+from parquet.writer import DICT_MAX_VALUES
 from parquet.bitio import (
     HybridDecoder,
     bit_width,
@@ -81,6 +85,7 @@ from parquet.encoding import (
     gather,
 )
 from parquet.schema import REP_OPTIONAL, REP_REPEATED, REP_REQUIRED
+from std.memory import bitcast
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -1530,6 +1535,129 @@ def test_single_entry_dictionary() raises:
     tiny.row_group_size = 4
     tiny.data_page_size = 32
     assert_true(_round_trip("nested", List[String](), tiny^) > 60)
+
+
+def _write_int64_column(
+    values: Span[Int64, _], var options: WriterOptions
+) raises -> List[UInt8]:
+    """One `INT64` column of exactly these values, written by us."""
+    var a = ArrayData(ArrowType(AT_INT64), String("v"))
+    a.nullable = False
+    a.length = len(values)
+    for v in values:
+        var u = bitcast[DType.uint64](v)
+        for b in range(8):
+            a.values.append(UInt8((u >> UInt64(8 * b)) & 0xFF))
+    var arena = ArrayArena()
+    var roots: List[Int] = [arena.add(a^)]
+    var w = ParquetWriter(options^)
+    w.write_batch(arena, roots)
+    return w^.finish()
+
+
+def _cycled(distinct: Int, count: Int) -> List[Int64]:
+    """`count` values drawn cyclically from `distinct` of them — the shape a
+    prefix sample cannot tell from an all-distinct column, because the first
+    `distinct` values *are* all distinct."""
+    var out = List[Int64](capacity=count)
+    for i in range(count):
+        out.append(Int64((i % distinct) * 7919))
+    return out^
+
+
+def _dictionary_column_count(bytes: Span[UInt8, _]) raises -> Int:
+    """How many of this file's column chunks carry a dictionary page."""
+    var r = ParquetReader[DefaultCodecs].from_span(bytes)
+    var n = 0
+    for g in range(len(r.meta.row_groups)):
+        for c in range(len(r.meta.row_groups[g].columns)):
+            ref cm = r.meta.row_groups[g].columns[c].meta_data.value()
+            if cm.dictionary_page_offset:
+                n += 1
+    return n
+
+
+def _assert_int64_round_trip(
+    bytes: Span[UInt8, _], values: Span[Int64, _], what: String
+) raises:
+    var r = ParquetReader[DefaultCodecs].from_span(bytes)
+    var t = r.read_table()
+    assert_equal(t.num_rows, len(values), String(what, ": row count"))
+    var got = t.column_i64(0)
+    for i in range(len(values)):
+        assert_equal(got[0][i], values[i], String(what, ": value ", i))
+
+
+def test_dictionary_kept_for_a_low_cardinality_column() raises:
+    """The happy path: few distinct values, so the dictionary must survive."""
+    var values = _cycled(1000, 65536)
+    var bytes = _write_int64_column(Span(values), WriterOptions())
+    assert_equal(
+        _dictionary_column_count(Span(bytes)),
+        1,
+        "a 1000-distinct column lost its dictionary",
+    )
+    _assert_int64_round_trip(Span(bytes), Span(values), String("low"))
+
+
+def test_dictionary_abandoned_for_a_high_cardinality_column() raises:
+    """All-distinct values: no dictionary, and the abandon must be early —
+    `DICT_MAX_VALUES` inserts, not half the chunk."""
+    var values = List[Int64](capacity=65536)
+    for i in range(65536):
+        values.append(Int64(i) * 2654435761)
+    var bytes = _write_int64_column(Span(values), WriterOptions())
+    assert_equal(
+        _dictionary_column_count(Span(bytes)),
+        0,
+        "an all-distinct column kept a dictionary",
+    )
+    _assert_int64_round_trip(Span(bytes), Span(values), String("high"))
+
+
+def test_dictionary_cap_boundary() raises:
+    """Either side of the cap, and the small-chunk floor below it.
+
+    `DICT_MAX_VALUES` is the largest index the build tolerates, so a dictionary
+    of `DICT_MAX_VALUES + 1` entries is the last one that fits.
+    """
+    var n = 4 * DICT_MAX_VALUES
+    var fits = _cycled(DICT_MAX_VALUES + 1, n)
+    assert_equal(
+        _dictionary_column_count(
+            Span(_write_int64_column(Span(fits), WriterOptions()))
+        ),
+        1,
+        String(DICT_MAX_VALUES + 1, " distinct values should still fit"),
+    )
+    var over = _cycled(DICT_MAX_VALUES + 2, n)
+    var over_bytes = _write_int64_column(Span(over), WriterOptions())
+    assert_equal(
+        _dictionary_column_count(Span(over_bytes)),
+        0,
+        String(DICT_MAX_VALUES + 2, " distinct values should abandon"),
+    )
+    _assert_int64_round_trip(Span(over_bytes), Span(over), String("boundary"))
+
+    # Below 128 values a chunk cannot reach the cap at all and the floor of 64
+    # decides instead — this is the rule that keeps a tiny chunk from
+    # abandoning on its second value, and it is unchanged.
+    var small_ok = _cycled(65, 100)
+    assert_equal(
+        _dictionary_column_count(
+            Span(_write_int64_column(Span(small_ok), WriterOptions()))
+        ),
+        1,
+        "65 distinct values in 100 should fit under the floor",
+    )
+    var small_over = _cycled(66, 100)
+    assert_equal(
+        _dictionary_column_count(
+            Span(_write_int64_column(Span(small_over), WriterOptions()))
+        ),
+        0,
+        "66 distinct values in 100 should abandon",
+    )
 
 
 def test_written_metadata() raises:

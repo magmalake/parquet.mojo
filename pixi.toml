@@ -50,10 +50,15 @@ bench-pyarrow = { cmd = "bash tools/bench_pyarrow.sh" }
 [feature.codecs.tasks]
 conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-conformance && ./build/parquet-conformance" }
 test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
+# Write the whole fixture corpus out through our writer, so that the encoding
+# each column chunk came out as can be compared between two branches with
+# `python tools/encoding_report.py build/encodings [reference-dir]`. Needs the
+# codecs env because `codecs.parquet` has a column per codec.
+encodings = { cmd = "mkdir -p build/encodings && mojo build tools/encoding_corpus.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/encoding-corpus && ./build/encoding-corpus" }
 # The three files `lint` and `lint-tools` can only text-mode-fallback on
 # (they import zstd/lz4/brotli): resolved fully here, with the codecs env's
 # sibling checkouts on the path.
-lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src src/parquet/ext_full.mojo tests/test_codecs.mojo tools/conformance.mojo" }
+lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src src/parquet/ext_full.mojo tests/test_codecs.mojo tools/conformance.mojo tools/encoding_corpus.mojo" }
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
