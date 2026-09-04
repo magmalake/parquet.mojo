@@ -73,6 +73,7 @@ from parquet.encoding import (
 from parquet.rle_encode import encode_hybrid, encode_levels, write_uleb128
 from parquet.stats import compare_bytes
 from std.memory import bitcast
+from std.sys import size_of
 from thrift import (
     BoundaryOrder,
     ColumnChunk,
@@ -936,18 +937,137 @@ def _var_less(values: PhysBuffer, i: Int, j: Int) -> Bool:
     return na < nb
 
 
+comptime MM_GENERIC = 0
+"""This type needs the generic byte comparator."""
+comptime MM_BOUNDS = 1
+"""Bounds found and written."""
+comptime MM_NONE = 2
+"""Handled, but there is nothing to report: every value was NaN."""
+
+
+@always_inline
+def _scan_bounds[
+    dt: DType
+](values: PhysBuffer, first: Int, stop: Int) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """The smallest and largest of `values[first:stop]`, read as `dt`.
+
+    No index, and no branch: the bound *is* the answer the caller wants, so
+    the loop carries two values and a compare-and-select each rather than a
+    value, an index and a branch that the float paths cannot fold away. NaN
+    fails both comparisons, so a NaN can never displace a bound as long as the
+    seed is not one — which is the caller's job.
+
+    Among values that compare equal the earliest wins, and for floats that is
+    load-bearing: `-0.0` and `+0.0` are equal, so which one a bound reports is
+    decided by which came first. The lane-wise pass cannot honour that on its
+    own, so `_first_zero` puts it back.
+    """
+    comptime W = 32 // size_of[Scalar[dt]]()
+    var p = values.bytes.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    var seed = p.unsafe_load[alignment=1](first)
+    var mn = seed
+    var mx = seed
+    var i = first
+    if stop - first >= W:
+        var vmn = SIMD[dt, W](seed)
+        var vmx = vmn
+        while i + W <= stop:
+            var v = p.unsafe_load[width=W, alignment=1](i)
+            vmn = v.lt(vmn).select(v, vmn)
+            vmx = v.gt(vmx).select(v, vmx)
+            i += W
+        mn = vmn.reduce_min()
+        mx = vmx.reduce_max()
+    while i < stop:
+        var v = p.unsafe_load[alignment=1](i)
+        if v < mn:
+            mn = v
+        if v > mx:
+            mx = v
+        i += 1
+    return (mn, mx)
+
+
+@always_inline
+def _first_zero[
+    dt: DType
+](values: PhysBuffer, first: Int, stop: Int) -> Scalar[dt]:
+    """The first of these floats that equals zero, `-0.0` and `+0.0` alike.
+
+    A bound of zero is reported with the sign of the *first* zero in the
+    chunk, which is what a scalar scan that only replaces a bound on a strict
+    improvement produces. Parquet suggests writers should prefer `-0.0` for a
+    minimum and `+0.0` for a maximum; this writer does not do that, and this
+    is not the change that should start.
+    """
+    var p = values.bytes.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    for i in range(first, stop):
+        var v = p.unsafe_load[alignment=1](i)
+        if v == 0:
+            return v
+    return 0
+
+
+@always_inline
+def _append_le(mut out: List[UInt8], bits: UInt64, width: Int):
+    """One statistic, little-endian — the layout PLAIN uses for these types."""
+    for b in range(width):
+        out.append(UInt8((bits >> UInt64(8 * b)) & 0xFF))
+
+
+@always_inline
+def _float_bounds[
+    dt: DType, bits: DType
+](
+    values: PhysBuffer,
+    start: Int,
+    count: Int,
+    mut mn: List[UInt8],
+    mut mx: List[UInt8],
+) -> Int:
+    """`FLOAT` / `DOUBLE` bounds: NaN is never one, and all-NaN has none."""
+    var p = values.bytes.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    var stop = start + count
+    var first = start
+    while first < stop:
+        var v = p.unsafe_load[alignment=1](first)
+        if v == v:
+            break
+        first += 1
+    if first == stop:
+        return MM_NONE
+    var got = _scan_bounds[dt](values, first, stop)
+    var lo = got[0]
+    var hi = got[1]
+    if lo == 0:
+        lo = _first_zero[dt](values, first, stop)
+    if hi == 0:
+        hi = _first_zero[dt](values, first, stop)
+    comptime width = size_of[Scalar[dt]]()
+    _append_le(mn, UInt64(bitcast[bits](lo)), width)
+    _append_le(mx, UInt64(bitcast[bits](hi)), width)
+    return MM_BOUNDS
+
+
 def _min_max_numeric(
-    leaf: WLeaf, values: PhysBuffer, start: Int, count: Int
-) raises -> Tuple[Int, Int, Bool]:
-    """The indices of the smallest and largest of `count` values, for the
-    physical types that fit in a register. Returns `(lo, hi, handled)`;
-    `handled` is `False` for the types that need the generic comparator.
+    leaf: WLeaf,
+    values: PhysBuffer,
+    start: Int,
+    count: Int,
+    mut mn: List[UInt8],
+    mut mx: List[UInt8],
+) raises -> Int:
+    """The bounds of `count` values, for the physical types that fit in a
+    register, appended to `mn` and `mx`. `MM_GENERIC` for the types that need
+    the generic comparator.
     """
     var phys = leaf.physical
     var id = leaf.arrow.id
     if values.kind == PK_VAR and id != AT_DECIMAL128:
         # BYTE_ARRAY sorts unsigned lexicographically, and no byte array is a
-        # NaN, so the whole scan is one comparison per value.
+        # NaN, so the whole scan is one comparison per value. The bound here
+        # is a run of bytes rather than a register, so this path does keep an
+        # index.
         var lo = start
         var hi = start
         for i in range(start + 1, start + count):
@@ -955,109 +1075,38 @@ def _min_max_numeric(
                 lo = i
             elif _var_less(values, hi, i):
                 hi = i
-        return (lo, hi, True)
-    var raw = values.bytes.unsafe_ptr()
+        mn.extend(values.value_span(lo))
+        mx.extend(values.value_span(hi))
+        return MM_BOUNDS
     if phys == Type.INT64.value and values.width == 8:
-        var p = raw.unsafe_bitcast[Int64]()
-        var lo = start
-        var hi = start
         if id == AT_UINT64:
-            var mn = bitcast[DType.uint64](p.unsafe_load[alignment=1](start))
-            var mx = mn
-            for i in range(start + 1, start + count):
-                var v = bitcast[DType.uint64](p.unsafe_load[alignment=1](i))
-                if v < mn:
-                    mn = v
-                    lo = i
-                elif v > mx:
-                    mx = v
-                    hi = i
+            var got = _scan_bounds[DType.uint64](values, start, start + count)
+            _append_le(mn, got[0], 8)
+            _append_le(mx, got[1], 8)
         else:
-            var mn = p.unsafe_load[alignment=1](start)
-            var mx = mn
-            for i in range(start + 1, start + count):
-                var v = p.unsafe_load[alignment=1](i)
-                if v < mn:
-                    mn = v
-                    lo = i
-                elif v > mx:
-                    mx = v
-                    hi = i
-        return (lo, hi, True)
+            var got = _scan_bounds[DType.int64](values, start, start + count)
+            _append_le(mn, bitcast[DType.uint64](got[0]), 8)
+            _append_le(mx, bitcast[DType.uint64](got[1]), 8)
+        return MM_BOUNDS
     if phys == Type.INT32.value and values.width == 4:
-        var p = raw.unsafe_bitcast[Int32]()
-        var lo = start
-        var hi = start
         if id == AT_UINT8 or id == AT_UINT16 or id == AT_UINT32:
-            var mn = bitcast[DType.uint32](p.unsafe_load[alignment=1](start))
-            var mx = mn
-            for i in range(start + 1, start + count):
-                var v = bitcast[DType.uint32](p.unsafe_load[alignment=1](i))
-                if v < mn:
-                    mn = v
-                    lo = i
-                elif v > mx:
-                    mx = v
-                    hi = i
+            var got = _scan_bounds[DType.uint32](values, start, start + count)
+            _append_le(mn, UInt64(got[0]), 4)
+            _append_le(mx, UInt64(got[1]), 4)
         else:
-            var mn = p.unsafe_load[alignment=1](start)
-            var mx = mn
-            for i in range(start + 1, start + count):
-                var v = p.unsafe_load[alignment=1](i)
-                if v < mn:
-                    mn = v
-                    lo = i
-                elif v > mx:
-                    mx = v
-                    hi = i
-        return (lo, hi, True)
+            var got = _scan_bounds[DType.int32](values, start, start + count)
+            _append_le(mn, UInt64(bitcast[DType.uint32](got[0])), 4)
+            _append_le(mx, UInt64(bitcast[DType.uint32](got[1])), 4)
+        return MM_BOUNDS
     if phys == Type.DOUBLE.value and values.width == 8:
-        var p = raw.unsafe_bitcast[Float64]()
-        var lo = -1
-        var hi = -1
-        var mn = Float64(0)
-        var mx = Float64(0)
-        for i in range(start, start + count):
-            var v = p.unsafe_load[alignment=1](i)
-            if v != v:  # NaN never becomes a bound
-                continue
-            if lo < 0:
-                lo = i
-                hi = i
-                mn = v
-                mx = v
-                continue
-            if v < mn:
-                mn = v
-                lo = i
-            elif v > mx:
-                mx = v
-                hi = i
-        return (lo, hi, True)
+        return _float_bounds[DType.float64, DType.uint64](
+            values, start, count, mn, mx
+        )
     if phys == Type.FLOAT.value and values.width == 4:
-        var p = raw.unsafe_bitcast[Float32]()
-        var lo = -1
-        var hi = -1
-        var mn = Float32(0)
-        var mx = Float32(0)
-        for i in range(start, start + count):
-            var v = p.unsafe_load[alignment=1](i)
-            if v != v:
-                continue
-            if lo < 0:
-                lo = i
-                hi = i
-                mn = v
-                mx = v
-                continue
-            if v < mn:
-                mn = v
-                lo = i
-            elif v > mx:
-                mx = v
-                hi = i
-        return (lo, hi, True)
-    return (-1, -1, False)
+        return _float_bounds[DType.float32, DType.uint32](
+            values, start, count, mn, mx
+        )
+    return MM_GENERIC
 
 
 def min_max(
@@ -1080,26 +1129,24 @@ def min_max(
         mn.append(UInt8(0) if seen_false else UInt8(1))
         mx.append(UInt8(1) if seen_true else UInt8(0))
         return (mn^, mx^, True)
+    var fast = _min_max_numeric(leaf, values, start, count, mn, mx)
+    if fast != MM_GENERIC:
+        return (mn^, mx^, fast == MM_BOUNDS)
     var lo = -1
     var hi = -1
-    var fast = _min_max_numeric(leaf, values, start, count)
-    if fast[2]:
-        lo = fast[0]
-        hi = fast[1]
-    else:
-        for k in range(count):
-            var i = start + k
-            var v = values.value_span(i)
-            if _is_nan(leaf, v):
-                continue
-            if lo < 0:
-                lo = i
-                hi = i
-                continue
-            if _stat_less(leaf, v, values.value_span(lo)):
-                lo = i
-            if _stat_less(leaf, values.value_span(hi), v):
-                hi = i
+    for k in range(count):
+        var i = start + k
+        var v = values.value_span(i)
+        if _is_nan(leaf, v):
+            continue
+        if lo < 0:
+            lo = i
+            hi = i
+            continue
+        if _stat_less(leaf, v, values.value_span(lo)):
+            lo = i
+        if _stat_less(leaf, values.value_span(hi), v):
+            hi = i
     if lo < 0:
         return (mn^, mx^, False)
     mn.extend(values.value_span(lo))

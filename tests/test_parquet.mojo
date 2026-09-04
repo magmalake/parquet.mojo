@@ -1660,6 +1660,160 @@ def test_dictionary_cap_boundary() raises:
     )
 
 
+def _write_float_column[
+    id: Int, dt: DType, bits: DType
+](values: Span[Scalar[dt], _]) raises -> List[UInt8]:
+    """One `FLOAT` or `DOUBLE` column of exactly these values, written by us."""
+    comptime width = 4 if id == AT_FLOAT32 else 8
+    var a = ArrayData(ArrowType(id), String("v"))
+    a.nullable = False
+    a.length = len(values)
+    for v in values:
+        var u = UInt64(bitcast[bits](v))
+        for b in range(width):
+            a.values.append(UInt8((u >> UInt64(8 * b)) & 0xFF))
+    var arena = ArrayArena()
+    var roots: List[Int] = [arena.add(a^)]
+    var w = ParquetWriter(WriterOptions())
+    w.write_batch(arena, roots)
+    return w^.finish()
+
+
+def _float_bounds_of(
+    bytes: Span[UInt8, _],
+) raises -> Tuple[Bool, Float64, Float64]:
+    """`(has_min_max, min, max)` of the one column of a file we just wrote."""
+    var r = ParquetReader[DefaultCodecs].from_span(bytes)
+    var st = r.statistics(0, 0)
+    return (st.has_min_max, st.min.f, st.max.f)
+
+
+def _is_negative_zero(v: Float64) -> Bool:
+    return v == 0.0 and bitcast[DType.uint64](v) != 0
+
+
+def _check_float_statistics[
+    id: Int, dt: DType, bits: DType
+](what: String) raises:
+    """Every float statistics rule, on one physical type.
+
+    Parquet is specific about NaN — it is never a bound, and a chunk of
+    nothing but NaN has no bounds at all — and *unspecific* about signed zero:
+    it suggests a writer prefer `-0.0` for a minimum and `+0.0` for a maximum,
+    which this writer does not do. What it does instead is report the first
+    zero it saw, and these pin that down rather than let it drift.
+    """
+    var one = Scalar[dt](1.0)
+    var zero = Scalar[dt](0.0)
+    var nan = zero / zero
+    var inf = one / zero
+
+    # NaN never becomes a bound, wherever it sits.
+    var mixed: List[Scalar[dt]] = [one, nan, -one, nan, Scalar[dt](2.0), nan]
+    var got = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(mixed)))
+    )
+    assert_true(got[0], String(what, ": NaN mix should have bounds"))
+    assert_equal(got[1], -1.0, String(what, ": NaN mix min"))
+    assert_equal(got[2], 2.0, String(what, ": NaN mix max"))
+
+    # Nothing but NaN: no statistics at all, not a NaN bound.
+    var all_nan: List[Scalar[dt]] = [nan, nan, nan, nan, nan]
+    var none = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(all_nan)))
+    )
+    assert_false(none[0], String(what, ": all-NaN must report no bounds"))
+
+    # One real value among NaNs is both bounds.
+    var lonely: List[Scalar[dt]] = [nan, nan, Scalar[dt](3.5), nan]
+    var only = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(lonely)))
+    )
+    assert_true(only[0], String(what, ": one non-NaN should have bounds"))
+    assert_equal(only[1], 3.5, String(what, ": one non-NaN min"))
+    assert_equal(only[2], 3.5, String(what, ": one non-NaN max"))
+
+    # Infinities are ordinary values and are the bounds when present.
+    var edges: List[Scalar[dt]] = [zero, inf, -inf, one, nan]
+    var ends = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(edges)))
+    )
+    assert_true(ends[0], String(what, ": infinities should have bounds"))
+    assert_true(ends[1] < -1.0e37, String(what, ": min should be -inf"))
+    assert_true(ends[2] > 1.0e37, String(what, ": max should be +inf"))
+
+    # Signed zero: the first zero wins, whichever sign it has. Long enough,
+    # and with the two zeros far enough apart, that a lane-wise scan would
+    # answer with the wrong one if it did not put the order back.
+    var pos_first = List[Scalar[dt]]()
+    var neg_first = List[Scalar[dt]]()
+    for i in range(64):
+        var v = Scalar[dt](2.0 + Float64(i))
+        pos_first.append(v)
+        neg_first.append(v)
+    pos_first[2] = zero
+    pos_first[37] = -zero
+    neg_first[2] = -zero
+    neg_first[37] = zero
+    var pos = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(pos_first)))
+    )
+    assert_true(pos[0], String(what, ": +0.0 first should have bounds"))
+    assert_equal(pos[1], 0.0, String(what, ": +0.0 first min value"))
+    assert_false(
+        _is_negative_zero(pos[1]), String(what, ": +0.0 first min sign")
+    )
+    var neg = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(neg_first)))
+    )
+    assert_true(neg[0], String(what, ": -0.0 first should have bounds"))
+    assert_equal(neg[1], 0.0, String(what, ": -0.0 first min value"))
+    assert_true(
+        _is_negative_zero(neg[1]), String(what, ": -0.0 first min sign")
+    )
+
+    # …and the same for a maximum of zero, where every other value is below.
+    var max_zero = List[Scalar[dt]]()
+    for i in range(64):
+        max_zero.append(Scalar[dt](-2.0 - Float64(i)))
+    max_zero[2] = -zero
+    max_zero[37] = zero
+    var top = _float_bounds_of(
+        Span(_write_float_column[id, dt, bits](Span(max_zero)))
+    )
+    assert_true(top[0], String(what, ": zero max should have bounds"))
+    assert_equal(top[2], 0.0, String(what, ": zero max value"))
+    assert_true(_is_negative_zero(top[2]), String(what, ": zero max sign"))
+
+
+def test_double_statistics_semantics() raises:
+    _check_float_statistics[AT_FLOAT64, DType.float64, DType.uint64](
+        String("DOUBLE")
+    )
+
+
+def test_float_statistics_semantics() raises:
+    _check_float_statistics[AT_FLOAT32, DType.float32, DType.uint32](
+        String("FLOAT")
+    )
+
+
+def test_integer_statistics_bounds() raises:
+    """The integer paths lost their index too; the bounds must not move."""
+    var vals = List[Int64](capacity=1000)
+    for i in range(1000):
+        vals.append(Int64(((i * 7919) % 1013) - 500))
+    vals[0] = 12345
+    vals[997] = -99999
+    vals[998] = 99999
+    var bytes = _write_int64_column(Span(vals), WriterOptions())
+    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var st = r.statistics(0, 0)
+    assert_true(st.has_min_max, "int64 bounds missing")
+    assert_equal(st.min.i, -99999, "int64 min")
+    assert_equal(st.max.i, 99999, "int64 max")
+
+
 def test_written_metadata() raises:
     var r = _reader("fieldids")
     var t = r.read_table()
