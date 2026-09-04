@@ -539,9 +539,8 @@ def test_list_offsets_and_child_null_counts() raises:
     assert_equal(inner.type.id, AT_LIST)
     assert_equal(inner.length, 9)
     assert_equal(inner.null_count, 1)
-    ref leaf = b2.child(b2.roots[0], 0)
-    assert_equal(len(leaf.children), 1)
-    ref strs = b2.arena.nodes[leaf.children[0]]
+    assert_equal(len(inner.children), 1)
+    ref strs = b2.arena.nodes[inner.children[0]]
     assert_equal(strs.type.id, AT_UTF8)
     assert_equal(strs.length, 8)
     assert_equal(strs.null_count, 1)
