@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "parquet.mojo"
-version = "0.4.1"
+version = "0.4.2"
 description = "Native pure-Mojo Apache Parquet — footer, pages, every encoding, and Arrow output over the C Data Interface."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -59,7 +59,7 @@ lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../thrift.mojo/src -I .
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
 [package]
 name = "parquet-mojo"
-version = "0.4.1"
+version = "0.4.2"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -73,27 +73,27 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.0.0"
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "5c474cbc4ccec1d98f5750598786d4e93d0fd931" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7f56128396cf7f4dc7620ac23dc0b725f4b8a26f" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "ae9d6a0b155a5063b57e2f6367b0e0b28f7b0a9e" }
-avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "3a43e8e5db4d6daf710ab9fe6bcf42942c38fd82" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "f4c3bdddd0c06bbad0c49c2b05c7afc30e7aa67a" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "6d56cd46c56273051f166d33f50fdf194a8dcd3e" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1faf0427543ed0142bbf1ffe7e41833a62a" }
+avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "589f3893627ee4263c756f679369c1b3f3ca5f7c" }
 
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "95812f5d0c600354dc68c23c97e8a09f1e53c960" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "2088700111339559978ea592c56eb55e75757346" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "336ea0ab0ac1347276265a495a7fcaf79059b3e7" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "bddf7c6811e756a4924fb13c7e9c14041644429a" }
 [package.build-dependencies]
 mojo-compiler = "==1.0.0"
 
 [package.run-dependencies]
 mojo-compiler = ">=1.0.0,<2"
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "5c474cbc4ccec1d98f5750598786d4e93d0fd931" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7f56128396cf7f4dc7620ac23dc0b725f4b8a26f" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "ae9d6a0b155a5063b57e2f6367b0e0b28f7b0a9e" }
-avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "3a43e8e5db4d6daf710ab9fe6bcf42942c38fd82" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "f4c3bdddd0c06bbad0c49c2b05c7afc30e7aa67a" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "6d56cd46c56273051f166d33f50fdf194a8dcd3e" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1faf0427543ed0142bbf1ffe7e41833a62a" }
+avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "589f3893627ee4263c756f679369c1b3f3ca5f7c" }
 
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "95812f5d0c600354dc68c23c97e8a09f1e53c960" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "2088700111339559978ea592c56eb55e75757346" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "336ea0ab0ac1347276265a495a7fcaf79059b3e7" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "bddf7c6811e756a4924fb13c7e9c14041644429a" }
 [feature.nightly.dependencies]
 modular = ">=26.6.0.dev2026082605,<27"
 
@@ -131,10 +131,10 @@ SHLIB_EXT = ".so"
 # refuses that package — see the note at the top of this file.
 [feature.bench.dependencies]
 bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "971759f58b862cfaa8fdef8708cd42f52ac719f9" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "5c474cbc4ccec1d98f5750598786d4e93d0fd931" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7f56128396cf7f4dc7620ac23dc0b725f4b8a26f" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "ae9d6a0b155a5063b57e2f6367b0e0b28f7b0a9e" }
-avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "3a43e8e5db4d6daf710ab9fe6bcf42942c38fd82" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "f4c3bdddd0c06bbad0c49c2b05c7afc30e7aa67a" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "6d56cd46c56273051f166d33f50fdf194a8dcd3e" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1faf0427543ed0142bbf1ffe7e41833a62a" }
+avro-mojo = { git = "https://github.com/magmalake/avro.mojo", rev = "589f3893627ee4263c756f679369c1b3f3ca5f7c" }
 
 [feature.bench.tasks]
 bench = "mojo run -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo"
