@@ -578,8 +578,12 @@ def _decode_leaf[
                     " rows",
                 )
             )
-        if not data.all_present and rows > len(data.defs):
-            raise Error(_short_levels(leaf, "definition"))
+        if not data.all_present:
+            # Levels are either one bitmap or one `UInt16` per slot; whichever
+            # this chunk has, it has to reach as far as the row group claims.
+            var have = len(data.mask) * 8 if data.masked() else len(data.defs)
+            if rows > have:
+                raise Error(_short_levels(leaf, "definition"))
         return
     var nslots = data.num_slots
     var all_present = data.all_present

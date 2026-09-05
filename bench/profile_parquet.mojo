@@ -216,6 +216,10 @@ def _walk_chunk(
         if nv * values.width <= (1 << 28):
             values.bytes.reserve(nv * values.width)
     var cd = ColumnData()
+    # Mirrors `read_column_chunk`: a leaf whose definition levels are one bit
+    # wide decodes them straight into a validity mask, and the `levels` row has
+    # to be timing what the library actually does.
+    cd.packed = leaf.max_def == 1 and leaf.max_rep == 0
     ref defs = cd.defs
     ref reps = cd.reps
     var offset = chunk_start(cm)

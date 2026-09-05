@@ -1929,6 +1929,108 @@ def test_projection_works_on_a_borrowed_reader() raises:
     keep(bytes)
 
 
+# ── which columns take the packed-validity path ─────────────────────────────
+#
+# A leaf with `max_def == 1` and `max_rep == 0` has definition levels that are
+# already a validity bitmap, and `read_column_chunk` decodes them straight into
+# one instead of materialising a `UInt16` per slot. Every other test in this
+# file would pass just as well if that path never fired, so these two say out
+# loud which chunks take it — by name for the fixture the optimisation was
+# aimed at, and by invariant across the corpus.
+
+
+def _validity_shapes(name: StringSlice) raises -> List[String]:
+    """Per leaf of `name`'s first row group, `path=shape`.
+
+    `mask` is the packed path, `all-present` is the chunk that had no nulls at
+    all and needed no validity, and `levels` is a definition level per slot.
+    """
+    var r = _reader(name)
+    r.verify_crc = False
+    r._load(0)
+    var out = List[String]()
+    for i in range(len(r.schema.leaves)):
+        var shape = String("levels")
+        if r._chunks[i].masked():
+            shape = String("mask")
+        elif r._chunks[i].all_present:
+            shape = String("all-present")
+        out.append(String(r.schema.leaves[i].dotted(), "=", shape))
+    return out^
+
+
+def test_packed_validity_fires_on_the_columns_it_should() raises:
+    """Instrumentation, not inference: which of `big.parquet`'s columns take
+    the bitmap path, asserted by name.
+
+    Four of its five columns are plain nullable scalars — `i`, `f`, `s`, `b` —
+    which qualify and have nulls, so their levels land in a mask. The fifth is
+    a list, whose leaf repeats, so it keeps a level per slot. If a change ever
+    makes the gate stop firing, this fails instead of quietly getting slower.
+    """
+    var got = _validity_shapes("big")
+    var want: List[String] = [
+        String("i=mask"),
+        String("f=mask"),
+        String("s=mask"),
+        String("b=mask"),
+        String("l.list.element=levels"),
+    ]
+    assert_equal(len(got), len(want), "leaf count of big.parquet")
+    for k in range(len(want)):
+        assert_equal(got[k], want[k])
+    var line = String("    big.parquet validity shapes:")
+    for g in got:
+        line += String(" ", g)
+    print(line)
+
+
+def test_packed_validity_and_its_gate_do_not_drift() raises:
+    """Across the corpus: a chunk decodes to a mask exactly when its leaf
+    qualifies and it has at least one null.
+
+    `packed` is set from the leaf descriptor before a page is read and only
+    ever cleared by the legacy `BIT_PACKED` level encoding, so
+    `masked() == (packed and not all_present)` is the whole contract. The
+    count at the end is what makes this a positive control rather than a
+    vacuous one.
+    """
+    var masked = 0
+    var checked = 0
+    for f in core_fixtures():
+        var r = _reader(f)
+        r.verify_crc = False
+        for rg in range(r.num_row_groups()):
+            r._load(rg)
+            for i in range(len(r.schema.leaves)):
+                ref leaf = r.schema.leaves[i]
+                ref cd = r._chunks[i]
+                checked += 1
+                assert_equal(
+                    cd.masked(),
+                    cd.packed and not cd.all_present,
+                    String(f, ".", leaf.dotted(), ": mask against its gate"),
+                )
+                if cd.masked():
+                    masked += 1
+                    assert_true(
+                        leaf.max_def == 1 and leaf.max_rep == 0,
+                        String(f, ".", leaf.dotted(), " must not be packed"),
+                    )
+                    assert_equal(
+                        len(cd.defs),
+                        0,
+                        String(f, ".", leaf.dotted(), " kept levels too"),
+                    )
+                    assert_equal(
+                        len(cd.mask),
+                        (cd.num_slots + 7) // 8,
+                        String(f, ".", leaf.dotted(), ": mask size"),
+                    )
+    assert_true(masked >= 20, String("only ", masked, " packed chunks"))
+    print("    packed chunks:", masked, "of", checked)
+
+
 # ── more than one core ──────────────────────────────────────────────────────
 #
 # `ParquetReader.num_workers` fans the column chunks of a row group out over

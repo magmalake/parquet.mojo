@@ -39,7 +39,7 @@ from parquet.arrow import (
 )
 from parquet.convert import append_null, append_value
 from parquet.encoding import PK_BOOL, PK_FIXED, PK_VAR, PhysBuffer
-from parquet.page import ColumnData
+from parquet.page import ColumnData, copy_mask_bits
 from parquet.schema import LeafColumn, ParquetSchema
 from thrift import Type
 
@@ -261,10 +261,25 @@ def _fill_leaf[
     # ── validity ──────────────────────────────────────────────────────────
     # `rows` is the output length: `n` unless the filter drops slots, in which
     # case the bitmap is written at the *row* index `m`, not the slot index.
+    #
+    # `packed` is the case the chunk decoded its definition levels *as* a
+    # bitmap — `max_def == 1`, `max_rep == 0`, so a level is a bit. The
+    # validity buffer is then a shifted copy of a byte range and the null count
+    # is a popcount, instead of a pass over `n` levels. A filtered leaf is
+    # never packed (it sits under a list, so its leaf repeats), which is why
+    # the flag folds away at compile time there.
     var dense = cd.all_present
     var present = n
     var rows = n
-    if not dense:
+    var packed = cd.masked()
+    comptime if filtered:
+        packed = False
+    if not dense and packed:
+        if s0 + n > cd.num_slots:
+            return False
+        out.validity.resize((n + 7) // 8, 0)
+        present = copy_mask_bits(cd.mask, s0, out.validity, n)
+    elif not dense:
         if s0 + n > len(cd.defs):
             return False
         var defs = cd.defs.unsafe_ptr()
@@ -295,6 +310,7 @@ def _fill_leaf[
     if out.null_count == 0:
         out.validity.clear()
         dense = True
+        packed = False
 
     # ── values ────────────────────────────────────────────────────────────
     if var_len:
@@ -309,6 +325,20 @@ def _fill_leaf[
         if dense:
             for k in range(rows + 1):
                 ooff.unsafe_store(k, voff.unsafe_load(v0 + k) - Int32(base))
+        elif packed:
+            # Presence is the validity buffer this call just built, so the
+            # offsets come off one bit per slot rather than one `UInt16`.
+            var vb = out.validity.unsafe_ptr()
+            var vi = v0
+            var run = 0
+            for k in range(rows):
+                ooff.unsafe_store(k, Int32(run))
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    run += Int(voff.unsafe_load(vi + 1)) - Int(
+                        voff.unsafe_load(vi)
+                    )
+                    vi += 1
+            ooff.unsafe_store(rows, Int32(run))
         else:
             var defs = cd.defs.unsafe_ptr()
             var vi = v0
@@ -341,6 +371,16 @@ def _fill_leaf[
                 if (k & 7) == 7:
                     vp.unsafe_store(k >> 3, byte)
                     byte = 0
+        elif packed:
+            var vb = out.validity.unsafe_ptr()
+            for k in range(rows):
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    if vals.bool_at(vi):
+                        byte |= UInt8(1) << UInt8(k & 7)
+                    vi += 1
+                if (k & 7) == 7:
+                    vp.unsafe_store(k >> 3, byte)
+                    byte = 0
         else:
             var defs = cd.defs.unsafe_ptr()
             var m = 0
@@ -369,6 +409,32 @@ def _fill_leaf[
     out.values.resize(rows * w, 0)
     var dst = out.values.unsafe_ptr()
     var src = vals.bytes.unsafe_ptr()
+    if packed:
+        # Spacing the values out into their slots, driven by the validity bits
+        # rather than by a definition level per slot.
+        var vb = out.validity.unsafe_ptr()
+        var vi = v0
+        if w == 8:
+            var d8 = dst.unsafe_bitcast[UInt64]()
+            var s8 = src.unsafe_bitcast[UInt64]()
+            for k in range(rows):
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    d8.unsafe_store(k, s8.unsafe_load[alignment=1](vi))
+                    vi += 1
+        elif w == 4:
+            var d4 = dst.unsafe_bitcast[UInt32]()
+            var s4 = src.unsafe_bitcast[UInt32]()
+            for k in range(rows):
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    d4.unsafe_store(k, s4.unsafe_load[alignment=1](vi))
+                    vi += 1
+        else:
+            for k in range(rows):
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    for b in range(w):
+                        dst.unsafe_store(k * w + b, src.unsafe_load(vi * w + b))
+                    vi += 1
+        return True
     var defs = cd.defs.unsafe_ptr()
     var vi = v0
     var m = 0
