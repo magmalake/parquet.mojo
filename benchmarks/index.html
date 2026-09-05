@@ -43,13 +43,23 @@
   h2 { font-size: 1.05rem; margin: 2.5rem 0 .5rem; letter-spacing: -.005em; }
   .sub { color: var(--muted); margin: 0 0 1.5rem; }
   .controls { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
+  .controls label { min-width: 0; }
   select, input {
     font: inherit; padding: .4rem .6rem; border: 1px solid var(--line);
     border-radius: 6px; background: var(--surface); color: var(--ink);
+    /* Host slugs are long. Without this the select alone widens the document. */
+    max-width: 100%;
   }
   .host-note { color: var(--muted); font-size: .85rem; }
   table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-  th, td { text-align: right; padding: .45rem .6rem; border-bottom: 1px solid var(--line); }
+  /*
+   * `nowrap` is what makes the table readable narrow: without it five columns
+   * squeezed into 375px wrap every cell and a row is ~90px tall, so twelve
+   * benchmarks cost 1 100px of table. With it a row is one line and `.scroll`
+   * takes the width instead — the columns past `mean` are a sideways swipe
+   * rather than three lines of wrapped text each.
+   */
+  th, td { text-align: right; padding: .45rem .6rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; font-family: var(--mono); font-size: .85rem; }
   th { color: var(--muted); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
   td { font-variant-numeric: tabular-nums; }
@@ -71,6 +81,37 @@
     background: var(--surface);
   }
   .chart h3 { margin: 0 0 .4rem; font-size: .85rem; font-family: var(--mono); font-weight: 600; }
+  /*
+   * The canvas gets its height from here, never from the page.
+   * `maintainAspectRatio: false` makes Chart.js size the canvas to its parent;
+   * if that parent is height:auto the canvas's own height is the input to its
+   * own next resize, and the pair grows without a fixed point — the published
+   * page reached canvases 5 800px tall. A parent with a height ends it.
+   */
+  .chart__canvas { position: relative; height: 150px; }
+  /* One chart at a time on a phone, so it can afford to be a little taller. */
+  @media (max-width: 800px) { .chart__canvas { height: 200px; } }
+  .picker { display: none; gap: .5rem; align-items: center; margin-bottom: .75rem; }
+  .picker label { color: var(--muted); font-size: .85rem; }
+  .picker select { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: .82rem; }
+  .step {
+    font: inherit; line-height: 1; padding: .45rem .7rem; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  .step:disabled { opacity: .4; cursor: default; }
+  /* Every benchmark name in the table jumps to that benchmark's chart. */
+  .pick {
+    font: inherit; color: inherit; background: none; border: 0; padding: 0;
+    text-align: left; cursor: pointer; text-decoration: underline;
+    text-decoration-color: transparent; text-underline-offset: 3px;
+  }
+  .pick:hover, .pick:focus-visible { text-decoration-color: var(--accent); }
+  @media (max-width: 800px) {
+    .picker { display: flex; }
+    .picker[hidden] { display: none; }  /* author rules outrank the UA's [hidden] */
+    .pick { text-decoration: underline dotted; text-decoration-color: var(--line); }
+  }
+  .chart--current { border-color: var(--accent); }
   .empty { color: var(--muted); padding: 2rem 0; }
   footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; }
   a { color: var(--accent); }
@@ -107,6 +148,12 @@
     </div>
 
     <h2>Over time</h2>
+    <div class="picker" id="picker">
+      <label for="series">Chart</label>
+      <select id="series"></select>
+      <button class="step" id="prev" type="button" aria-label="Previous benchmark">←</button>
+      <button class="step" id="next" type="button" aria-label="Next benchmark">→</button>
+    </div>
     <div class="grid" id="charts"></div>
   </div>
 
@@ -178,7 +225,19 @@ function detect(series) {
   return { known: true, changePct, threshold, regressed: changePct < -threshold };
 }
 
-let STATE = { history: null, host: null, filter: "" };
+/**
+ * One chart at a time below this width, all of them above it.
+ *
+ * A phone gets one column, so N charts are N screenfuls before anything else:
+ * at twelve benchmarks that was already most of the page, and the number only
+ * goes up. The table above is the better dense view on a small screen — it
+ * shows every benchmark, its rate and its delta in one row — so the charts
+ * become one chart the reader chooses, and the section's height stops
+ * depending on how many benchmarks the repository has.
+ */
+const NARROW = window.matchMedia("(max-width: 800px)");
+
+let STATE = { history: null, host: null, filter: "", series: null };
 const charts = [];
 
 fetch("data.json")
@@ -215,8 +274,48 @@ function start(history) {
   const filter = document.getElementById("filter");
   filter.addEventListener("input", () => { STATE.filter = filter.value.trim(); render(); });
 
+  const series = document.getElementById("series");
+  series.addEventListener("change", () => { select(series.value); });
+  // The table is the dense view; a name in it is the way into that chart.
+  document.getElementById("latest").addEventListener("click", (e) => {
+    const b = e.target.closest(".pick");
+    if (b) select(b.dataset.name);
+  });
+  document.getElementById("prev").addEventListener("click", () => step(-1));
+  document.getElementById("next").addEventListener("click", () => step(1));
+
+  // Crossing the breakpoint changes how many charts exist, so redraw. Charts
+  // are only ever built into a container that is already laid out, never into
+  // a hidden one, which is what Chart.js needs to size a canvas correctly.
+  NARROW.addEventListener("change", () => render());
+
   document.getElementById("content").hidden = false;
   render();
+}
+
+/** Show one benchmark's chart, on whichever layout is current. */
+function select(name) {
+  STATE.series = name;
+  if (NARROW.matches) {
+    render();
+    // The one chart lives below the table; a tap in the table should land on it.
+    const only = document.querySelector(".chart");
+    if (only) only.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    return;
+  }
+  const box = document.querySelector(`.chart[data-name="${CSS.escape(name)}"]`);
+  if (!box) return;
+  for (const el of document.querySelectorAll(".chart--current")) el.classList.remove("chart--current");
+  box.classList.add("chart--current");
+  box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function step(dir) {
+  const series = document.getElementById("series");
+  const i = series.selectedIndex + dir;
+  if (i < 0 || i >= series.options.length) return;
+  series.selectedIndex = i;
+  select(series.value);
 }
 
 /** Runs for the selected host, oldest first — the order a trend reads in. */
@@ -265,7 +364,9 @@ function render() {
     const r = latest.results[n];
     const tr = document.createElement("tr");
     if (!r) {
-      tr.innerHTML = `<td>${n}</td><td colspan="4" class="host-note">not in this run</td>`;
+      tr.innerHTML =
+        `<td><button type="button" class="pick" data-name="${n}">${n}</button></td>` +
+        `<td colspan="4" class="host-note">not in this run</td>`;
       body.append(tr);
       continue;
     }
@@ -278,7 +379,7 @@ function render() {
       delta = `<span class="${cls}">${(v.changePct * 100).toFixed(1)}%${suffix}</span>`;
     }
     tr.innerHTML =
-      `<td>${n}</td>` +
+      `<td><button type="button" class="pick" data-name="${n}">${n}</button></td>` +
       `<td>${fmtRate(r.throughput, r.throughput_unit)}</td>` +
       `<td>${fmtTime(r.mean_ns)}</td>` +
       `<td>${fmtTime(r.min_ns)} – ${fmtTime(r.max_ns)}</td>` +
@@ -289,10 +390,45 @@ function render() {
   drawCharts(runs, names);
 }
 
-function drawCharts(runs, names) {
+/**
+ * Which benchmarks get a chart, and what the picker offers.
+ *
+ * Wide: all of them, two columns, unchanged. Narrow: exactly one, so the
+ * section is the same height at 40 benchmarks as at 4. The picker is only
+ * populated when it is the thing steering the layout; on a wide screen it is
+ * `display: none` and the selection just scrolls to a chart that already
+ * exists.
+ */
+function chartNames(names) {
+  const picker = document.getElementById("picker");
+  const series = document.getElementById("series");
+  if (!NARROW.matches) {
+    series.replaceChildren();
+    picker.hidden = true;
+    return names;
+  }
+  picker.hidden = names.length === 0;
+  // Keep the reader's benchmark across a re-render; fall back to the first one
+  // that survived the filter.
+  if (!names.includes(STATE.series)) STATE.series = names[0] || null;
+  series.replaceChildren();
+  for (const n of names) {
+    const o = document.createElement("option");
+    o.value = n;
+    o.textContent = n;
+    if (n === STATE.series) o.selected = true;
+    series.append(o);
+  }
+  document.getElementById("prev").disabled = series.selectedIndex <= 0;
+  document.getElementById("next").disabled = series.selectedIndex >= names.length - 1;
+  return STATE.series == null ? [] : [STATE.series];
+}
+
+function drawCharts(runs, allNames) {
   while (charts.length) charts.pop().destroy();
   const grid = document.getElementById("charts");
   grid.replaceChildren();
+  const names = chartNames(allNames);
 
   const css = getComputedStyle(document.body);
   const ink = css.getPropertyValue("--ink").trim();
@@ -308,7 +444,9 @@ function drawCharts(runs, names) {
 
     const box = document.createElement("div");
     box.className = "chart";
-    box.innerHTML = `<h3>${n}</h3><canvas height="150"></canvas>`;
+    box.dataset.name = n;
+    // The canvas is sized by `.chart__canvas`, which has a height; see the CSS.
+    box.innerHTML = `<h3>${n}</h3><div class="chart__canvas"><canvas></canvas></div>`;
     grid.append(box);
 
     charts.push(new Chart(box.querySelector("canvas"), {
@@ -360,6 +498,16 @@ function drawCharts(runs, names) {
         color: ink,
       },
     }));
+  }
+
+  // A benchmark can exist in the history and have no runs on the selected
+  // machine. In the grid it was simply absent; as the one chart it would be a
+  // blank space, so say so.
+  if (!grid.children.length && allNames.length) {
+    const note = document.createElement("p");
+    note.className = "empty";
+    note.textContent = "No runs for this benchmark on this machine.";
+    grid.append(note);
   }
 }
 </script>
