@@ -1929,6 +1929,99 @@ def test_projection_works_on_a_borrowed_reader() raises:
     keep(bytes)
 
 
+# ── the value index of a row ────────────────────────────────────────────────
+
+
+def _write_nullable_int64(
+    values: Span[Int64, _], valid: Span[Bool, _], var options: WriterOptions
+) raises -> List[UInt8]:
+    """One nullable `INT64` column: `values[i]`, or null where `valid[i]` is
+    false. Arrow keeps a slot for a null, so the value buffer is full length."""
+    var a = ArrayData(ArrowType(AT_INT64), String("v"))
+    a.nullable = True
+    a.length = len(values)
+    a.validity.resize((len(values) + 7) // 8, 0)
+    for i in range(len(values)):
+        if valid[i]:
+            a.validity[i >> 3] |= UInt8(1) << UInt8(i & 7)
+        else:
+            a.null_count += 1
+        var u = bitcast[DType.uint64](values[i])
+        for b in range(8):
+            a.values.append(UInt8((u >> UInt64(8 * b)) & 0xFF))
+    var arena = ArrayArena()
+    var roots: List[Int] = [arena.add(a^)]
+    var w = ParquetWriter(options^)
+    w.write_batch(arena, roots)
+    return w^.finish()
+
+
+def test_value_index_before_the_first_null_page() raises:
+    """A chunk whose nulls only start in a later page.
+
+    `ColumnData.page_slot` starts at the first page that has a null in it, on
+    the grounds that every slot before that holds a value and so its value
+    index *is* its slot index. Nothing in the corpus has that shape — every
+    nullable fixture is null inside its first page — so this writes one: 4000
+    rows in 512-byte data pages, with only the second half nullable. The
+    assertions are that the shape really is that (`page_slot[0] > 0`, so the
+    branch is reached) and that `value_at` agrees with a count for every row.
+    """
+    var values = List[Int64](capacity=4000)
+    var valid = List[Bool](capacity=4000)
+    for i in range(4000):
+        values.append(Int64(i))
+        valid.append(i < 2000 or (i % 7) != 0)
+    var opts = WriterOptions()
+    opts.data_page_size = 512
+    opts.row_group_size = 4000
+    opts.use_dictionary = False
+    var bytes = _write_nullable_int64(Span(values), Span(valid), opts^)
+
+    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    r.verify_crc = False
+    r._load(0)
+    ref cd = r._chunks[0]
+    assert_true(
+        len(cd.page_slot) > 0 and cd.page_slot[0] > 0,
+        String(
+            "the fixture needs a null-free first page; page_slot starts at ",
+            cd.page_slot[0] if len(cd.page_slot) else -1,
+        ),
+    )
+    var seen = 0
+    for row in range(len(values) + 1):
+        assert_equal(
+            cd.value_at(row, 1),
+            seen,
+            String("value_at(", row, ")"),
+        )
+        if row < len(values) and valid[row]:
+            seen += 1
+
+    # …and end to end, at batch sizes that start inside the null-free region.
+    var sizes: List[Int] = [1, 7, 64, 999, 65536]
+    for bs in sizes:
+        var r2 = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+        r2.verify_crc = False
+        r2.batch_size = bs
+        var t = r2.read_table()
+        var row = 0
+        for b in range(len(t.batches)):
+            ref batch = t.batches[b]
+            for i in range(batch.num_rows):
+                var s = String()
+                canon_value(batch.arena, batch.roots[0], i, s)
+                var text = String(values[row])
+                var want = String("N") if not valid[row] else String(
+                    "S", text.byte_length(), ":", text
+                )
+                assert_equal(s, want, String("row ", row, " at batch ", bs))
+                row += 1
+        assert_equal(row, len(values), String("rows at batch ", bs))
+    keep(bytes)
+
+
 # ── which columns take the packed-validity path ─────────────────────────────
 #
 # A leaf with `max_def == 1` and `max_rep == 0` has definition levels that are

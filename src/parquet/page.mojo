@@ -214,18 +214,19 @@ struct ColumnData(Copyable, Defaultable, Movable):
     never materialised. This is the usual case — a column with no nulls — and
     skipping the per-slot level array is worth a great deal on a wide read."""
     var page_slot: List[Int]
-    """The first slot of each data page, and one final entry equal to
-    `num_slots`.
+    """The first slot of each data page from the first one with a null in it,
+    and one final entry equal to `num_slots`. Empty until then, and so empty
+    altogether for a chunk with no nulls.
 
     A checkpoint table, sampled at the one boundary the page walk already
     knows: it turns "where do this row's values start" into a binary search
-    plus a scan bounded by one page, instead of an entry per row. One entry
-    per page is a few dozen `Int`s per chunk against `rows + 1` of them, and
-    it costs nothing to build — the counts are the loop variables of
-    `read_column_chunk` already."""
+    plus a scan bounded by one page, instead of an entry per row. Every slot
+    before `page_slot[0]` holds a value, so its value index *is* its slot
+    index and there is nothing to store — which is why a chunk that never
+    sees a null allocates neither list."""
     var page_value: List[Int]
-    """The first value of each data page, and one final entry equal to the
-    number of values in `values`. Parallel to `page_slot`."""
+    """The first value of each data page `page_slot` covers, and one final
+    entry equal to the number of values in `values`."""
     var packed: Bool
     """This leaf's definition levels *are* a validity bitmap — `max_def == 1`
     and `max_rep == 0`, so a level is one bit — and `mask`, not `defs`, is
@@ -285,8 +286,12 @@ struct ColumnData(Copyable, Defaultable, Movable):
         which is the point: the caller wants this at a handful of batch
         boundaries, not at every row.
         """
-        if row <= 0 or len(self.page_slot) == 0:
+        if row <= 0:
             return 0
+        # Before the first checkpoint every slot holds a value, so the value
+        # index and the slot index are the same number.
+        if len(self.page_slot) == 0 or row <= self.page_slot[0]:
+            return row
         var lo = 0
         var hi = len(self.page_slot) - 1
         while lo < hi:
@@ -885,8 +890,9 @@ def read_column_chunk[
                 dict,
                 has_dict,
             )
-            out.page_slot.append(out.num_slots)
-            out.page_value.append(nvalues)
+            if len(out.page_slot) > 0 or non_null < n:
+                out.page_slot.append(out.num_slots)
+                out.page_value.append(nvalues)
             nvalues += non_null
             out.num_slots += n
             continue
@@ -974,8 +980,9 @@ def read_column_chunk[
                     dict,
                     has_dict,
                 )
-            out.page_slot.append(out.num_slots)
-            out.page_value.append(nvalues)
+            if len(out.page_slot) > 0 or non_null < n:
+                out.page_slot.append(out.num_slots)
+                out.page_value.append(nvalues)
             nvalues += non_null
             out.num_slots += n
             continue
@@ -984,8 +991,9 @@ def read_column_chunk[
 
     # The closing entry, so a lookup at the end of the chunk lands on a stored
     # answer rather than off the end of the table.
-    out.page_slot.append(out.num_slots)
-    out.page_value.append(nvalues)
+    if len(out.page_slot) > 0:
+        out.page_slot.append(out.num_slots)
+        out.page_value.append(nvalues)
     if out.num_slots != want:
         raise Error(
             String(
