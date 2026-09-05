@@ -411,6 +411,11 @@ def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
 # axes and nesting can never oversubscribe it. The streaming path asks for one
 # row group and gets the first axis alone; `read_table` asks for a window of
 # them and gets both.
+#
+# A third axis, Arrow assembly, sits after this one and is written up above
+# `_BatchPlan`. It is a separate fan-out rather than more tasks in this one
+# because a batch cannot be assembled until every leaf of its row group has
+# been decoded, and `parallel_for` has no barrier in the middle.
 
 
 def _decode_leaf[
@@ -514,6 +519,54 @@ def _decode_leaf[
     sp.unsafe_store(rows, nslots)
     if not all_present:
         vp.unsafe_store(rows, nvals)
+
+
+@always_inline
+def _leaf_slices(
+    needed: List[Bool],
+    chunks: List[ColumnData],
+    flat: List[Bool],
+    slot: List[List[Int]],
+    value: List[List[Int]],
+    r0: Int,
+    r1: Int,
+) -> List[LeafSlice]:
+    """Where rows `[r0, r1)` sit in each leaf's decoded chunk.
+
+    One entry per leaf of the file schema, `LeafSlice()` for the ones this read
+    does not want. Pure arithmetic over the per-row indices `_decode_leaf`
+    built, so it does not matter which of them ran on which thread, or whether
+    the row group came out of `_load` or out of a prefetched window: the same
+    row range gives the same slices. Both paths call this and nothing else,
+    which is what makes that true rather than merely intended.
+
+    `@always_inline` is not decoration. The per-row indices are
+    `List[List[Int]]` with an entry per row, and handing them to an out-of-line
+    call costs **9.6% of `bench_read_big` on a sequential read** — measured,
+    and the entire cost of pulling this body out of `_assemble`. Inlined, the
+    sequential path is within 0.3% of never having moved it.
+    """
+    var slices = List[LeafSlice]()
+    for i in range(len(needed)):
+        if not needed[i]:
+            slices.append(LeafSlice())
+            continue
+        var s0 = r0
+        var s1 = r1
+        if not flat[i]:
+            if len(slot[i]) <= r1:
+                slices.append(LeafSlice())
+                continue
+            s0 = slot[i][r0]
+            s1 = slot[i][r1]
+        elif r1 > chunks[i].num_slots:
+            slices.append(LeafSlice())
+            continue
+        # An empty `value` means every slot holds a value, so the value index
+        # and the slot index are the same number.
+        var v0 = s0 if len(value[i]) == 0 else value[i][r0]
+        slices.append(LeafSlice(s0, s1, v0))
+    return slices^
 
 
 struct _RowGroupData(Defaultable, Movable):
@@ -709,6 +762,131 @@ def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
         ctx.errors[d] = String(e)
 
 
+# ── the third axis: Arrow assembly ─────────────────────────────────────────
+#
+# Decoding a column chunk turns file bytes into values and levels; *assembly*
+# turns those into Arrow buffers, one array per Arrow field. Once the decode
+# fan-out landed, assembly was the whole serial remainder of a read — 32% of
+# the mixed benchmark and 16% of the wide one — and Amdahl's law on those two
+# numbers predicted the scaling that was actually observed at eight workers to
+# within a few percent. So it is the ceiling, and it is the axis below.
+#
+# A task is one *(batch, top-level field)* pair. Top-level fields are already
+# independent: `build_field` reads the decoded chunks and the row slices and
+# writes only into the arena it is handed, and a nested field recurses into
+# that same arena. Batches are independent for the same reason, and a window
+# of row groups has several of them in flight, so both go into one flat work
+# list handed to one `parallel_for` — one pool per window for assembly, next to
+# the one the same window already used for decode, rather than one per batch.
+#
+# **Arena layout does not move.** `ArrayData` refers to its children by arena
+# index, so assembling fields in a different order would shift every index and
+# produce a structurally different batch out of identical values — the kind of
+# wrong a value-comparing test cannot see. Each task therefore builds into its
+# *own* arena, starting at index 0, and the calling thread grafts those arenas
+# into the batch in field order afterwards (`ArrayArena.graft`), shifting every
+# child index by the graft point. A subtree built alone and grafted at `B` is
+# byte for byte the subtree built directly into a shared arena that already
+# held `B` nodes, so the batch that comes out is the sequential one at every
+# worker count — not merely one holding the same values.
+
+
+@fieldwise_init
+struct _BatchPlan(Copyable, Defaultable, Movable):
+    """One batch a window will cut, decided before any of it is built."""
+
+    var rg: Int
+    var group: Int
+    """Which decoded row group holds it, or -1 for a row group with no rows —
+    which `_prefetch` skips and which is built on the calling thread."""
+    var r0: Int
+    var r1: Int
+
+    def __init__(out self):
+        self.rg = -1
+        self.group = -1
+        self.r0 = 0
+        self.r1 = 0
+
+
+struct _AssembleCtx(Movable):
+    """Everything the assembly fan-out reads, and where each task writes.
+
+    Task `t` builds field `field[t]` of batch `batch[t]` into `arenas[t]` — its
+    own arena, which no other task touches — and records the root's index
+    inside it in `local_root[t]`, or its failure in `errors[t]`. Everything
+    else is read-only for the length of the call: the schema and the include
+    mask are copies, the row groups were moved in whole, and the slices were
+    computed on the calling thread before any worker started.
+
+    Tasks are queued batch-major and field-minor, which is visit order, so
+    scanning `errors` in task order gives the caller the same first failure the
+    sequential path gives.
+    """
+
+    var schema: ParquetSchema
+    var include: List[Bool]
+    var groups: List[_RowGroupData]
+    """The window's decoded row groups, moved out of `_prefetched`."""
+    var slices: List[List[LeafSlice]]
+    """Per planned batch, where its rows sit in each leaf's chunk."""
+    var batch: List[Int]
+    var group_of: List[Int]
+    var field: List[Int]
+    var arenas: List[ArrayArena]
+    var local_root: List[Int]
+    var errors: List[String]
+
+    def __init__(
+        out self,
+        var schema: ParquetSchema,
+        var include: List[Bool],
+        var groups: List[_RowGroupData],
+    ):
+        self.schema = schema^
+        self.include = include^
+        self.groups = groups^
+        self.slices = List[List[LeafSlice]]()
+        self.batch = List[Int]()
+        self.group_of = List[Int]()
+        self.field = List[Int]()
+        self.arenas = List[ArrayArena]()
+        self.local_root = List[Int]()
+        self.errors = List[String]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.schema = move.schema^
+        self.include = move.include^
+        self.groups = move.groups^
+        self.slices = move.slices^
+        self.batch = move.batch^
+        self.group_of = move.group_of^
+        self.field = move.field^
+        self.arenas = move.arenas^
+        self.local_root = move.local_root^
+        self.errors = move.errors^
+
+
+def _assemble_task(t: Int, mut ctx: _AssembleCtx) -> None:
+    """One top-level field of one batch, on whichever worker drew task `t`.
+
+    Writes `arenas[t]`, `local_root[t]` and `errors[t]` and nothing else; reads
+    the decoded chunks, which nothing mutates while the fan-out runs.
+    """
+    try:
+        ctx.local_root[t] = build_field(
+            ctx.schema,
+            ctx.field[t],
+            0,
+            ctx.groups[ctx.group_of[t]].chunks,
+            ctx.slices[ctx.batch[t]],
+            ctx.arenas[t],
+            ctx.include,
+        )
+    except e:
+        ctx.errors[t] = String(e)
+
+
 struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     """A Parquet file, projected and batched."""
 
@@ -722,42 +900,50 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var batch_size: Int
     var verify_crc: Bool
     var num_workers: Int
-    """How many OS threads decode column chunks at once.
+    """How many OS threads turn file bytes into Arrow at once.
 
-    `1`, the default, decodes every chunk on the calling thread and is what
-    every existing caller gets: the sequential path is the same code it always
-    was, with no pool started and no task context built. `0` means one worker
-    per core. Anything else is that many workers, clamped down to the number of
+    `1`, the default, does all of it on the calling thread and is what every
+    existing caller gets: the sequential path is the same code it always was,
+    with no pool started and no task context built. `0` means one worker per
+    core. Anything else is that many workers, clamped down to the number of
     tasks there actually are — a two-column read gains nothing from ten
     threads.
 
-    A column chunk is the unit because it is where the time is: on the wide
-    benchmark, dictionary gather, value decoding, decompression and the
-    per-row index together are about 85% of a read, and they are all inside
-    it. Chunks are independent through decode, so the tasks share nothing but
-    the immutable file bytes and the output is identical whatever the worker
-    count — asserted over the whole fixture corpus by
+    A column chunk is the unit of *decoding* because it is where most of the
+    time is: on the wide benchmark, dictionary gather, value decoding,
+    decompression and the per-row index together are about 85% of a read, and
+    they are all inside it. Chunks are independent through decode, so the tasks
+    share nothing but the immutable file bytes and the output is identical
+    whatever the worker count — asserted over the whole fixture corpus by
     `test_num_workers_is_bit_identical`.
 
-    **Two axes, one budget.** A task is a *(row group, leaf)* pair, and this
-    number is the whole thread budget for both:
+    **Three axes, one budget.** This number is the whole thread budget, and
+    every axis draws from it:
 
     * every read fans out across the leaves of the row group it is loading;
     * `read_table` *additionally* fans out across row groups, because it is
-      the one entry point that was always going to visit all of them.
+      the one entry point that was always going to visit all of them;
+    * and it fans out Arrow *assembly* across the *(batch, top-level field)*
+      pairs of a window, because once decoding was threaded, assembly on the
+      calling thread was the whole serial remainder of a read.
 
     Per-leaf parallelism alone is bounded by the slowest column chunk — one
     fat dictionary-encoded string column is most of a wide read on its own, so
     past two or four threads the others idle. Row groups are the axis that
-    still has width there. The two never nest: `_decode_groups` flattens the
-    pairs into one work list for one pool, so `num_workers = 4` means four
-    threads and not four times however many columns.
+    still has width there. The axes never nest: a decode task is one *(row
+    group, leaf)* pair and an assembly task is one *(batch, top-level field)*
+    pair, each flattened into a single work list for a single pool, so
+    `num_workers = 4` means four threads and not four times however many
+    columns.
 
     **Memory.** The streaming path — `read_batch`, `has_next`, and the reader's
     own iteration — is untouched and still holds exactly one row group's decode
     state, whatever this is set to. `read_table` decodes up to `num_workers`
     row groups at a time (see `read_table`), so past `1` it trades a bounded
-    amount of peak memory for the second axis. Nothing changes at `1`.
+    amount of peak memory for the second axis. The third axis trades none: an
+    assembly task builds the arrays the batch was going to hold anyway, into a
+    small arena that is grafted into the batch and dropped. Nothing changes at
+    `1`.
     """
     var _row_groups: List[Int]
     var _roots: List[Int]
@@ -1291,6 +1477,121 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_value = got[0].take_value()
         self._loaded_rg = rg
 
+    def _prefetched_group(self, rg: Int) -> Int:
+        """Where row group `rg` sits in the current window, or -1."""
+        for g in range(len(self._prefetched)):
+            if self._prefetched[g].rg == rg:
+                return g
+        return -1
+
+    def _plan_window(mut self, past: Int) -> List[_BatchPlan]:
+        """Cut every batch this window hands out, without building any of them.
+
+        The batch walk of `read_batch`, with `_load` and `_assemble` taken out:
+        it advances exactly the same iterator state — `_rg_pos`, `_range_pos`,
+        `_row_pos` and `_did_empty` — over exactly the same row ranges, so the
+        batches a window plans are the batches the sequential loop would have
+        cut, in the same order and with the same boundaries. Nothing here reads
+        a decoded chunk, so it can run before a single array is built.
+        """
+        var plans = List[_BatchPlan]()
+        while self._seek():
+            if self._rg_pos >= past:
+                break
+            var rg = self._row_groups[self._rg_pos]
+            if Int(self.meta.row_groups[rg].num_rows) == 0:
+                # One empty batch, so a zero-row file keeps its columns.
+                # `_prefetch` skips these, hence no group to build it from.
+                self._did_empty = True
+                plans.append(_BatchPlan(rg, -1, 0, 0))
+                continue
+            var ranges = self._ranges_for(self._rg_pos)
+            var span = ranges[self._range_pos]
+            var r0 = self._row_pos
+            var r1 = r0 + self.batch_size
+            if r1 > span[1]:
+                r1 = span[1]
+            plans.append(_BatchPlan(rg, self._prefetched_group(rg), r0, r1))
+            self._row_pos = r1
+        return plans^
+
+    def _assemble_window(
+        mut self, plans: List[_BatchPlan], workers: Int, mut t: Table
+    ) raises:
+        """Build every batch of a planned window, and append them in order.
+
+        One `parallel_for` over *(batch, top-level field)* pairs, then a graft
+        of each task's private arena into its batch on this thread — see the
+        note above `_BatchPlan` for why the graft, and not the fan-out, is what
+        makes the arena layout independent of the worker count.
+
+        The window's decoded row groups are moved out of `_prefetched` and into
+        the context, so the tasks read them through a value nothing else holds
+        and the reader is left with the empty `_prefetched` the caller expects
+        after a window.
+        """
+        if len(plans) == 0:
+            return
+        var groups = self._prefetched^
+        self._prefetched = List[_RowGroupData]()
+        var ctx = _AssembleCtx(
+            self.schema.copy(), self._include.copy(), groups^
+        )
+        # Slices first, on this thread: they are pure arithmetic over the
+        # per-row indices, and computing them here keeps the tasks to the one
+        # thing that is worth spreading.
+        for p in range(len(plans)):
+            var g = plans[p].group
+            if g < 0:
+                ctx.slices.append(List[LeafSlice]())
+                continue
+            ctx.slices.append(
+                _leaf_slices(
+                    self._needed,
+                    ctx.groups[g].chunks,
+                    ctx.groups[g].flat,
+                    ctx.groups[g].slot,
+                    ctx.groups[g].value,
+                    plans[p].r0,
+                    plans[p].r1,
+                )
+            )
+        # Batch-major, field-minor: task order is visit order.
+        for p in range(len(plans)):
+            if plans[p].group < 0:
+                continue
+            for k in range(len(self._roots)):
+                ctx.batch.append(p)
+                ctx.group_of.append(plans[p].group)
+                ctx.field.append(self._roots[k])
+                ctx.arenas.append(ArrayArena())
+                ctx.local_root.append(0)
+                ctx.errors.append(String())
+        parallel_for[_assemble_task](len(ctx.batch), ctx, num_workers=workers)
+        var task = 0
+        for p in range(len(plans)):
+            if plans[p].group < 0:
+                # A row group with no rows: decoded and assembled here, in its
+                # place in visit order, exactly as the sequential loop does it.
+                self._load(plans[p].rg)
+                var empty = self._assemble(0, 0)
+                t.num_rows += empty.num_rows
+                t.batches.append(empty^)
+                continue
+            var b = RecordBatch()
+            b.num_rows = plans[p].r1 - plans[p].r0
+            for _k in range(len(self._roots)):
+                # Checked as the batches are stitched rather than all at once,
+                # so a failure reaches the caller at the point in visit order
+                # where the sequential path would have raised it.
+                if ctx.errors[task]:
+                    raise Error(ctx.errors[task])
+                var at = b.arena.graft(ctx.arenas[task], ctx.local_root[task])
+                b.roots.append(at)
+                task += 1
+            t.num_rows += b.num_rows
+            t.batches.append(b^)
+
     def _prefetch(mut self, first: Int, past: Int, workers: Int) raises:
         """Decode the row groups at selection slots `[first, past)` in one go.
 
@@ -1386,28 +1687,15 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         return batch^
 
     def _assemble(mut self, r0: Int, r1: Int) raises -> RecordBatch:
-        var slices = List[LeafSlice]()
-        for i in range(len(self.schema.leaves)):
-            if not self._needed[i]:
-                slices.append(LeafSlice())
-                continue
-            var s0 = r0
-            var s1 = r1
-            if not self._row_flat[i]:
-                if len(self._row_slot[i]) <= r1:
-                    slices.append(LeafSlice())
-                    continue
-                s0 = self._row_slot[i][r0]
-                s1 = self._row_slot[i][r1]
-            elif r1 > self._chunks[i].num_slots:
-                slices.append(LeafSlice())
-                continue
-            # An empty `_row_value` means every slot holds a value, so the
-            # value index and the slot index are the same number.
-            var v0 = (
-                s0 if len(self._row_value[i]) == 0 else self._row_value[i][r0]
-            )
-            slices.append(LeafSlice(s0, s1, v0))
+        var slices = _leaf_slices(
+            self._needed,
+            self._chunks,
+            self._row_flat,
+            self._row_slot,
+            self._row_value,
+            r0,
+            r1,
+        )
         var batch = RecordBatch()
         batch.num_rows = r1 - r0
         var roots = self._roots.copy()
@@ -1512,10 +1800,14 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         `num_workers = 1` — the default — this is the same loop it always was,
         byte for byte and allocation for allocation.
 
-        Within a window the batches are still cut, assembled and appended by
-        the ordinary iterator, in file order, on this thread. Row groups
-        finishing out of order changes which row group is *decoded* first and
-        nothing about which rows come out first.
+        Within a window the batches are cut by the ordinary iterator walk —
+        `_plan_window`, which is `read_batch` with the building taken out — and
+        then built by a second fan-out over *(batch, top-level field)* pairs,
+        because sequential Arrow assembly was the whole serial remainder of a
+        threaded read. They are appended in file order on this thread whatever
+        order the workers finished in, and each field is grafted into its batch
+        at the index it would have had sequentially, so neither row order nor
+        arena layout depends on the worker count.
         """
         self.rewind()
         var t = Table()
@@ -1536,15 +1828,11 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             if past > nsel:
                 past = nsel
             self._prefetch(first, past, workers)
-            while self.has_next():
-                if self._rg_pos >= past:
-                    break
-                var b = self.read_batch()
-                t.num_rows += b.num_rows
-                t.batches.append(b^)
+            var plans = self._plan_window(past)
+            self._assemble_window(plans, workers, t)
             self._drop_prefetch()
-            # `has_next` may have walked past the window looking for a row to
-            # hand out; the next window starts wherever it stopped.
+            # `_plan_window` may have walked past the window looking for a row
+            # to hand out; the next window starts wherever it stopped.
             first = past
             if self._rg_pos > first:
                 first = self._rg_pos

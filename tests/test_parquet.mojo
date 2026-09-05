@@ -12,7 +12,13 @@ from fixtures_list import (
     iceberg_fixtures,
     iceberg_zstd_fixtures,
 )
-from fingerprint import read_error, read_fingerprint, table_fingerprint
+from fingerprint import (
+    permuted_arenas,
+    read_error,
+    read_fingerprint,
+    table_fingerprint,
+    table_values_fingerprint,
+)
 from oracle import canon_value, decimal_string, double_bits, hex_of, load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import (
@@ -92,6 +98,7 @@ from std.testing import (
     TestSuite,
     assert_equal,
     assert_false,
+    assert_not_equal,
     assert_raises,
     assert_true,
 )
@@ -2000,6 +2007,102 @@ def test_num_workers_is_bit_identical_across_batches() raises:
             )
             checked += 1
     assert_true(checked >= 18, String("only ", checked, " comparisons"))
+
+
+def test_the_fingerprint_catches_a_permuted_arena() raises:
+    """The negative control for the arena-layout half of the fingerprint.
+
+    Top-level fields are assembled on several threads and grafted back into the
+    batch afterwards, and the way that goes subtly wrong is *ordering*: an
+    `ArrayData` names its children by arena index, so stitching the fields back
+    in a different order shifts every index and yields a structurally different
+    batch out of values that are identical to the last bit. A test that folds
+    only the arrays — which is what this file folded before assembly was
+    threaded — cannot see that at all.
+
+    So: read `big.parquet` (five top-level fields, one of them a list, so the
+    arena has more nodes than roots), renumber every arena without touching a
+    value, and assert both halves of the claim. If the second assertion ever
+    fails, `test_num_workers_is_bit_identical` has stopped being able to catch
+    a broken assembly order and is checking values alone again.
+    """
+    var r = ParquetReader[DefaultCodecs].open(String(FIXTURES, "big.parquet"))
+    var t = r.read_table()
+    assert_true(
+        len(t.batches[0].arena.nodes) > len(t.batches[0].roots),
+        "big.parquet has no nested field, so reversal may be a no-op",
+    )
+    var shuffled = permuted_arenas(t)
+    assert_equal(
+        table_values_fingerprint(shuffled),
+        table_values_fingerprint(t),
+        "the permutation changed a value, so it is not a layout-only control",
+    )
+    assert_not_equal(
+        table_fingerprint(shuffled),
+        table_fingerprint(t),
+        "the fingerprint missed a permuted arena",
+    )
+
+
+def test_arena_layout_does_not_depend_on_the_worker_count() raises:
+    """The same claim, stated on its own rather than folded into a CRC.
+
+    `test_num_workers_is_bit_identical` covers this across the corpus now that
+    the fingerprint folds layout, but a failure there says only "some byte
+    moved". This says which byte: node for node, the arena a threaded read
+    builds is the arena a sequential one builds — the same number of nodes, in
+    the same order, with the same children at the same indices — because each
+    field is grafted in at the index it would have had sequentially.
+    """
+    var names: List[String] = [
+        String("big"),
+        String("nested"),
+        String("legacy_list"),
+        String("logical"),
+        String("manypages"),
+    ]
+    var checked = 0
+    for f in names:
+        var path = String(FIXTURES, f, ".parquet")
+        var base = ParquetReader[DefaultCodecs].open(path)
+        base.batch_size = 256
+        var want = base.read_table()
+        for w in [2, 4, 10]:
+            var r = ParquetReader[DefaultCodecs].open(path)
+            r.num_workers = w
+            r.batch_size = 256
+            var got = r.read_table()
+            assert_equal(
+                len(got.batches), len(want.batches), String(f, " at ", w)
+            )
+            for b in range(len(want.batches)):
+                ref a = want.batches[b]
+                ref c = got.batches[b]
+                assert_equal(
+                    len(c.arena.nodes),
+                    len(a.arena.nodes),
+                    String(f, " batch ", b, " node count at ", w),
+                )
+                assert_equal(
+                    String(c.roots),
+                    String(a.roots),
+                    String(f, " batch ", b, " roots at ", w),
+                )
+                for n in range(len(a.arena.nodes)):
+                    assert_equal(
+                        String(c.arena.nodes[n].children),
+                        String(a.arena.nodes[n].children),
+                        String(f, " batch ", b, " node ", n, " at ", w),
+                    )
+                    assert_equal(
+                        c.arena.nodes[n].name,
+                        a.arena.nodes[n].name,
+                        String(f, " batch ", b, " node ", n, " name at ", w),
+                    )
+                    checked += 1
+    assert_true(checked >= 100, String("only ", checked, " nodes compared"))
+    print("    arena nodes compared:", checked)
 
 
 def test_num_workers_zero_uses_every_core() raises:

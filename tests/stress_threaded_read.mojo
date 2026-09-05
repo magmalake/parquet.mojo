@@ -19,10 +19,13 @@ five to fifteen times, so the round count is small by default and
 `STRESS_ROUNDS` raises it.
 
 Four of the seven fixtures have more than one row group — `prune` has ten —
-so `read_table` runs both axes here: several row groups in flight at once,
-each fanned out across its columns, all drawing from one pool. The error leg
-runs twice, with the corruption in the first row group and in the last, so a
-window that raced its error slots has two shapes to get wrong.
+so `read_table` runs every axis here: several row groups in flight at once,
+each fanned out across its columns, all drawing from one pool, and then a
+second fan-out that assembles the batches of the whole window at once. The
+fingerprint folds arena layout as well as buffers, so an assembly that raced
+its way into the wrong graft order fails here too. The error leg runs twice,
+with the corruption in the first row group and in the last, so a window that
+raced its error slots has two shapes to get wrong.
 
 Environment:
 
