@@ -42,9 +42,42 @@ trait CodecSet:
         ...
 
     @staticmethod
-    def decompress(
-        codec: Int32, data: Span[UInt8, _], uncompressed_size: Int
-    ) raises -> List[UInt8]:
+    def decompress[
+        page_origin: ImmOrigin, scratch_origin: MutOrigin
+    ](
+        codec: Int32,
+        data: Span[UInt8, page_origin],
+        uncompressed_size: Int,
+        ref[scratch_origin] scratch: List[UInt8],
+    ) raises -> Span[UInt8, origin_of(page_origin, scratch_origin)].Immutable:
+        """Decompress one page body, borrowing rather than allocating.
+
+        The result is *a view*, never a fresh buffer. For `UNCOMPRESSED` it is
+        `data` itself — the page's own bytes inside the file, handed back
+        untouched, which is what `SerializedPageReader::DecompressIfNeeded`
+        does in parquet-cpp. For every other codec it is `scratch`, the
+        caller's one decompression buffer per column chunk.
+
+        **Lifetime contract — the span is valid only until the next call that
+        passes the same `scratch`.** That call overwrites the buffer and may
+        reallocate it, so a span held across a page boundary reads another
+        page's bytes. parquet-cpp documents the same rule at
+        `column_reader.cc:251`: the previous page is invalidated by
+        `NextPage()`. Copy out anything that has to outlive the page —
+        `decode_plain_into` and its neighbours already do, which is why a
+        dictionary page survives the data pages decompressed after it.
+
+        Mojo's origins cannot make the compiler enforce that. The returned
+        origin is the union of the file's and the scratch buffer's, so both are
+        kept alive for as long as the span is and it can never dangle, but Mojo
+        does not treat an outstanding immutable view as blocking a later
+        mutation the way an exclusivity checker would — a held span is a wrong
+        answer, not a compile error. So the rule is a contract, and
+        `test_a_page_span_is_only_valid_until_the_next_page` is what states it.
+
+        `uncompressed_size` is the page header's declared decompressed length,
+        which for Brotli and raw LZ4 is the only size there is.
+        """
         ...
 
     @staticmethod
@@ -57,6 +90,27 @@ def copy_of(data: Span[UInt8, _]) -> List[UInt8]:
     var out = List[UInt8](capacity=len(data))
     out.extend(data)
     return out^
+
+
+def page_span[origin: ImmOrigin](data: Span[UInt8, _]) -> Span[UInt8, origin]:
+    """Re-label `data` with the origin `CodecSet.decompress` returns.
+
+    Its two answers live in different places — the file for an uncompressed
+    page, the caller's scratch buffer for a compressed one — and the declared
+    return type is the union of those two origins, which keeps both alive for
+    as long as the span is. Neither branch can produce that union type on its
+    own, hence this one narrow re-labelling, and it is a no-op at run time: the
+    same pointer and length.
+
+    Sound because the union outlives either input, so the origin stamped on is
+    never longer-lived than the one the bytes actually have.
+    """
+    return Span[UInt8, origin](
+        unsafe_ptr=Pointer[UInt8, origin](
+            unsafe_from_address=Int(data.unsafe_ptr())
+        ),
+        length=len(data),
+    )
 
 
 def codec_name(codec: Int32) -> String:
@@ -191,15 +245,23 @@ struct DefaultCodecs(CodecSet):
         )
 
     @staticmethod
-    def decompress(
-        codec: Int32, data: Span[UInt8, _], uncompressed_size: Int
-    ) raises -> List[UInt8]:
+    def decompress[
+        page_origin: ImmOrigin, scratch_origin: MutOrigin
+    ](
+        codec: Int32,
+        data: Span[UInt8, page_origin],
+        uncompressed_size: Int,
+        ref[scratch_origin] scratch: List[UInt8],
+    ) raises -> Span[UInt8, origin_of(page_origin, scratch_origin)].Immutable:
+        comptime O = origin_of(origin_of(page_origin, scratch_origin))
         if codec == CompressionCodec.UNCOMPRESSED.value:
-            return copy_of(data)
+            return page_span[O](data)
         if codec == CompressionCodec.SNAPPY.value:
-            return snappy_decompress(data)
+            scratch = snappy_decompress(data)
+            return page_span[O](Span(scratch))
         if codec == CompressionCodec.GZIP.value:
-            return gunzip(data)
+            scratch = gunzip(data)
+            return page_span[O](Span(scratch))
         raise unsupported_codec(codec)
 
     @staticmethod

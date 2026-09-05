@@ -789,6 +789,14 @@ def read_column_chunk[
     # Values written into `out.values` so far — the running count that
     # `page_value` samples once per page.
     var nvalues = 0
+    # One decompression buffer for the whole chunk, as `SerializedPageReader`
+    # has. Every span `Codecs.decompress` hands back is a view — of the file
+    # for an uncompressed page, of this buffer otherwise — and is valid only
+    # until the next page is decompressed into it. Nothing below outlives its
+    # own iteration: the dictionary page is copied into `dict` by
+    # `decode_plain`, and a data page's levels and values are copied into `out`
+    # before the loop turns.
+    var scratch = List[UInt8]()
 
     while out.num_slots < want and offset < limit:
         var hdr = read_page_header(file, offset)
@@ -828,7 +836,7 @@ def read_column_chunk[
             if not dh:
                 raise Error("parquet.page: dictionary page with no header")
             var n = Int(dh.value().num_values)
-            var raw = Codecs.decompress(codec, body, usize)
+            var raw = Codecs.decompress(codec, body, usize, scratch)
             var enc = dh.value().encoding.value
             if (
                 enc != Encoding.PLAIN.value
@@ -841,7 +849,7 @@ def read_column_chunk[
                         " is not PLAIN",
                     )
                 )
-            dict = decode_plain(leaf.physical, leaf.type_length, Span(raw), n)
+            dict = decode_plain(leaf.physical, leaf.type_length, raw, n)
             has_dict = True
             continue
 
@@ -853,8 +861,8 @@ def read_column_chunk[
             if not h:
                 raise Error("parquet.page: v1 data page with no header")
             var n = Int(h.value().num_values)
-            var raw = Codecs.decompress(codec, body, usize)
-            var buf = Span(raw)
+            var raw = Codecs.decompress(codec, body, usize, scratch)
+            var buf = raw
             var pos = 0
             if leaf.max_rep > 0:
                 pos = _read_levels(
@@ -959,13 +967,13 @@ def read_column_chunk[
             # decompress, and the empty span is already the answer.
             if compressed and len(vbytes) > 0:
                 var raw = Codecs.decompress(
-                    codec, vbytes, usize - rep_len - def_len
+                    codec, vbytes, usize - rep_len - def_len, scratch
                 )
                 _decode_values_into(
                     out.values,
                     h.value().encoding.value,
                     leaf,
-                    Span(raw),
+                    raw,
                     non_null,
                     dict,
                     has_dict,
