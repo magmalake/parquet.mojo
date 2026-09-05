@@ -11,7 +11,7 @@ Decode — the page walk mirrors `parquet.page.read_column_chunk`:
 |---|---|
 | footer | Thrift footer parse and schema build |
 | hdr | page headers (Thrift compact) |
-| decomp | `Codecs.decompress` per page, including the UNCOMPRESSED copy |
+| decomp | `Codecs.decompress` per page — a borrow, so UNCOMPRESSED is free |
 | levels | definition and repetition levels into `List[UInt16]` |
 | values | the value encoding: PLAIN / DELTA / BSS |
 | gather | `gather_dict_into`: dictionary indices decoded, bounds-checked and materialised, which is one fused pass and so one row |
@@ -200,6 +200,21 @@ def _row(name: StringSlice, ns: Int, total: Int) -> String:
     )
 
 
+def _count_scratch(mut st: Stages, scratch: List[UInt8], mut high: Int):
+    """Charge the decompression buffer for what it actually allocates.
+
+    One buffer serves a whole column chunk and never shrinks, so it allocates
+    only when a page pushes it past its high-water mark — and an uncompressed
+    page never touches it at all. Adding `len(raw)` per page, as this profile
+    did while every page got a buffer of its own, would now count bytes nothing
+    ever allocated.
+    """
+    if len(scratch) > high:
+        st.alloc_bytes += len(scratch) - high
+        st.alloc_count += 1
+        high = len(scratch)
+
+
 def _walk_chunk(
     file: Span[UInt8, _],
     cm: ColumnMetaData,
@@ -229,6 +244,8 @@ def _walk_chunk(
     var has_dict = False
     var codec = cm.codec.value
     var slots = 0
+    var scratch = List[UInt8]()
+    var scratch_high = 0
 
     while slots < want and offset < limit:
         var t0 = perf_counter_ns()
@@ -245,12 +262,11 @@ def _walk_chunk(
         if ph.type_ == PageType.DICTIONARY_PAGE:
             var n = Int(ph.dictionary_page_header.value().num_values)
             t0 = perf_counter_ns()
-            var raw = DefaultCodecs.decompress(codec, body, usize)
+            var raw = DefaultCodecs.decompress(codec, body, usize, scratch)
             t1 = perf_counter_ns()
             st.decomp += t1 - t0
-            st.alloc_bytes += len(raw)
-            st.alloc_count += 1
-            dict = decode_plain(leaf.physical, leaf.type_length, Span(raw), n)
+            _count_scratch(st, scratch, scratch_high)
+            dict = decode_plain(leaf.physical, leaf.type_length, raw, n)
             st.values += perf_counter_ns() - t1
             has_dict = True
             continue
@@ -266,12 +282,11 @@ def _walk_chunk(
             n = Int(h.value().num_values)
             enc = h.value().encoding.value
             t0 = perf_counter_ns()
-            var raw = DefaultCodecs.decompress(codec, body, usize)
+            var raw = DefaultCodecs.decompress(codec, body, usize, scratch)
             t1 = perf_counter_ns()
             st.decomp += t1 - t0
-            st.alloc_bytes += len(raw)
-            st.alloc_count += 1
-            var buf = Span(raw)
+            _count_scratch(st, scratch, scratch_high)
+            var buf = raw
             var pos = 0
             if leaf.max_rep > 0:
                 pos = _read_levels(
@@ -339,14 +354,13 @@ def _walk_chunk(
             var vbytes = body[rep_len + def_len :]
             if h.value().is_compressed.or_else(True):
                 var raw = DefaultCodecs.decompress(
-                    codec, vbytes, usize - rep_len - def_len
+                    codec, vbytes, usize - rep_len - def_len, scratch
                 )
                 var t2 = perf_counter_ns()
                 st.decomp += t2 - t1
-                st.alloc_bytes += len(raw)
-                st.alloc_count += 1
+                _count_scratch(st, scratch, scratch_high)
                 _profile_values(
-                    values, enc, leaf, Span(raw), non_null, dict, has_dict, st
+                    values, enc, leaf, raw, non_null, dict, has_dict, st
                 )
             else:
                 _profile_values(

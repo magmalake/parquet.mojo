@@ -72,6 +72,7 @@ from parquet import (
     export_c,
     array_str,
 )
+from parquet.page import chunk_start
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.writer import DICT_MAX_VALUES
 from parquet.bitio import (
@@ -112,8 +113,10 @@ from thrift import (
     FieldRepetitionType,
     ListType,
     LogicalType,
+    PageType,
     SchemaElement,
     Type,
+    read_page_header,
     read_parquet_file,
 )
 
@@ -152,6 +155,108 @@ def test_unsupported_codec_says_so() raises:
     r2.select_columns([String("brotli")])
     with assert_raises(contains="BROTLI"):
         _ = r2.read_table()
+
+
+def _chunk_page_counts(bytes: Span[UInt8, _]) raises -> Tuple[Int, Int]:
+    """Dictionary pages and data pages in the first row group's first chunk."""
+    var r = ParquetReader[DefaultCodecs].from_span(bytes)
+    ref cm = r.meta.row_groups[0].columns[0].meta_data.value()
+    var offset = chunk_start(cm)
+    var limit = offset + Int(cm.total_compressed_size)
+    var dicts = 0
+    var datas = 0
+    while offset < limit:
+        var hdr = read_page_header(bytes, offset)
+        ref ph = hdr[0]
+        offset += hdr[1] + Int(ph.compressed_page_size)
+        if ph.type_ == PageType.DICTIONARY_PAGE:
+            dicts += 1
+        else:
+            datas += 1
+    return (dicts, datas)
+
+
+def test_a_page_span_is_only_valid_until_the_next_page() raises:
+    """`CodecSet.decompress` returns a view, and the view dies with the page.
+
+    Two halves, because the contract has two ways to break.
+
+    *The page is not copied.* An uncompressed page comes back as the file's own
+    bytes — asserted by address, since a copy with identical contents would
+    pass any value-level check while costing the whole `decomp` stage. The
+    scratch buffer must be untouched: nothing was decompressed.
+
+    *Two compressed pages land in the same bytes.* One scratch buffer,
+    decompressed into twice; the second span must start at the same address as
+    the first, which is both the point of reusing the buffer and the reason a
+    span cannot be held. Asserted by address rather than by reading the first
+    span again afterwards, which would be reading bytes this very test says are
+    no longer the first page's.
+
+    *Nothing may hold a page across the loop's turn.* A snappy column chunk of
+    many data pages behind one dictionary page, no two pages holding the same
+    values, read end to end. Every page decompresses into the same buffer, so a
+    `read_column_chunk` that kept a span — a lazily decoded dictionary, a
+    deferred value pass — reads another page's bytes and gives plausible, wrong
+    values. The control was exactly that, deferring every page's value decode
+    by one: it fails here, and in several corpus tests besides, so this half
+    names the rule rather than being its only guard.
+    """
+    var page = List[UInt8](capacity=4096)
+    for i in range(4096):
+        page.append(UInt8((i * 31) % 251))
+    var scratch = List[UInt8]()
+    var raw = DefaultCodecs.decompress(
+        CompressionCodec.UNCOMPRESSED.value, Span(page), len(page), scratch
+    )
+    assert_equal(len(raw), len(page))
+    assert_equal(
+        Int(raw.unsafe_ptr()),
+        Int(Span(page).unsafe_ptr()),
+        "an uncompressed page was copied instead of handed back",
+    )
+    assert_equal(len(scratch), 0, "an uncompressed page touched the scratch")
+
+    var half = List[UInt8](capacity=1024)
+    for i in range(1024):
+        half.append(UInt8((i * 17) % 241))
+    var big = DefaultCodecs.compress(CompressionCodec.SNAPPY.value, Span(page))
+    var small = DefaultCodecs.compress(
+        CompressionCodec.SNAPPY.value, Span(half)
+    )
+    var first = DefaultCodecs.decompress(
+        CompressionCodec.SNAPPY.value, Span(big), len(page), scratch
+    )
+    assert_equal(len(first), len(page))
+    assert_equal(Int(first[7]), Int(page[7]))
+    var at = Int(first.unsafe_ptr())
+    var second = DefaultCodecs.decompress(
+        CompressionCodec.SNAPPY.value, Span(small), len(half), scratch
+    )
+    assert_equal(len(second), len(half))
+    assert_equal(Int(second[7]), Int(half[7]))
+    assert_equal(
+        Int(second.unsafe_ptr()),
+        at,
+        "the second page did not reuse the first page's buffer",
+    )
+
+    var options = WriterOptions()
+    options.codec = CompressionCodec.SNAPPY.value
+    options.data_page_size = 512  # 64 INT64 values a page
+    options.write_page_index = False
+    # 997 distinct values over 4000, so no two of the 64-value pages hold the
+    # same values — a per-page pattern that repeated would let a caller hold
+    # the first page's span and still get the right answer.
+    var values = _cycled(997, 4000)
+    var bytes = _write_int64_column(Span(values), options^)
+    var counts = _chunk_page_counts(Span(bytes))
+    assert_equal(counts[0], 1, "the chunk should carry a dictionary page")
+    assert_true(
+        counts[1] > 8,
+        String("only ", counts[1], " data pages: the chunk is not multi-page"),
+    )
+    _assert_int64_round_trip(Span(bytes), Span(values), String("many pages"))
 
 
 def test_batching_is_invariant() raises:
