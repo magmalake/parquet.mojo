@@ -104,7 +104,7 @@ tins — see [Codecs](#codecs).
 | `.page_row_ranges(rg, predicates)` | the row ranges those pages cover |
 | `.batch_size` | rows per batch (default 65536) |
 | `.verify_crc` | check page CRC32s when present (default true) |
-| `.num_workers` | threads decoding column chunks, and — in `read_table` — row groups (default 1; `0` means one per core) — see [More than one core](#more-than-one-core) |
+| `.num_workers` | threads decoding column chunks, and — in `read_table` — row groups and Arrow assembly (default 1; `0` means one per core) — see [More than one core](#more-than-one-core) |
 | `.read_batch()` / `.has_next()` / `.rewind()` | iterate batches |
 | `.read_table()` | every selected row group, as a `Table` |
 
@@ -522,7 +522,7 @@ r.num_workers = 4        # 1 = sequential (the default); 0 = one per core
 var t = r.read_table()
 ```
 
-**A task is a *(row group, column chunk)* pair.** Reading a row group is
+**A decode task is a *(row group, column chunk)* pair.** Reading a row group is
 `read_column_chunk` per projected leaf, then one pass over that chunk's levels
 to build the per-row index — and by the table above that is about 85% of a
 read. Chunks are independent through decode, so the tasks share nothing but
@@ -533,7 +533,7 @@ therefore gives the same error at any worker count, and
 `test_num_workers_is_bit_identical` asserts byte-for-byte equal Arrow buffers,
 null counts and offsets across the whole fixture corpus.
 
-**Two axes, one budget.** Columns alone are bounded by the *slowest chunk*:
+**Three axes, one budget.** Columns alone are bounded by the *slowest chunk*:
 the wide file's fourth column is a dictionary string column that is most of
 the decode on its own, so once it has a thread there is nothing left to
 overlap and three columns idle. Row groups are the axis with width exactly
@@ -546,11 +546,36 @@ data file here — as parallel as it was: splitting the budget by row group
 instead measures 1.7× *slower* on that case, because there is only one row
 group to split.
 
+The third axis is **Arrow assembly**: turning decoded values and levels into
+Arrow buffers, one array per Arrow field. It used to run on the calling thread
+after the join, and once decoding was spread it was the entire serial
+remainder — `pixi run profile` put it at 32% of the mixed read and 16% of the
+wide one, and Amdahl's law on those two numbers predicted the observed scaling
+to within a few percent. `read_table` now fans it out as well, one task per
+*(batch, top-level field)* pair over the whole window, drawing from the same
+budget as everything else.
+
+**The arena does not move.** An Arrow array names its children by index into
+its batch's arena, so building the top-level fields on several threads and
+appending them as they finished would shift every index: identical values,
+different structure, which is the kind of wrong a value-comparing test cannot
+see. Each task therefore builds into its own arena starting at index 0, and
+the calling thread grafts those into the batch in field order, shifting each
+child index by the graft point — so the batch that comes out is the sequential
+one node for node, not merely one holding the same values.
+`tests/fingerprint.mojo` folds arena layout as well as buffers so that a break
+in that order fails `test_num_workers_is_bit_identical`, and
+`test_the_fingerprint_catches_a_permuted_arena` is the control that says the
+fold can see a permutation at all.
+
 **The streaming path is unchanged.** `read_batch` holds exactly one row
 group's decode state at every worker count, because that is the contract an
-iterator makes. `read_table` was always going to materialise every row group,
-so it is allowed the second axis — bounded at `num_workers` row groups of
-intermediate state, never growing with the size of the file.
+iterator makes, and it still assembles on the calling thread — a fan-out per
+batch would pay for a pool to do one batch's worth of work. `read_table` was
+always going to materialise every row group, so it is allowed the second axis
+— bounded at `num_workers` row groups of intermediate state, never growing
+with the size of the file — and the third costs no memory at all, because an
+assembly task builds the arrays the batch was going to hold anyway.
 `num_workers = 1`, the default, is a separate branch throughout: no context is
 built, no thread is started, and `_load` calls the same `_decode_leaf` the
 tasks do, straight through.
@@ -562,28 +587,34 @@ given the same file — once pinned to one thread and once with
 
 | workers | 1M × 4 cols, 18 MiB | 100k × 5 cols incl. a list, snappy |
 |---|---|---|
-| 1 | 4.91 ms (4.97) | 3.27 ms (3.29) |
-| 2 | 3.57 ms (3.64) | 2.42 ms (2.45) |
-| 4 | 2.49 ms (2.55) | 1.78 ms (1.81) |
-| 8 | **2.38 ms** (2.99) | **1.66 ms** (2.58) |
-| 10 | 2.55 ms (3.08) | 2.20 ms (2.80) |
-| pyarrow, 1 thread | 8.19 ms (8.65) | 2.47 ms (2.58) |
-| pyarrow, 10 threads | 2.73 ms (2.83) | 0.70 ms (0.83) |
+| 1 | 4.96 ms (5.02) | 3.28 ms (3.30) |
+| 2 | 3.41 ms (3.47) | 2.02 ms (2.05) |
+| 4 | 2.36 ms (2.43) | 1.15 ms (1.17) |
+| 8 | 2.17 ms (3.03) | 0.95 ms (1.25) |
+| 10 | **2.13 ms** (3.03) | **0.94 ms** (2.03) |
+| pyarrow, 1 thread | 7.82 ms (8.17) | 2.31 ms (2.44) |
+| pyarrow, 10 threads | 2.70 ms (2.83) | 0.72 ms (0.83) |
 
-**Where it bends now.** 2.06× on the wide file and 1.97× on the mixed one, at
-eight workers, and past that both get worse: ten threads on four performance
-cores is not ten cores' worth of anything. What sets the ceiling is no longer
-the widest column — it is the part that is still sequential. `pixi run
-profile` puts Arrow assembly at 16% of the wide read and 32% of the mixed one,
-and assembly happens on the calling thread after the fan-out; add the footer
-parse and Amdahl's law lands within a few percent of both numbers. That is
-also why the mixed file, with twice the sequential fraction, scales worse.
+**Where it bends now.** 2.33× on the wide file and 3.50× on the mixed one, and
+neither ladder turns over any more: before assembly was spread, both were
+*slower* at ten workers than at eight. Fitting Amdahl's law to the eight-worker
+point puts the effective serial fraction of the mixed read at 19%, down from
+43%, and the wide one at 36%, down from 41%. Most of what is left is not serial
+work — the footer parse and two pool spawn/joins are together under 0.15 ms —
+but parallel inefficiency: eight threads on four performance cores and six
+efficiency cores are not eight cores' worth of anything.
 
-**Against threaded pyarrow: one win, one loss.** On the wide file this is now
-**1.15× faster** than pyarrow with all ten of its threads (2.38 ms against
-2.73 ms), having been 1.24× behind before row groups — though pyarrow keeps a
-tighter p90. On the mixed file pyarrow is still **2.4× faster** (0.70 ms
-against 1.66 ms), and the sequential assembly pass above is where that goes.
+The wide file gains least from this, and the reason is in the profile: its
+assembly is almost all bulk buffer copying, which is bandwidth-bound, so
+spreading it across cores returns much less than the core count. The mixed
+file's assembly is Dremel work over levels — per-slot branches, not memcpy —
+and that scales.
+
+**Against threaded pyarrow.** On the wide file this is **1.27× faster** than
+pyarrow with all ten of its threads (2.13 ms against 2.70 ms), up from 1.13×.
+On the mixed file pyarrow is still ahead, but by **1.3×** (0.72 ms against
+0.94 ms) rather than the 2.3× it was — and the sequential assembly pass is no
+longer the answer for the rest. pyarrow keeps a tighter p90 on both.
 
 ## Gaps
 

@@ -409,6 +409,33 @@ struct ArrayArena(Copyable, Defaultable, Movable):
         self.nodes.append(node^)
         return len(self.nodes) - 1
 
+    def graft(mut self, mut other: Self, root: Int) -> Int:
+        """Move every node of `other` in here, keeping its order; return where
+        `root` ended up.
+
+        This is what lets an array be *built* somewhere else and still land in a
+        caller-chosen place in this arena. Children are indices, so a subtree
+        built on its own — starting at index 0 — needs every one of them shifted
+        by however many nodes are already here. Because the nodes keep their
+        relative order, the result is byte for byte the arena that building the
+        same subtree straight into this one would have produced.
+
+        That equivalence is the whole point: it is what makes it safe to build
+        several top-level fields at once and concatenate them in field order
+        afterwards, whatever order they actually finished in.
+
+        `other` is left holding that many empty arrays — an `ArrayData` owns its
+        buffers, so this moves them out one slot at a time rather than copying.
+        """
+        var base = len(self.nodes)
+        for k in range(len(other.nodes)):
+            var node = ArrayData()
+            swap(node, other.nodes[k])
+            for c in range(len(node.children)):
+                node.children[c] += base
+            self.nodes.append(node^)
+        return base + root
+
     def __len__(self) -> Int:
         return len(self.nodes)
 
