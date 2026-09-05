@@ -39,8 +39,9 @@ from parquet.arrow import (
 )
 from parquet.convert import append_null, append_value
 from parquet.encoding import PK_BOOL, PK_FIXED, PK_VAR, PhysBuffer
-from parquet.page import ColumnData
+from parquet.page import ColumnData, copy_mask_bits
 from parquet.schema import LeafColumn, ParquetSchema
+from std.memory import unsafe_memcpy
 from thrift import Type
 
 
@@ -261,10 +262,25 @@ def _fill_leaf[
     # ── validity ──────────────────────────────────────────────────────────
     # `rows` is the output length: `n` unless the filter drops slots, in which
     # case the bitmap is written at the *row* index `m`, not the slot index.
+    #
+    # `packed` is the case the chunk decoded its definition levels *as* a
+    # bitmap — `max_def == 1`, `max_rep == 0`, so a level is a bit. The
+    # validity buffer is then a shifted copy of a byte range and the null count
+    # is a popcount, instead of a pass over `n` levels. A filtered leaf is
+    # never packed (it sits under a list, so its leaf repeats), which is why
+    # the flag folds away at compile time there.
     var dense = cd.all_present
     var present = n
     var rows = n
-    if not dense:
+    var packed = cd.masked()
+    comptime if filtered:
+        packed = False
+    if not dense and packed:
+        if s0 + n > cd.num_slots:
+            return False
+        out.validity.resize((n + 7) // 8, 0)
+        present = copy_mask_bits(cd.mask, s0, out.validity, n)
+    elif not dense:
         if s0 + n > len(cd.defs):
             return False
         var defs = cd.defs.unsafe_ptr()
@@ -295,6 +311,7 @@ def _fill_leaf[
     if out.null_count == 0:
         out.validity.clear()
         dense = True
+        packed = False
 
     # ── values ────────────────────────────────────────────────────────────
     if var_len:
@@ -309,6 +326,20 @@ def _fill_leaf[
         if dense:
             for k in range(rows + 1):
                 ooff.unsafe_store(k, voff.unsafe_load(v0 + k) - Int32(base))
+        elif packed:
+            # Presence is the validity buffer this call just built, so the
+            # offsets come off one bit per slot rather than one `UInt16`.
+            var vb = out.validity.unsafe_ptr()
+            var vi = v0
+            var run = 0
+            for k in range(rows):
+                ooff.unsafe_store(k, Int32(run))
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    run += Int(voff.unsafe_load(vi + 1)) - Int(
+                        voff.unsafe_load(vi)
+                    )
+                    vi += 1
+            ooff.unsafe_store(rows, Int32(run))
         else:
             var defs = cd.defs.unsafe_ptr()
             var vi = v0
@@ -341,6 +372,16 @@ def _fill_leaf[
                 if (k & 7) == 7:
                     vp.unsafe_store(k >> 3, byte)
                     byte = 0
+        elif packed:
+            var vb = out.validity.unsafe_ptr()
+            for k in range(rows):
+                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                    if vals.bool_at(vi):
+                        byte |= UInt8(1) << UInt8(k & 7)
+                    vi += 1
+                if (k & 7) == 7:
+                    vp.unsafe_store(k >> 3, byte)
+                    byte = 0
         else:
             var defs = cd.defs.unsafe_ptr()
             var m = 0
@@ -369,6 +410,88 @@ def _fill_leaf[
     out.values.resize(rows * w, 0)
     var dst = out.values.unsafe_ptr()
     var src = vals.bytes.unsafe_ptr()
+    if packed:
+        # Spacing by *runs* rather than by slot. parquet-cpp's
+        # `SpacedExpandRightward` (`arrow/util/spaced_internal.h:66`) walks a
+        # set-bit-run reader and moves each run with one `memmove`; arrow-rs's
+        # `ValuesBuffer::pad_nulls` (`record_reader/buffer.rs:66`) is the same
+        # design over `iter_set_bits_rev`. At the null rates real data has, a
+        # run is a hundred values or more, so a chunk's 25,000 per-slot
+        # branches become a couple of hundred copies — and each copy is
+        # contiguous on both sides, which the per-slot loop never was.
+        #
+        # Forwards, not backwards: both references expand a buffer in place
+        # and have to walk from the end to avoid overwriting what they have
+        # not moved yet. `out.values` is a separate buffer, so the runs can go
+        # in the order the bitmap gives them.
+        var vb = out.validity.unsafe_ptr()
+        var vb8 = vb.unsafe_bitcast[UInt64]()
+        var vi = v0
+        var start = -1
+        var nbytes = rows >> 3
+        var b = 0
+        while b < nbytes:
+            # Eight bytes of "all valid" at a time: the overwhelmingly common
+            # shape, and the whole reason this is cheaper than a bit test.
+            if (b & 7) == 0 and b + 8 <= nbytes:
+                if vb8.unsafe_load[alignment=1](b >> 3) == UInt64.MAX:
+                    if start < 0:
+                        start = b << 3
+                    b += 8
+                    continue
+            var byte = vb.unsafe_load(b)
+            if byte == 0xFF:
+                if start < 0:
+                    start = b << 3
+                b += 1
+                continue
+            if byte == 0:
+                if start >= 0:
+                    var cnt = (b << 3) - start
+                    unsafe_memcpy(
+                        dest=dst.unsafe_offset(start * w),
+                        src=src.unsafe_offset(vi * w),
+                        count=cnt * w,
+                    )
+                    vi += cnt
+                    start = -1
+                b += 1
+                continue
+            for j in range(8):
+                if ((byte >> UInt8(j)) & 1) == 1:
+                    if start < 0:
+                        start = (b << 3) + j
+                elif start >= 0:
+                    var cnt = (b << 3) + j - start
+                    unsafe_memcpy(
+                        dest=dst.unsafe_offset(start * w),
+                        src=src.unsafe_offset(vi * w),
+                        count=cnt * w,
+                    )
+                    vi += cnt
+                    start = -1
+            b += 1
+        for k in range(nbytes << 3, rows):
+            if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                if start < 0:
+                    start = k
+            elif start >= 0:
+                var cnt = k - start
+                unsafe_memcpy(
+                    dest=dst.unsafe_offset(start * w),
+                    src=src.unsafe_offset(vi * w),
+                    count=cnt * w,
+                )
+                vi += cnt
+                start = -1
+        if start >= 0:
+            var cnt = rows - start
+            unsafe_memcpy(
+                dest=dst.unsafe_offset(start * w),
+                src=src.unsafe_offset(vi * w),
+                count=cnt * w,
+            )
+        return True
     var defs = cd.defs.unsafe_ptr()
     var vi = v0
     var m = 0
