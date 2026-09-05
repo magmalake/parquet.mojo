@@ -312,6 +312,140 @@ def decode_hybrid_into[
             done += n
 
 
+comptime HYBRID_BLOCK = 1024
+"""How many values `HybridRuns.next_block` hands out at a time.
+
+Four kilobytes of `UInt32` scratch, which stays in L1 between the decode and
+whatever consumes it. parquet-cpp's `ProcessValues` and arrow-rs's
+`RleDecoder::get_batch_with_dict` both use exactly 1024. It has to be a
+multiple of eight, for the reason `next_block` gives.
+"""
+
+
+struct HybridRuns[origin: ImmOrigin](Copyable, Movable):
+    """An RLE/bit-packed hybrid stream, read a block at a time.
+
+    `decode_hybrid_into` materialises the whole stream. A consumer that reads
+    each value once and then throws it away — the dictionary gather — pays for
+    that array twice, once written and once read straight back, and pays for
+    the allocation under it. This hands the same values out in blocks of
+    `HYBRID_BLOCK` into a scratch buffer the caller reuses.
+
+    Every run header, bit width and length is validated exactly as
+    `decode_hybrid_into` validates it, with the same errors.
+    """
+
+    var data: Span[UInt8, Self.origin]
+    var width: Int
+    var pos: Int
+    var left: Int
+    """Values still owed to the caller."""
+    var run_left: Int
+    """Values still to come out of the run in progress."""
+    var run_value: UInt64
+    var run_packed: Bool
+
+    def __init__(
+        out self, data: Span[UInt8, Self.origin], width: Int, count: Int
+    ):
+        self.data = data
+        self.width = width
+        self.pos = 0
+        self.left = count
+        self.run_left = 0
+        self.run_value = 0
+        self.run_packed = False
+
+    def __init__(out self, *, copy: Self):
+        self.data = copy.data
+        self.width = copy.width
+        self.pos = copy.pos
+        self.left = copy.left
+        self.run_left = copy.run_left
+        self.run_value = copy.run_value
+        self.run_packed = copy.run_packed
+
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data
+        self.width = move.width
+        self.pos = move.pos
+        self.left = move.left
+        self.run_left = move.run_left
+        self.run_value = move.run_value
+        self.run_packed = move.run_packed
+
+    def _load_run(mut self) raises:
+        if self.pos >= len(self.data):
+            raise Error("parquet.rle: ran out of runs before all values")
+        var head = read_uleb128(self.data, self.pos)
+        self.pos = head[1]
+        var indicator = head[0]
+        if (indicator & 1) == 1:
+            var n = Int(indicator >> 1) * 8
+            if n <= 0:
+                raise Error(String("parquet.rle: bit-packed run of ", n))
+            self.run_left = n
+            self.run_packed = True
+            return
+        var n = Int(indicator >> 1)
+        if n <= 0:
+            raise Error(String("parquet.rle: RLE run of ", n, " values"))
+        var nbytes = (self.width + 7) // 8
+        if self.pos + nbytes > len(self.data):
+            raise Error(
+                String("parquet.rle: truncated RLE run value at ", self.pos)
+            )
+        var v: UInt64 = 0
+        for k in range(nbytes):
+            v |= UInt64(self.data[self.pos + k]) << UInt64(8 * k)
+        self.pos += nbytes
+        self.run_value = v
+        self.run_left = n
+        self.run_packed = False
+
+    def next_block(
+        mut self, mut scratch: List[UInt32]
+    ) raises -> Tuple[Int, Bool]:
+        """Decode the next values into `scratch[0 : n]`; return `(n, uniform)`.
+
+        `n` is zero once every value asked for has been handed out. `uniform`
+        says the whole block came out of one repeated run, so a consumer that
+        has to validate the values can do it with one comparison instead of a
+        scan.
+
+        `scratch` must hold at least `HYBRID_BLOCK` values, and a block is that
+        many — a multiple of eight, which is what lets a bit-packed run be
+        taken a block at a time. Eight values of `width` bits are exactly
+        `width` bytes, so a block boundary inside a run is still a byte
+        boundary; only the very last block of the stream may be shorter, and
+        nothing is read after it.
+        """
+        if len(scratch) < HYBRID_BLOCK:
+            raise Error("parquet.rle: hybrid block scratch is too small")
+        if self.left == 0:
+            return (0, False)
+        while self.run_left == 0:
+            self._load_run()
+        var n = self.run_left
+        if n > HYBRID_BLOCK:
+            n = HYBRID_BLOCK
+        if n > self.left:
+            n = self.left
+        if self.run_packed:
+            _ = unpack_lsb_into[DType.uint32](
+                self.data, self.pos, self.width, n, scratch, 0
+            )
+            self.pos += (n * self.width) // 8
+        else:
+            var v = self.run_value.cast[DType.uint32]()
+            var dst = scratch.unsafe_ptr()
+            for i in range(n):
+                dst.unsafe_store(i, v)
+        self.run_left -= n
+        self.left -= n
+        return (n, not self.run_packed)
+
+
 def decode_levels_into(
     data: Span[UInt8, _],
     width: Int,

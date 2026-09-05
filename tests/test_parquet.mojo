@@ -75,6 +75,7 @@ from parquet import (
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.writer import DICT_MAX_VALUES
 from parquet.bitio import (
+    HYBRID_BLOCK,
     HybridDecoder,
     bit_width,
     read_uleb128,
@@ -84,6 +85,7 @@ from parquet.bitio import (
 )
 from parquet.bloom import read_bloom_filter
 from parquet.encoding import (
+    PK_FIXED,
     PK_VAR,
     PhysBuffer,
     decode_byte_stream_split,
@@ -91,6 +93,8 @@ from parquet.encoding import (
     decode_dict_indices,
     decode_plain,
     gather,
+    gather_dict_into,
+    gather_into,
 )
 from parquet.schema import REP_OPTIONAL, REP_REPEATED, REP_REQUIRED
 from std.memory import bitcast
@@ -1315,6 +1319,208 @@ def test_plain_and_dictionary() raises:
     var got = decode_dict_indices(Span(page), 3)
     assert_equal(len(got), 3)
     assert_equal(got[0], 1)
+
+
+# ── the fused dictionary gather ────────────────────────────────────────────
+#
+# `gather_dict_into` decodes indices, bounds-checks them and gathers them a
+# block at a time, where `decode_dict_indices` + `gather_into` make three
+# passes over a page-sized index array. The two must agree byte for byte, and
+# a corrupt index must raise identically out of either.
+
+
+def _fixed_dict(entries: Int, width: Int) raises -> PhysBuffer:
+    """A `PK_FIXED` dictionary whose entries all differ, so a gather that
+    lands on the wrong one shows up in the bytes."""
+    var d = PhysBuffer(PK_FIXED, width)
+    d.bytes.resize(entries * width, 0)
+    for k in range(entries):
+        for b in range(width):
+            d.bytes[k * width + b] = UInt8((k * 7 + b * 31) & 0xFF)
+    d.count = entries
+    return d^
+
+
+def _var_dict(entries: Int) raises -> PhysBuffer:
+    """A `PK_VAR` dictionary with values either side of the eight-byte
+    fast-copy threshold, and an empty one."""
+    var d = PhysBuffer(PK_VAR, 0)
+    for k in range(entries):
+        var v = List[UInt8]()
+        for b in range(k % 17):
+            v.append(UInt8((k * 13 + b) & 0xFF))
+        d.append_bytes(Span(v))
+    return d^
+
+
+def _test_dict(which: Int, entries: Int) raises -> PhysBuffer:
+    if which == 0:
+        return _fixed_dict(entries, 8)
+    if which == 1:
+        return _fixed_dict(entries, 4)
+    if which == 2:
+        return _fixed_dict(entries, 12)
+    return _var_dict(entries)
+
+
+def _index_pattern(which: Int, entries: Int) raises -> List[UInt16]:
+    """Index streams that between them cover every shape a hybrid run has."""
+    var idx = List[UInt16]()
+    if which == 0:  # one repeated run, several blocks long
+        for _ in range(3000):
+            idx.append(7)
+    elif which == 1:  # bit-packed throughout, several blocks
+        for i in range(3000):
+            idx.append(UInt16(i % entries))
+    elif which == 2:  # a repeated run, then bit-packed
+        for _ in range(2000):
+            idx.append(5)
+        for i in range(1500):
+            idx.append(UInt16(i % entries))
+    elif which == 3:  # shorter than one block
+        for i in range(5):
+            idx.append(UInt16((i * 3) % entries))
+    elif which == 4:  # exactly one block
+        for i in range(HYBRID_BLOCK):
+            idx.append(UInt16(i % entries))
+    elif which == 5:  # one block and one value
+        for i in range(HYBRID_BLOCK + 1):
+            idx.append(UInt16(i % entries))
+    elif which == 6:  # runs of exactly eight: many short RLE runs
+        for i in range(2500):
+            idx.append(UInt16((i // 8) % entries))
+    else:  # nothing at all
+        pass
+    return idx^
+
+
+def _index_page(indices: List[UInt16], width: Int) raises -> List[UInt8]:
+    """A dictionary-index page body: the bit width byte, then the hybrid."""
+    var page: List[UInt8] = [UInt8(width)]
+    page.extend(Span(encode_hybrid(Span(indices), width)))
+    return page^
+
+
+def test_fused_dict_gather_matches_the_unfused_one() raises:
+    """`gather_dict_into` must produce, byte for byte, what
+    `decode_dict_indices` followed by `gather_into` produces.
+
+    A bit-packed run longer than one `HYBRID_BLOCK` is the case the fused path
+    can only handle because a block is a multiple of eight values: eight
+    values of `width` bits are exactly `width` bytes, so resuming a run at a
+    block boundary is still resuming it on a byte boundary. Patterns 1, 2, 4,
+    5 and 6 all cross one.
+
+    Both buffers are primed with a page first, so the append-onto-a-non-empty
+    chunk path — the one a multi-page column chunk actually takes — is what is
+    being compared.
+    """
+    var entries = 300
+    var width = bit_width(entries - 1)
+    for kind in range(4):
+        var dict = _test_dict(kind, entries)
+        var head = _index_pattern(3, entries)
+        var head_page = _index_page(head, width)
+        for pattern in range(8):
+            var idx = _index_pattern(pattern, entries)
+            var page = _index_page(idx, width)
+            var slow = PhysBuffer(dict.kind, dict.width)
+            var fast = PhysBuffer(dict.kind, dict.width)
+            gather_into(
+                slow, dict, decode_dict_indices(Span(head_page), len(head))
+            )
+            gather_dict_into(fast, dict, Span(head_page), len(head))
+            gather_into(slow, dict, decode_dict_indices(Span(page), len(idx)))
+            gather_dict_into(fast, dict, Span(page), len(idx))
+            var tag = String("dict ", kind, " pattern ", pattern)
+            assert_equal(fast.count, slow.count, String(tag, " count"))
+            assert_equal(fast.width, slow.width, String(tag, " width"))
+            assert_equal(
+                len(fast.bytes), len(slow.bytes), String(tag, " bytes")
+            )
+            for i in range(len(slow.bytes)):
+                assert_equal(
+                    fast.bytes[i],
+                    slow.bytes[i],
+                    String(tag, " byte ", i),
+                )
+            assert_equal(
+                len(fast.offsets),
+                len(slow.offsets),
+                String(tag, " offset count"),
+            )
+            for i in range(len(slow.offsets)):
+                assert_equal(
+                    fast.offsets[i],
+                    slow.offsets[i],
+                    String(tag, " offset ", i),
+                )
+
+
+def _bad_index_pattern(which: Int, entries: Int) raises -> List[UInt16]:
+    var idx = List[UInt16]()
+    if which == 0:  # in the first bit-packed block
+        for i in range(50):
+            idx.append(UInt16(i % entries))
+        idx[7] = UInt16(entries + 100)
+    elif which == 1:  # in a later block, so the scan has to get there
+        for i in range(3000):
+            idx.append(UInt16(i % entries))
+        idx[2500] = UInt16(entries + 199)
+    elif which == 2:  # a whole repeated run: one comparison, not a scan
+        for _ in range(3000):
+            idx.append(UInt16(entries + 20))
+    elif which == 3:  # two of them in different blocks: the first has to win
+        for i in range(3000):
+            idx.append(UInt16(i % entries))
+        idx[1500] = UInt16(entries + 180)
+        idx[2500] = UInt16(entries + 190)
+    else:  # two of them in one block: the scan *within* a block is ordered too
+        for i in range(3000):
+            idx.append(UInt16(i % entries))
+        idx[1100] = UInt16(entries + 170)
+        idx[1200] = UInt16(entries + 160)
+    return idx^
+
+
+def test_fused_dict_gather_raises_the_same_error() raises:
+    """A dictionary index past the end of the dictionary must raise the same
+    error out of the fused path as out of the separate bounds pass — the same
+    index reported, the same message — wherever in the page it sits.
+
+    The check also has to happen *before* the block is gathered: an index past
+    the end is an out-of-bounds read of the dictionary's offsets, not just a
+    wrong answer.
+    """
+    var entries = 300
+    var width = bit_width(entries + 200)
+    for kind in range(4):
+        var dict = _test_dict(kind, entries)
+        for bad in range(5):
+            var idx = _bad_index_pattern(bad, entries)
+            var page = _index_page(idx, width)
+            var tag = String("dict ", kind, " case ", bad)
+
+            var want = String()
+            var slow = PhysBuffer(dict.kind, dict.width)
+            try:
+                gather_into(
+                    slow, dict, decode_dict_indices(Span(page), len(idx))
+                )
+            except e:
+                want = String(e)
+            assert_true(
+                want.find("out of range") >= 0,
+                String(tag, ": the unfused path did not raise"),
+            )
+
+            var got = String()
+            var fast = PhysBuffer(dict.kind, dict.width)
+            try:
+                gather_dict_into(fast, dict, Span(page), len(idx))
+            except e:
+                got = String(e)
+            assert_equal(got, want, tag)
 
 
 def test_byte_stream_split_round_trip() raises:
