@@ -61,7 +61,7 @@ As a dependency declaration, or for a nightly consumer:
 parquet-mojo = { git = "https://github.com/magmalake/parquet.mojo" }
 ```
 
-The package's `.mojopkg` is built with stable Mojo 1.0.0 and the nightly
+The compiled package `.mojoc` is built with stable Mojo 1.0.0 and the nightly
 compiler will not load it, so a nightly consumer should put the source on the
 include path instead and check the sibling tins out next to it:
 
