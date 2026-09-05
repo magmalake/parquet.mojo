@@ -124,12 +124,20 @@ def bench_read_wide(mut b: Benchmark) raises:
 
 # ── decode, on more than one core ───────────────────────────────────────────
 #
-# `ParquetReader.num_workers` fans the column chunks of a row group out over
-# threads, so the ceiling is the number of projected columns: bench-wide has
-# four and big.parquet five. `_w1` goes through the same helper as the rest,
-# which makes it the honest baseline for the ladder — and comparing it with
-# `bench_read_wide`/`bench_read_big` above shows what, if anything, the extra
-# `num_workers` store and the refactored `_load` cost the sequential path.
+# `ParquetReader.num_workers` is one budget over two axes: the column chunks of
+# a row group, and the row groups themselves. Per column alone the ceiling is
+# the projected column count — four on bench-wide, five on big.parquet — and in
+# practice lower, because a read is only as parallel as its slowest chunk.
+# `read_table` adds the second axis, and both fixtures have four row groups.
+#
+# `_w1` goes through the same helper as the rest, which makes it the honest
+# baseline for the ladder — and comparing it with `bench_read_wide` /
+# `bench_read_big` above shows what, if anything, the extra `num_workers` store
+# and the refactored `_load` cost the sequential path.
+#
+# `_rg0_` is the case with no second axis at all: one row group selected out of
+# `big.parquet`'s four, which must not be slower than it was before this
+# existed.
 #
 # Run one ladder at a time when you want numbers to quote:
 #
@@ -151,6 +159,33 @@ def _bench_read_workers(
 
     b.iter[call]()
     keep(data)
+
+
+def _bench_read_one_row_group(mut b: Benchmark, workers: Int) raises:
+    """`big.parquet` restricted to row group 0: 25k rows, five columns, and
+    nothing for the row-group axis to do."""
+    var data = _read_file(String(FIXTURES, "big.parquet"))
+    b.throughput(Metric.elements(), 25000)
+
+    @parameter
+    def call() raises:
+        var r = ParquetReader[DefaultCodecs].from_span(Span(data))
+        r.verify_crc = False
+        r.num_workers = workers
+        var only: List[Int] = [0]
+        r.select_row_groups(only^)
+        keep(r.read_table().num_rows)
+
+    b.iter[call]()
+    keep(data)
+
+
+def bench_read_big_rg0_w1(mut b: Benchmark) raises:
+    _bench_read_one_row_group(b, 1)
+
+
+def bench_read_big_rg0_w4(mut b: Benchmark) raises:
+    _bench_read_one_row_group(b, 4)
 
 
 def bench_read_wide_w1(mut b: Benchmark) raises:

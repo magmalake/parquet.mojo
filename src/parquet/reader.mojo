@@ -366,6 +366,18 @@ def _no_chunk_meta(rg: Int, leaf: Int) -> Error:
     )
 
 
+def _bad_chunk_count(rg: Int, got: Int, nleaves: Int) -> String:
+    return String(
+        "parquet: row group ",
+        rg,
+        " has ",
+        got,
+        " column chunk(s) for a schema with ",
+        nleaves,
+        " leaves",
+    )
+
+
 def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
     return String(
         "parquet: column '",
@@ -376,7 +388,7 @@ def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
     )
 
 
-# ── the unit of a row-group load, and its fan-out ───────────────────────────
+# ── the unit of a load, and its two axes of fan-out ─────────────────────────
 #
 # `_load` decodes one column chunk per leaf and then walks its levels once to
 # build the per-row indices `_assemble` slices with. That whole per-leaf body
@@ -384,6 +396,21 @@ def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
 # outputs — which is what makes it safe to run several of them at once.
 # `ParquetReader.num_workers` says how many; 1, the default, calls it straight
 # from `_load` on the calling thread with no threading machinery in the way.
+#
+# There are two independent things to run at once, and they share one work
+# list rather than nesting. A task is a *(row group, leaf)* pair:
+#
+#   * across leaves of one row group — the axis whose ceiling is the slowest
+#     column chunk, because once the widest column has a thread the rest run
+#     out of work;
+#   * across row groups — which has width exactly where the other one does
+#     not, and is only available where every row group is being read anyway.
+#
+# `_decode_groups` flattens every pair it is asked for into one flat list and
+# hands it to one `parallel_for`, so `num_workers` is a single budget for both
+# axes and nesting can never oversubscribe it. The streaming path asks for one
+# row group and gets the first axis alone; `read_table` asks for a window of
+# them and gets both.
 
 
 def _decode_leaf[
@@ -489,80 +516,38 @@ def _decode_leaf[
         vp.unsafe_store(rows, nvals)
 
 
-struct _LoadCtx(Movable):
-    """Everything a threaded row-group load reads, and where it writes.
+struct _RowGroupData(Defaultable, Movable):
+    """One row group's decode state — what a loaded reader holds.
 
-    The outputs are sized to one slot per *leaf* — not per task — and filled in
-    at the leaf's own index, so the lists come out in exactly the order the
-    sequential loop appends them in and `_load` can move them straight into the
-    reader. Task `k` reads `metas[k]`/`leaves[k]` and writes only the four
-    slots at `which[k]`, so the tasks share nothing and need no lock; the file
-    bytes they all read are immutable for the life of the reader.
+    One slot per leaf of the *file* schema, not per projected leaf, so a leaf's
+    index here is the same number it has everywhere else and a projection
+    leaves empty slots rather than renumbering anything.
     """
 
-    var file: FileBytes
-    var metas: List[ColumnMetaData]
-    """The chunk metadata of each *needed* leaf, copied so no worker reads
-    through the reader while `_load` holds it mutably."""
-    var leaves: List[LeafColumn]
-    var which: List[Int]
-    """Task `k` decodes leaf `which[k]`."""
-    var rows: Int
-    var verify_crc: Bool
+    var rg: Int
+    """The row group this holds, or -1 once it has been handed to the reader."""
     var chunks: List[ColumnData]
     var flat: List[Bool]
     var slot: List[List[Int]]
     var value: List[List[Int]]
-    var errors: List[String]
-    """Per leaf, empty when it decoded. A task cannot raise — pthread has no
-    exception channel — so a failure lands in its own leaf's slot and `_load`
-    re-raises it in leaf order after the join, which is why the error a corrupt
-    file gives does not depend on which worker lost."""
 
-    def __init__(
-        out self,
-        file: FileBytes,
-        var metas: List[ColumnMetaData],
-        var leaves: List[LeafColumn],
-        var which: List[Int],
-        nleaves: Int,
-        rows: Int,
-        verify_crc: Bool,
-    ):
-        self.file = file
-        self.metas = metas^
-        self.leaves = leaves^
-        self.which = which^
-        self.rows = rows
-        self.verify_crc = verify_crc
+    def __init__(out self):
+        self.rg = -1
         self.chunks = List[ColumnData]()
         self.flat = List[Bool]()
         self.slot = List[List[Int]]()
         self.value = List[List[Int]]()
-        self.errors = List[String]()
-        for _ in range(nleaves):
-            self.chunks.append(ColumnData())
-            self.flat.append(False)
-            self.slot.append(List[Int]())
-            self.value.append(List[Int]())
-            self.errors.append(String())
 
     def __init__(out self, *, deinit move: Self):
-        self.file = move.file
-        self.metas = move.metas^
-        self.leaves = move.leaves^
-        self.which = move.which^
-        self.rows = move.rows
-        self.verify_crc = move.verify_crc
+        self.rg = move.rg
         self.chunks = move.chunks^
         self.flat = move.flat^
         self.slot = move.slot^
         self.value = move.value^
-        self.errors = move.errors^
 
-    # The four outputs, moved out; the context keeps an empty list in place.
-    # A field cannot be transferred out of the middle of a live value, and the
-    # context is still live at this point, so each one swaps rather than moves.
+    # The four outputs, moved out; the value keeps an empty list in place. A
+    # field cannot be transferred out of the middle of a live value, and this
+    # one is still live at that point, so each one swaps rather than moves.
 
     def take_chunks(mut self) -> List[ColumnData]:
         var taken = self.chunks^
@@ -585,28 +570,143 @@ struct _LoadCtx(Movable):
         return taken^
 
 
-def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
-    """One column chunk, on whichever worker drew task `k`.
+struct _LoadCtx(Movable):
+    """Everything a threaded decode reads, and where it writes.
 
-    Writes only the four output slots at leaf index `which[k]` — or, on a
-    failure, that leaf's error slot — none of which another task touches, and
-    reads only fields nothing writes while the fan-out runs.
+    A task is one *(row group, leaf)* pair, and both axes of parallelism go
+    through this one flat list: the streaming path asks for a single row group
+    and gets the per-column fan-out, `read_table` asks for a window of them and
+    gets that fan-out across every row group in the window at once. Either way
+    there is one pool drawing from one queue, so composing the axes cannot
+    oversubscribe `num_workers`.
+
+    The outputs are sized `ngroups * nleaves` and written at
+    `group * nleaves + leaf` — the task's own `dest[k]`, which no other task
+    touches. So the tasks need no lock, the file bytes they all read are
+    immutable for the life of the reader, and the lists come out group-major
+    and leaf-minor: exactly the order the sequential loop produces them in,
+    which is what makes row order independent of which worker finished when.
     """
-    var i = ctx.which[k]
+
+    var file: FileBytes
+    var verify_crc: Bool
+    var nleaves: Int
+    var rgs: List[Int]
+    """The row group each group slot holds, in visit order."""
+    var metas: List[ColumnMetaData]
+    """The chunk metadata of each queued leaf, copied so no worker reads
+    through the reader while the caller holds it mutably."""
+    var leaves: List[LeafColumn]
+    var rows: List[Int]
+    var dest: List[Int]
+    """Task `k` writes the output slots at `dest[k]`."""
+    var chunks: List[ColumnData]
+    var flat: List[Bool]
+    var slot: List[List[Int]]
+    var value: List[List[Int]]
+    var errors: List[String]
+    """Per output slot, empty when it decoded. A task cannot raise — pthread
+    has no exception channel — so a failure lands in its own slot and the
+    caller re-raises it in group-then-leaf order after the join, which is why
+    the error a corrupt file gives does not depend on which worker lost."""
+    var fatal: List[String]
+    """Per group, a failure that stops a whole row group before any of its
+    leaves is queued. Recorded rather than raised on the spot so that the
+    *first* failure in visit order is the one that reaches the caller, which is
+    what the sequential path does."""
+
+    def __init__(
+        out self,
+        file: FileBytes,
+        verify_crc: Bool,
+        nleaves: Int,
+        ngroups: Int,
+    ):
+        self.file = file
+        self.verify_crc = verify_crc
+        self.nleaves = nleaves
+        self.rgs = List[Int](length=ngroups, fill=-1)
+        self.metas = List[ColumnMetaData]()
+        self.leaves = List[LeafColumn]()
+        self.rows = List[Int]()
+        self.dest = List[Int]()
+        self.chunks = List[ColumnData]()
+        self.flat = List[Bool]()
+        self.slot = List[List[Int]]()
+        self.value = List[List[Int]]()
+        self.errors = List[String]()
+        self.fatal = List[String]()
+        for _ in range(ngroups * nleaves):
+            self.chunks.append(ColumnData())
+            self.flat.append(False)
+            self.slot.append(List[Int]())
+            self.value.append(List[Int]())
+            self.errors.append(String())
+        for _ in range(ngroups):
+            self.fatal.append(String())
+
+    def __init__(out self, *, deinit move: Self):
+        self.file = move.file
+        self.verify_crc = move.verify_crc
+        self.nleaves = move.nleaves
+        self.rgs = move.rgs^
+        self.metas = move.metas^
+        self.leaves = move.leaves^
+        self.rows = move.rows^
+        self.dest = move.dest^
+        self.chunks = move.chunks^
+        self.flat = move.flat^
+        self.slot = move.slot^
+        self.value = move.value^
+        self.errors = move.errors^
+        self.fatal = move.fatal^
+
+    def take_group(mut self, g: Int) -> _RowGroupData:
+        """Group `g`'s outputs, lifted out of the flat lists.
+
+        Swapped out one slot at a time, leaving empties behind: the context is
+        still live, and a `ColumnData` holds the decoded buffers, so this must
+        move rather than copy.
+        """
+        var out = _RowGroupData()
+        out.rg = self.rgs[g]
+        var base = g * self.nleaves
+        for i in range(self.nleaves):
+            var cd = ColumnData()
+            swap(cd, self.chunks[base + i])
+            out.chunks.append(cd^)
+            out.flat.append(self.flat[base + i])
+            var s = List[Int]()
+            swap(s, self.slot[base + i])
+            out.slot.append(s^)
+            var v = List[Int]()
+            swap(v, self.value[base + i])
+            out.value.append(v^)
+        return out^
+
+
+def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
+    """One column chunk of one row group, on whichever worker drew task `k`.
+
+    Writes only the four output slots at `dest[k]` — or, on a failure, that
+    slot's error cell — none of which another task touches, and reads only
+    fields nothing writes while the fan-out runs.
+    """
+    var d = ctx.dest[k]
     try:
         _decode_leaf[Codecs](
             ctx.file,
             ctx.metas[k],
             ctx.leaves[k],
             ctx.verify_crc,
-            ctx.rows,
-            ctx.chunks[i],
-            ctx.flat[i],
-            ctx.slot[i],
-            ctx.value[i],
+            ctx.rows[k],
+            ctx.chunks[d],
+            ctx.flat[d],
+            ctx.slot[d],
+            ctx.value[d],
         )
     except e:
-        ctx.errors[i] = String(e)
+        ctx.errors[d] = String(e)
 
 
 struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
@@ -622,13 +722,14 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var batch_size: Int
     var verify_crc: Bool
     var num_workers: Int
-    """How many OS threads decode the column chunks of a row group at once.
+    """How many OS threads decode column chunks at once.
 
     `1`, the default, decodes every chunk on the calling thread and is what
     every existing caller gets: the sequential path is the same code it always
     was, with no pool started and no task context built. `0` means one worker
     per core. Anything else is that many workers, clamped down to the number of
-    projected leaves — a two-column read gains nothing from ten threads.
+    tasks there actually are — a two-column read gains nothing from ten
+    threads.
 
     A column chunk is the unit because it is where the time is: on the wide
     benchmark, dictionary gather, value decoding, decompression and the
@@ -637,6 +738,26 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     the immutable file bytes and the output is identical whatever the worker
     count — asserted over the whole fixture corpus by
     `test_num_workers_is_bit_identical`.
+
+    **Two axes, one budget.** A task is a *(row group, leaf)* pair, and this
+    number is the whole thread budget for both:
+
+    * every read fans out across the leaves of the row group it is loading;
+    * `read_table` *additionally* fans out across row groups, because it is
+      the one entry point that was always going to visit all of them.
+
+    Per-leaf parallelism alone is bounded by the slowest column chunk — one
+    fat dictionary-encoded string column is most of a wide read on its own, so
+    past two or four threads the others idle. Row groups are the axis that
+    still has width there. The two never nest: `_decode_groups` flattens the
+    pairs into one work list for one pool, so `num_workers = 4` means four
+    threads and not four times however many columns.
+
+    **Memory.** The streaming path — `read_batch`, `has_next`, and the reader's
+    own iteration — is untouched and still holds exactly one row group's decode
+    state, whatever this is set to. `read_table` decodes up to `num_workers`
+    row groups at a time (see `read_table`), so past `1` it trades a bounded
+    amount of peak memory for the second axis. Nothing changes at `1`.
     """
     var _row_groups: List[Int]
     var _roots: List[Int]
@@ -662,6 +783,14 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var _row_value: List[List[Int]]
     """Per leaf, the first *value* of each row. Empty when every slot of the
     chunk is present, in which case the value index is the slot index."""
+    var _prefetched: List[_RowGroupData]
+    """Row groups `read_table` decoded ahead, in visit order.
+
+    Only ever non-empty inside a threaded `read_table`: `_load` takes a group
+    out of here instead of decoding it, and everything downstream of `_load` —
+    batching, assembly, row order — is the code it always was. Empty for every
+    other caller, which is what keeps the streaming memory contract intact.
+    """
 
     def __init__(out self, var data: List[UInt8]) raises:
         """Take ownership of the file bytes."""
@@ -713,6 +842,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_flat = List[Bool]()
         self._row_slot = List[List[Int]]()
         self._row_value = List[List[Int]]()
+        self._prefetched = List[_RowGroupData]()
 
     def __init__(out self, *, deinit move: Self):
         self._owned = move._owned^
@@ -737,6 +867,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_flat = move._row_flat^
         self._row_slot = move._row_slot^
         self._row_value = move._row_value^
+        self._prefetched = move._prefetched^
 
     @staticmethod
     def open(path: StringSlice) raises -> Self:
@@ -838,6 +969,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         for r in rs:
             self._mark(r)
         self._loaded_rg = -1
+        self._drop_prefetch()
 
     def _include_subtree(self, fi: Int, mut inc: List[Bool]):
         inc[fi] = True
@@ -904,6 +1036,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 self._needed[self.schema.fields[f].leaf] = True
         self._include = inc^
         self._loaded_rg = -1
+        self._drop_prefetch()
 
     def select_field_ids_deep(mut self, ids: List[Int32]) raises:
         """`select_fields`, addressing the fields by Parquet field id."""
@@ -978,31 +1111,60 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_pos = 0
         self._did_empty = False
         self._loaded_rg = -1
+        self._drop_prefetch()
+
+    def _resolved_workers(self) -> Int:
+        """`num_workers` with `0` spelt out as the core count."""
+        var w = self.num_workers
+        if w == 0:
+            w = num_cpus()
+        if w < 1:
+            w = 1
+        return w
+
+    def _drop_prefetch(mut self):
+        self._prefetched = List[_RowGroupData]()
+
+    def _take_prefetched(mut self, rg: Int) -> Bool:
+        """Adopt a row group `read_table` already decoded, if it is there.
+
+        A miss is not an error: the streaming path never prefetches, a row
+        group can appear twice in an explicit `select_row_groups`, and a group
+        is only ever handed out once. Whoever misses decodes it the ordinary
+        way.
+        """
+        for g in range(len(self._prefetched)):
+            if self._prefetched[g].rg != rg:
+                continue
+            self._prefetched[g].rg = -1
+            self._chunks = self._prefetched[g].take_chunks()
+            self._row_flat = self._prefetched[g].take_flat()
+            self._row_slot = self._prefetched[g].take_slot()
+            self._row_value = self._prefetched[g].take_value()
+            self._loaded_rg = rg
+            return True
+        return False
 
     def _load(mut self, rg: Int) raises:
         if self._loaded_rg == rg:
             return
         var nleaves = len(self.schema.leaves)
+        # Drop the row group being replaced before anything else, so that at
+        # most one loaded group is alive at a time on this side of the reader.
         self._chunks = List[ColumnData]()
         self._row_flat = List[Bool]()
         self._row_slot = List[List[Int]]()
         self._row_value = List[List[Int]]()
+        if self._take_prefetched(rg):
+            return
         var rows = Int(self.meta.row_groups[rg].num_rows)
         if len(self.meta.row_groups[rg].columns) != nleaves:
             raise Error(
-                String(
-                    "parquet: row group ",
-                    rg,
-                    " has ",
-                    len(self.meta.row_groups[rg].columns),
-                    " column chunk(s) for a schema with ",
-                    nleaves,
-                    " leaves",
+                _bad_chunk_count(
+                    rg, len(self.meta.row_groups[rg].columns), nleaves
                 )
             )
-        var workers = self.num_workers
-        if workers == 0:
-            workers = num_cpus()
+        var workers = self._resolved_workers()
         if workers > 1:
             var projected = 0
             for i in range(nleaves):
@@ -1011,7 +1173,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             if workers > projected:
                 workers = projected
         if workers > 1:
-            self._load_threaded(rg, rows, nleaves, workers)
+            self._load_threaded(rg, nleaves, workers)
             return
         for i in range(nleaves):
             if not self._needed[i]:
@@ -1044,51 +1206,118 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             self._row_value.append(value^)
         self._loaded_rg = rg
 
-    def _load_threaded(
-        mut self, rg: Int, rows: Int, nleaves: Int, workers: Int
-    ) raises:
-        """`_load`'s body on `workers` threads, one task per projected leaf.
+    def _decode_groups(
+        self, rgs: List[Int], nleaves: Int, workers: Int
+    ) raises -> List[_RowGroupData]:
+        """Decode every projected leaf of every row group in `rgs`, threaded.
+
+        This is the whole fan-out, and the only one. Every *(row group, leaf)*
+        pair becomes one task in one flat list handed to one `parallel_for`, so
+        a window of row groups and the columns inside them draw from a single
+        queue of `workers` threads: the axes compose by flattening, never by
+        nesting a pool inside a pool.
 
         The metadata each task needs is copied into the context on the calling
-        thread, before any worker starts, so a chunk with no metadata still
-        raises from here and in leaf order — the same error the sequential path
-        gives, whatever `num_workers` is.
+        thread, before any worker starts, so no worker reads through the
+        reader while it runs.
+
+        Tasks are queued in group-then-leaf order, which is also file order,
+        and that turns out to matter: `parallel_for` draws from one counter, so
+        the queue order *is* the schedule. Queueing the largest chunks first —
+        the textbook longest-processing-time-first fix for the tail — is worth
+        12% at two workers on the wide fixture and costs 22% at eight on the
+        mixed one, because it starts every fat dictionary column at once and
+        they contend for memory bandwidth rather than for cores. File order
+        spreads them out. This is measured, not assumed; see the PR.
+
+        Failures do not race to the caller. A task writes into its own error
+        cell, a row group that cannot be queued at all writes into its own
+        `fatal` cell, and both are scanned in group-then-leaf order after the
+        join — so a corrupt file raises with the first failure in *visit*
+        order, the same message the sequential path gives, at any worker count.
+
+        The result is one `_RowGroupData` per entry of `rgs`, in that order.
         """
-        var metas = List[ColumnMetaData]()
-        var leaves = List[LeafColumn]()
-        var which = List[Int]()
-        for i in range(nleaves):
-            if not self._needed[i]:
+        var ngroups = len(rgs)
+        var ctx = _LoadCtx(self.data, self.verify_crc, nleaves, ngroups)
+        for g in range(ngroups):
+            var rg = rgs[g]
+            ctx.rgs[g] = rg
+            var cols = len(self.meta.row_groups[rg].columns)
+            if cols != nleaves:
+                ctx.fatal[g] = _bad_chunk_count(rg, cols, nleaves)
                 continue
-            ref chunk = self.meta.row_groups[rg].columns[i]
-            if not chunk.meta_data:
-                raise _no_chunk_meta(rg, i)
-            metas.append(chunk.meta_data.value().copy())
-            leaves.append(self.schema.leaves[i].copy())
-            which.append(i)
-        var n = len(which)
-        var ctx = _LoadCtx(
-            self.data,
-            metas^,
-            leaves^,
-            which^,
-            nleaves,
-            rows,
-            self.verify_crc,
-        )
+            var rows = Int(self.meta.row_groups[rg].num_rows)
+            for i in range(nleaves):
+                if not self._needed[i]:
+                    continue
+                ref chunk = self.meta.row_groups[rg].columns[i]
+                if not chunk.meta_data:
+                    ctx.errors[g * nleaves + i] = String(_no_chunk_meta(rg, i))
+                    continue
+                ctx.metas.append(chunk.meta_data.value().copy())
+                ctx.leaves.append(self.schema.leaves[i].copy())
+                ctx.rows.append(rows)
+                ctx.dest.append(g * nleaves + i)
+        var n = len(ctx.dest)
         # The typed `parallel_for` holds `ctx` for the whole call, joins
         # included, so nothing has to mention it afterwards to keep it alive.
         parallel_for[_decode_leaf_task[Self.Codecs]](
             n, ctx, num_workers=workers
         )
-        for i in range(nleaves):
-            if ctx.errors[i]:
-                raise Error(ctx.errors[i])
-        self._chunks = ctx.take_chunks()
-        self._row_flat = ctx.take_flat()
-        self._row_slot = ctx.take_slot()
-        self._row_value = ctx.take_value()
+        for g in range(ngroups):
+            if ctx.fatal[g]:
+                raise Error(ctx.fatal[g])
+            for i in range(nleaves):
+                if ctx.errors[g * nleaves + i]:
+                    raise Error(ctx.errors[g * nleaves + i])
+        var out = List[_RowGroupData]()
+        for g in range(ngroups):
+            out.append(ctx.take_group(g))
+        return out^
+
+    def _load_threaded(mut self, rg: Int, nleaves: Int, workers: Int) raises:
+        """`_load`'s body on `workers` threads, one task per projected leaf.
+
+        A window of exactly one row group: the second axis has no width here,
+        because the streaming path has no licence to decode a row group the
+        caller has not asked for yet.
+        """
+        var one: List[Int] = [rg]
+        var got = self._decode_groups(one, nleaves, workers)
+        self._chunks = got[0].take_chunks()
+        self._row_flat = got[0].take_flat()
+        self._row_slot = got[0].take_slot()
+        self._row_value = got[0].take_value()
         self._loaded_rg = rg
+
+    def _prefetch(mut self, first: Int, past: Int, workers: Int) raises:
+        """Decode the row groups at selection slots `[first, past)` in one go.
+
+        Skips what the iterator will never load — a row group with no rows, one
+        page pruning emptied, and a repeat of one already in this window — so
+        that a threaded `read_table` decodes exactly the row groups a
+        sequential one does and no more.
+        """
+        var rgs = List[Int]()
+        for s in range(first, past):
+            var rg = self._row_groups[s]
+            if Int(self.meta.row_groups[rg].num_rows) == 0:
+                continue
+            if len(self._ranges_for(s)) == 0:
+                continue
+            var seen = False
+            for k in range(len(rgs)):
+                if rgs[k] == rg:
+                    seen = True
+                    break
+            if seen:
+                continue
+            rgs.append(rg)
+        if len(rgs) == 0:
+            return
+        var got = self._decode_groups(rgs, len(self.schema.leaves), workers)
+        self._prefetched = got^
 
     def _ranges_for(self, slot: Int) -> List[Tuple[Int, Int]]:
         """The row ranges to read from the row group at `slot`."""
@@ -1264,13 +1493,61 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         return total
 
     def read_table(mut self) raises -> Table:
-        """Every selected row group, as a list of batches."""
+        """Every selected row group, as a list of batches.
+
+        This is the one entry point that parallelises across **row groups** as
+        well as columns, and the reason is a memory contract rather than a
+        performance one. `read_table` was always going to hold every row group
+        of the selection at once — that is what returning a `Table` means — so
+        decoding several of them at once asks for no lifetime the caller was
+        not already granting. The streaming path makes the opposite promise,
+        and keeps it: `read_batch` holds one row group and is untouched.
+
+        What it does add is intermediate state. A loaded row group holds
+        decompressed pages, level arrays and per-row indices *on top of* the
+        Arrow batches built from them, and sequentially only one row group's
+        worth is ever alive. So the window is capped at `num_workers` row
+        groups: peak decode state grows by at most `num_workers - 1` row groups
+        over the sequential path, never with the size of the file, and at
+        `num_workers = 1` — the default — this is the same loop it always was,
+        byte for byte and allocation for allocation.
+
+        Within a window the batches are still cut, assembled and appended by
+        the ordinary iterator, in file order, on this thread. Row groups
+        finishing out of order changes which row group is *decoded* first and
+        nothing about which rows come out first.
+        """
         self.rewind()
         var t = Table()
-        while self.has_next():
-            var b = self.read_batch()
-            t.num_rows += b.num_rows
-            t.batches.append(b^)
+        var workers = self._resolved_workers()
+        var nsel = len(self._row_groups)
+        if workers <= 1 or nsel <= 1:
+            while self.has_next():
+                var b = self.read_batch()
+                t.num_rows += b.num_rows
+                t.batches.append(b^)
+            return t^
+        var window = workers
+        if window > nsel:
+            window = nsel
+        var first = 0
+        while first < nsel:
+            var past = first + window
+            if past > nsel:
+                past = nsel
+            self._prefetch(first, past, workers)
+            while self.has_next():
+                if self._rg_pos >= past:
+                    break
+                var b = self.read_batch()
+                t.num_rows += b.num_rows
+                t.batches.append(b^)
+            self._drop_prefetch()
+            # `has_next` may have walked past the window looking for a row to
+            # hand out; the next window starts wherever it stopped.
+            first = past
+            if self._rg_pos > first:
+                first = self._rg_pos
         return t^
 
 
