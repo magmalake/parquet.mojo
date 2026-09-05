@@ -122,6 +122,77 @@ def bench_read_wide(mut b: Benchmark) raises:
     keep(data)
 
 
+# ── decode, on more than one core ───────────────────────────────────────────
+#
+# `ParquetReader.num_workers` fans the column chunks of a row group out over
+# threads, so the ceiling is the number of projected columns: bench-wide has
+# four and big.parquet five. `_w1` goes through the same helper as the rest,
+# which makes it the honest baseline for the ladder — and comparing it with
+# `bench_read_wide`/`bench_read_big` above shows what, if anything, the extra
+# `num_workers` store and the refactored `_load` cost the sequential path.
+#
+# Run one ladder at a time when you want numbers to quote:
+#
+#     pixi run -e bench bench -- --only bench_read_wide_w1 bench_read_wide_w2 …
+
+
+def _bench_read_workers(
+    mut b: Benchmark, path: StringSlice, workers: Int
+) raises:
+    var data = _read_file(String(path))
+    b.throughput(Metric.elements(), _rows_in(data))
+
+    @parameter
+    def call() raises:
+        var r = ParquetReader[DefaultCodecs].from_span(Span(data))
+        r.verify_crc = False
+        r.num_workers = workers
+        keep(r.read_table().num_rows)
+
+    b.iter[call]()
+    keep(data)
+
+
+def bench_read_wide_w1(mut b: Benchmark) raises:
+    _bench_read_workers(b, WIDE, 1)
+
+
+def bench_read_wide_w2(mut b: Benchmark) raises:
+    _bench_read_workers(b, WIDE, 2)
+
+
+def bench_read_wide_w4(mut b: Benchmark) raises:
+    _bench_read_workers(b, WIDE, 4)
+
+
+def bench_read_wide_w8(mut b: Benchmark) raises:
+    _bench_read_workers(b, WIDE, 8)
+
+
+def bench_read_wide_w10(mut b: Benchmark) raises:
+    _bench_read_workers(b, WIDE, 10)
+
+
+def bench_read_big_w1(mut b: Benchmark) raises:
+    _bench_read_workers(b, String(FIXTURES, "big.parquet"), 1)
+
+
+def bench_read_big_w2(mut b: Benchmark) raises:
+    _bench_read_workers(b, String(FIXTURES, "big.parquet"), 2)
+
+
+def bench_read_big_w4(mut b: Benchmark) raises:
+    _bench_read_workers(b, String(FIXTURES, "big.parquet"), 4)
+
+
+def bench_read_big_w8(mut b: Benchmark) raises:
+    _bench_read_workers(b, String(FIXTURES, "big.parquet"), 8)
+
+
+def bench_read_big_w10(mut b: Benchmark) raises:
+    _bench_read_workers(b, String(FIXTURES, "big.parquet"), 10)
+
+
 # ── encode ──────────────────────────────────────────────────────────────────
 #
 # Decoding happens in setup, so what is timed is Arrow batches to Parquet
@@ -180,7 +251,7 @@ def _print_shape() raises:
         String(FIXTURES, "v2pages.parquet"),
         String(WIDE),
     ]
-    print("parquet.mojo benchmarks (single threaded)")
+    print("parquet.mojo benchmarks (the `_wN` ladders use N reader threads)")
     for i in range(len(names)):
         # A missing file is reported, not raised: the wide fixture is
         # generated rather than committed, and `--skip bench_read_wide

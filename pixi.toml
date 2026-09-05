@@ -10,10 +10,21 @@ platforms = ["osx-arm64", "linux-64"]
 # Sibling magmalake tins are consumed by *source path* (`-I ../x.mojo/src`),
 # never as built `.mojopkg`: pixi-build-mojo emits a package compiled with
 # mojo-compiler 1.0.0 and the nightly compiler refuses to load it. CI checks
-# each sibling out next to this repository.
+# each sibling out next to this repository, at that repository's `main`.
+#
+# threads.mojo is one of those source-path siblings and needs nothing else: it
+# calls the pthread symbols libc already exports, with no shim and no build
+# step. It is a *required* dependency rather than an optional feature —
+# `ParquetReader.num_workers` lives on the reader, so `parquet.reader` imports
+# `threads` unconditionally, and pixi has no way to make a package dependency
+# in `[package.run-dependencies]` conditional on a feature anyway. The
+# threading itself is opt-in at run time (`num_workers` defaults to 1), not at
+# build time. `threads-mojo` 0.4.0 is the floor: the typed `parallel_for` this
+# uses arrived in 0.3.0, but the pinned rev below is what the registry
+# published for 0.4.0, and a package dependency has to name a published rev.
 [tasks]
 # macOS wants .dylib, Linux .so; the shared-library tasks read $SHLIB_EXT.
-test = { cmd = "mkdir -p build && mojo build tests/test_parquet.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-test && ./build/parquet-test" }
+test = { cmd = "mkdir -p build && mojo build tests/test_parquet.mojo -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-test && ./build/parquet-test" }
 # mojolint (lint-mojo, below): the origin and threading mistakes the compiler
 # lets through, with mojo-lsp-server behind the rules. Exit 1 on findings.
 # `src/parquet/ext_full.mojo` imports zstd/lz4/brotli, which are not on this
@@ -21,14 +32,14 @@ test = { cmd = "mkdir -p build && mojo build tests/test_parquet.mojo -I src -I t
 # mode for that file; `lint-codecs` (below) resolves it fully. `tests` also
 # holds `test_codecs.mojo` (same missing imports) and the rest of `tests/`,
 # `src` all clean.
-lint = { cmd = "mojolint --lsp -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src src tests" }
+lint = { cmd = "mojolint --lsp -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src src tests" }
 # tools/write_fixtures.mojo imports tests/fixtures_list.mojo, hence -I tests;
 # tools/conformance.mojo imports parquet.ext_full (zstd/lz4/brotli, missing
 # here too) but `lint-codecs` covers it fully — see the same note on `lint`.
-lint-tools = { cmd = "mojolint --lsp -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src tools" }
+lint-tools = { cmd = "mojolint --lsp -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src tools" }
 check = { depends-on = ["test", "cli", "lint", "lint-tools"] }
-cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-mojo" }
-profile = { cmd = "mkdir -p build && mojo build bench/profile_parquet.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-profile && ./build/parquet-profile" }
+cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-mojo" }
+profile = { cmd = "mkdir -p build && mojo build bench/profile_parquet.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/parquet-profile && ./build/parquet-profile" }
 fmt = { cmd = "mojo format src tests bench" }
 # `mojo format` has no check mode in 1.0.0 — it rejects `--check` outright — so
 # the check is: format, then assert the tree did not move. It rewrites the files
@@ -38,27 +49,43 @@ format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- s
 # Regenerate tests/fixtures/*.parquet and their pyarrow oracles (needs `uv`).
 fixtures = { cmd = "bash tools/gen_fixtures.sh" }
 # Build the Arrow C Data Interface shared library and import it into pyarrow.
-carrow-lib = { cmd = "mkdir -p build && mojo build --emit shared-lib tools/carrow_export.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/libpqcarrow$SHLIB_EXT" }
+carrow-lib = { cmd = "mkdir -p build && mojo build --emit shared-lib tools/carrow_export.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/libpqcarrow$SHLIB_EXT" }
 verify-c = { cmd = "bash tools/verify_c_data.sh", depends-on = ["carrow-lib"] }
 # Write every fixture back out through our writer and have pyarrow read it.
 verify-written = { cmd = "bash tools/verify_written.sh" }
-# pyarrow's numbers for the same files, for the README's honesty.
+# pyarrow's numbers for the same files, single threaded and threaded, for the
+# README's honesty.
 bench-pyarrow = { cmd = "bash tools/bench_pyarrow.sh" }
+# The threaded read path, hammered. `stress` — no sanitizer, many rounds — is
+# what CI runs on both platforms: it is the guard against a hung join and a
+# wrong answer under load. The two sanitizer legs are manual, because on Mojo
+# 1.0.0 neither is usable as a gate: `--sanitize address` does not link on
+# osx-arm64 and `--sanitize thread` does not start on linux-64, and where TSan
+# *does* run it reports the runtime's own allocator recycling addresses across
+# workers rather than anything this repository does. `tests/run_stress.sh` and
+# `tests/tsan_control.mojo` set out the evidence for that.
+stress = { cmd = "tests/run_stress.sh plain" }
+stress-tsan = { cmd = "tests/run_stress.sh tsan" }
+stress-asan = { cmd = "tests/run_stress.sh asan" }
+# The control that says whether a `stress-tsan` finding is a race in this
+# repository or the Mojo runtime's allocator being invisible to the tool — see
+# the header of tests/tsan_control.mojo.
+stress-tsan-control = { cmd = "mkdir -p build && mojo build --sanitize thread tests/tsan_control.mojo -I ../threads.mojo/src -o build/tsan-control && { ./build/tsan-control || echo 'control: the allocating mode reported and aborted, which is the point — see the header of tests/tsan_control.mojo'; }" }
 
 # The ZSTD / LZ4 codecs are FFI tins, so they live in their own environments:
 # `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.0.0).
 [feature.codecs.tasks]
-conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-conformance && ./build/parquet-conformance" }
-test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
+conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-conformance && ./build/parquet-conformance" }
+test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
 # Write the whole fixture corpus out through our writer, so that the encoding
 # each column chunk came out as can be compared between two branches with
 # `python tools/encoding_report.py build/encodings [reference-dir]`. Needs the
 # codecs env because `codecs.parquet` has a column per codec.
-encodings = { cmd = "mkdir -p build/encodings && mojo build tools/encoding_corpus.mojo -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/encoding-corpus && ./build/encoding-corpus" }
+encodings = { cmd = "mkdir -p build/encodings && mojo build tools/encoding_corpus.mojo -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/encoding-corpus && ./build/encoding-corpus" }
 # The three files `lint` and `lint-tools` can only text-mode-fallback on
 # (they import zstd/lz4/brotli): resolved fully here, with the codecs env's
 # sibling checkouts on the path.
-lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src src/parquet/ext_full.mojo tests/test_codecs.mojo tools/conformance.mojo tools/encoding_corpus.mojo" }
+lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src src/parquet/ext_full.mojo tests/test_codecs.mojo tools/conformance.mojo tools/encoding_corpus.mojo" }
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
@@ -78,6 +105,7 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.0.0"
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "f4c3bdddd0c06bbad0c49c2b05c7afc30e7aa67a" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "6d56cd46c56273051f166d33f50fdf194a8dcd3e" }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1faf0427543ed0142bbf1ffe7e41833a62a" }
@@ -91,6 +119,7 @@ mojo-compiler = "==1.0.0"
 
 [package.run-dependencies]
 mojo-compiler = ">=1.0.0,<2"
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "f4c3bdddd0c06bbad0c49c2b05c7afc30e7aa67a" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "6d56cd46c56273051f166d33f50fdf194a8dcd3e" }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1faf0427543ed0142bbf1ffe7e41833a62a" }
@@ -136,6 +165,7 @@ SHLIB_EXT = ".so"
 # refuses that package — see the note at the top of this file.
 [feature.bench.dependencies]
 bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "4f4440fa6e61c9ca7c7573ca6aa2f8f1d606d88a" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "f4c3bdddd0c06bbad0c49c2b05c7afc30e7aa67a" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "6d56cd46c56273051f166d33f50fdf194a8dcd3e" }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "33cad1faf0427543ed0142bbf1ffe7e41833a62a" }
@@ -146,7 +176,7 @@ bench = "mkdir -p build && mojo build -I src -I $CONDA_PREFIX/lib/mojo bench/ben
 # bench/ imports the shared harness and the sibling tins by source path
 # (mojolint needs real sources to resolve, not the precompiled packages the
 # dependencies above install into $CONDA_PREFIX/lib/mojo).
-lint-bench = { cmd = "mojolint --lsp -I src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../bench.mojo/src bench" }
+lint-bench = { cmd = "mojolint --lsp -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../bench.mojo/src bench" }
 
 [environments]
 default = ["nightly"]

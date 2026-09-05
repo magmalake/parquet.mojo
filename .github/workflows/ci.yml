@@ -23,6 +23,11 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          repository: magmalake/threads.mojo
+          path: threads.mojo
+
+      - uses: actions/checkout@v4
+        with:
           repository: magmalake/thrift.mojo
           path: thrift.mojo
 
@@ -58,6 +63,16 @@ jobs:
         # which has the sibling checkouts for it.
         run: pixi run -e ${{ matrix.env }} check
 
+      # The threaded read path under load: the same fixtures read over and
+      # over at 2, 4, 8 and 10 workers, with a watchdog, so a hung join or an
+      # answer that depends on which worker won fails here rather than in
+      # somebody's pipeline. Stable only — it is a property of the code, not
+      # of the compiler, and running it twice per OS buys nothing.
+      - name: Threaded read stress
+        if: matrix.env == 'stable'
+        working-directory: parquet.mojo
+        run: pixi run -e stable stress
+
       - name: CLI smoke
         working-directory: parquet.mojo
         run: |
@@ -84,6 +99,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: parquet.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/threads.mojo
+          path: threads.mojo
       - uses: actions/checkout@v4
         with:
           repository: magmalake/thrift.mojo
@@ -144,6 +163,10 @@ jobs:
           path: parquet.mojo
       - uses: actions/checkout@v4
         with:
+          repository: magmalake/threads.mojo
+          path: threads.mojo
+      - uses: actions/checkout@v4
+        with:
           repository: magmalake/thrift.mojo
           path: thrift.mojo
       - uses: actions/checkout@v4
@@ -182,6 +205,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: parquet.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/threads.mojo
+          path: threads.mojo
       - uses: actions/checkout@v4
         with:
           repository: magmalake/thrift.mojo

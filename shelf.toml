@@ -10,4 +10,5 @@ tins = [
     "zstd-mojo",
     "lz4-mojo",
     "brotli-mojo",
+    "threads-mojo",
 ]

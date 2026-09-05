@@ -104,6 +104,7 @@ tins — see [Codecs](#codecs).
 | `.page_row_ranges(rg, predicates)` | the row ranges those pages cover |
 | `.batch_size` | rows per batch (default 65536) |
 | `.verify_crc` | check page CRC32s when present (default true) |
+| `.num_workers` | threads decoding a row group's column chunks (default 1; `0` means one per core) — see [More than one core](#more-than-one-core) |
 | `.read_batch()` / `.has_next()` / `.rewind()` | iterate batches |
 | `.read_table()` | every selected row group, as a `Table` |
 
@@ -433,8 +434,16 @@ skips them. The pyarrow comparison is a local check too.
 | 1M rows × (int64, double, dictionary int64, dictionary string) | 46.6 ms — 21.5 M rows/s, 400 MB/s | 31.6 ms — 31.7 M rows/s, 604 MB/s | pyarrow 1.5× |
 | 100k rows × 5 mixed types incl. a list column | 14.8 ms — 6.8 M rows/s, 155 MB/s | 8.57 ms — 11.7 M rows/s, 279 MB/s | pyarrow 1.7× |
 
-Nothing here is threaded — Mojo's nightly has no reachable thread pool — so
-every number is one core. pyarrow's writer numbers are single-threaded too.
+Every number in both tables is one core on both sides, which is what makes
+them comparable: the reads leave `ParquetReader.num_workers` at its default of
+1, and pyarrow is pinned with `set_cpu_count(1)`, `set_io_thread_count(1)` and
+`use_threads=False`. Writing is single threaded on both sides either way.
+
+A read *can* now use more than one core — see [More than one
+core](#more-than-one-core) — and `tools/bench_pyarrow.py` grew a second leg
+that lets pyarrow have all of them, so the threaded-against-threaded
+comparison can be measured rather than guessed at. Neither is folded into the
+tables above: a table that mixed worker counts would not compare anything.
 
 **One row moved a long way and it is worth saying so.** The 100k-row read
 was previously published as parquet.mojo 4.3 ms against pyarrow **2.3 ms**,
@@ -504,6 +513,61 @@ allocation of the decompression buffer, and the biggest single item on the
 wide file is the dictionary gather. A `keep_dictionary` option that handed
 back an Arrow dictionary array would remove the gather entirely for consumers
 that can take one.
+
+### More than one core
+
+```mojo
+var r = ParquetReader.open("part-0.parquet")
+r.num_workers = 4        # 1 = sequential (the default); 0 = one per core
+var t = r.read_table()
+```
+
+**The unit is a column chunk.** Reading a row group is `read_column_chunk` per
+projected leaf, then one pass over that chunk's levels to build the per-row
+index — and by the table above that is about 85% of a read. Chunks are
+independent through decode, so the tasks share nothing but the immutable file
+bytes: each writes only its own leaf's four output slots, and a task that
+fails writes a string into its own error slot, which the caller re-raises in
+leaf order after the join. The same corrupt file therefore gives the same
+error at any worker count, and `test_num_workers_is_bit_identical` asserts
+byte-for-byte equal Arrow buffers, null counts and offsets across the whole
+fixture corpus at 1, 2, 4 and 10 workers.
+
+`num_workers = 1` is the default and is a separate branch: no context is
+built, no thread is started, and `_load` calls the same `_decode_leaf` the
+tasks do, straight through.
+
+Measured on the M4, p50 of three timed repetitions (p90 in brackets), CRC
+verification off, against pyarrow 25.0.1 given the same file — once pinned to
+one thread and once with `use_threads=True` and its default CPU count:
+
+| workers | 1M × 4 cols, 18 MiB | 100k × 5 cols incl. a list, snappy |
+|---|---|---|
+| 1 | 4.74 ms (4.82) | 3.26 ms (3.28) |
+| 2 | 3.60 ms (3.69) | 2.42 ms (2.46) |
+| 4 | **3.40 ms** (3.46) | 1.97 ms (2.01) |
+| 8 | 3.43 ms (3.47) | **1.84 ms** (2.51) |
+| 10 | 3.42 ms (3.48) | 1.84 ms (2.21) |
+| pyarrow, 1 thread | 8.17 ms (8.80) | 2.43 ms (2.48) |
+| pyarrow, 10 threads | 2.75 ms (2.89) | 0.72 ms (0.80) |
+
+**Scaling bends at 2 on the wide file and at 4 on the mixed one, and neither
+is a scheduling problem.** Per-chunk parallelism is bounded by the *slowest
+chunk*, not by the core count: the wide file's fourth column is a dictionary
+string column that is most of the decode on its own, so once it has a thread
+of its own there is nothing left to overlap — 1.39× and then flat, three
+columns idle. The mixed file's work is spread more evenly and gets to 1.77×,
+but past four workers only the p50 improves while p90 gets worse, which is
+what an M4 with four performance cores and six efficiency cores looks like.
+
+**Against threaded pyarrow, this loses.** On the wide file pyarrow at ten
+threads is 1.24× faster than the best number here, having started 1.72×
+*slower* on one thread; on the mixed file it is 2.6× faster, from a 1.34× lead
+on one thread. pyarrow parallelises across row groups as well as columns and
+so is not bounded by one fat column. Doing the same here — decoding several
+row groups at once — is the obvious next axis and is not implemented: it
+changes the streaming contract, since `read_batch` currently holds exactly one
+row group's chunks in memory.
 
 ## Gaps
 
@@ -591,7 +655,10 @@ result against the *original* pyarrow oracle, value by value.
 | `pixi run -e codecs test-codecs` | the ZSTD / LZ4 tests |
 | `pixi run bench` | the decode and encode benchmarks |
 | `pixi run profile` | per-stage decode profile: where a read spends its time |
-| `pixi run bench-pyarrow` | pyarrow's numbers for the same files (needs `uv`) |
+| `pixi run bench-pyarrow` | pyarrow's numbers for the same files, one thread and threaded (needs `uv`) |
+| `pixi run stress` | the threaded read path under load, with a watchdog |
+| `pixi run stress-tsan` | the same under ThreadSanitizer (macOS; see `tests/run_stress.sh`) |
+| `pixi run stress-tsan-control` | what a ThreadSanitizer finding here means (see `tests/tsan_control.mojo`) |
 | `pixi run cli schema f.parquet` | build and run the CLI |
 | `pixi run verify-c` | import the C Data Interface export into pyarrow |
 | `pixi run verify-written` | write every fixture back out and have pyarrow read it |
