@@ -29,7 +29,11 @@ it and pointing at `AllCodecs`; every other column of that file still reads.
 
 from avro.deflate import deflate, inflate, inflate_at
 from hashes import crc32
-from snappy import compress as snappy_compress, decompress as snappy_decompress
+from snappy import (
+    compress as snappy_compress,
+    decompress_into as snappy_decompress_into,
+    uncompressed_length as snappy_uncompressed_length,
+)
 from thrift import CompressionCodec
 
 
@@ -56,7 +60,9 @@ trait CodecSet:
         `data` itself — the page's own bytes inside the file, handed back
         untouched, which is what `SerializedPageReader::DecompressIfNeeded`
         does in parquet-cpp. For every other codec it is `scratch`, the
-        caller's one decompression buffer per column chunk.
+        caller's one decompression buffer per column chunk, grown in place and
+        never shrunk — parquet-cpp's `decompression_buffer_`, resized with
+        `shrink_to_fit=false` (`column_reader.cc:564`).
 
         **Lifetime contract — the span is valid only until the next call that
         passes the same `scratch`.** That call overwrites the buffer and may
@@ -111,6 +117,22 @@ def page_span[origin: ImmOrigin](data: Span[UInt8, _]) -> Span[UInt8, origin]:
         ),
         length=len(data),
     )
+
+
+def sized_scratch[
+    origin: MutOrigin
+](ref[origin] scratch: List[UInt8], n: Int) -> Span[UInt8, origin]:
+    """`scratch`, resized to exactly `n` bytes and ready to be written over.
+
+    Grows in place and never shrinks the allocation, which is what
+    `Resize(uncompressed_len, /*shrink_to_fit=*/false)` buys parquet-cpp: after
+    the first page of a chunk, a page no larger than the biggest one so far
+    costs no allocation at all. The bytes are left uninitialised rather than
+    zeroed — a decompressor writes every one of them, and a memset per page
+    would be most of what this commit is trying to remove.
+    """
+    scratch.resize(unsafe_uninit_length=n)
+    return Span(scratch)
 
 
 def codec_name(codec: Int32) -> String:
@@ -185,8 +207,23 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
     page written that way decodes to the members joined in order. Stopping at
     the first one silently loses the rest, so the members are looped over here.
     """
+    var out = List[UInt8]()
+    gunzip_into(data, out)
+    return out^
+
+
+def gunzip_into(data: Span[UInt8, _], mut out: List[UInt8]) raises:
+    """`gunzip` into a buffer the caller already has, replacing its contents.
+
+    The gzip-framed path — every `GZIP` page a Parquet writer emits — inflates
+    each member onto the end of `out`, so a decompression buffer reused across
+    a chunk keeps whatever capacity it has already grown. The zlib and bare
+    DEFLATE fallbacks hand `out` a buffer `inflate` allocated: neither shape
+    comes out of a Parquet writer, and neither is worth a second copy to keep
+    the growth in place.
+    """
+    out.clear()
     if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
-        var out = List[UInt8]()
         var at = 0
         while at < len(data):
             # Trailing NUL padding after the last member is legal and some
@@ -199,15 +236,16 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
                     "parquet.gzip: trailing bytes are not a gzip member"
                 )
             at = _inflate_one_member(data, at, out)
-        return out^
+        return
     if (
         len(data) >= 2
         and (data[0] & 0x0F) == 8
         and ((UInt16(data[0]) * 256 + UInt16(data[1])) % 31) == 0
     ):
         # RFC 1950 zlib wrapper: 2-byte header, 4-byte Adler-32 trailer.
-        return inflate(data[2 : len(data) - 4])
-    return inflate(data)
+        out = inflate(data[2 : len(data) - 4])
+        return
+    out = inflate(data)
 
 
 def gzip_wrap(data: Span[UInt8, _]) raises -> List[UInt8]:
@@ -257,10 +295,13 @@ struct DefaultCodecs(CodecSet):
         if codec == CompressionCodec.UNCOMPRESSED.value:
             return page_span[O](data)
         if codec == CompressionCodec.SNAPPY.value:
-            scratch = snappy_decompress(data)
-            return page_span[O](Span(scratch))
+            # The block's own varint header, not the page header's number:
+            # `decompress_into` needs the length the stream itself declares.
+            var n = snappy_uncompressed_length(data)
+            var wrote = snappy_decompress_into(data, sized_scratch(scratch, n))
+            return page_span[O](Span(scratch)[:wrote])
         if codec == CompressionCodec.GZIP.value:
-            scratch = gunzip(data)
+            gunzip_into(data, scratch)
             return page_span[O](Span(scratch))
         raise unsupported_codec(codec)
 

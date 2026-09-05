@@ -200,15 +200,19 @@ def _row(name: StringSlice, ns: Int, total: Int) -> String:
     )
 
 
-def _count_page(mut st: Stages, codec: Int32, raw: Span[UInt8, _]):
+def _count_scratch(mut st: Stages, scratch: List[UInt8], mut high: Int):
     """Charge the decompression buffer for what it actually allocates.
 
-    An uncompressed page is handed back where it lies, so it allocates
-    nothing; every other codec still writes one buffer per page.
+    One buffer serves a whole column chunk and never shrinks, so it allocates
+    only when a page pushes it past its high-water mark — and an uncompressed
+    page never touches it at all. Adding `len(raw)` per page, as this profile
+    did while every page got a buffer of its own, would now count bytes nothing
+    ever allocated.
     """
-    if codec != CompressionCodec.UNCOMPRESSED.value:
-        st.alloc_bytes += len(raw)
+    if len(scratch) > high:
+        st.alloc_bytes += len(scratch) - high
         st.alloc_count += 1
+        high = len(scratch)
 
 
 def _walk_chunk(
@@ -241,6 +245,7 @@ def _walk_chunk(
     var codec = cm.codec.value
     var slots = 0
     var scratch = List[UInt8]()
+    var scratch_high = 0
 
     while slots < want and offset < limit:
         var t0 = perf_counter_ns()
@@ -260,7 +265,7 @@ def _walk_chunk(
             var raw = DefaultCodecs.decompress(codec, body, usize, scratch)
             t1 = perf_counter_ns()
             st.decomp += t1 - t0
-            _count_page(st, codec, raw)
+            _count_scratch(st, scratch, scratch_high)
             dict = decode_plain(leaf.physical, leaf.type_length, raw, n)
             st.values += perf_counter_ns() - t1
             has_dict = True
@@ -280,7 +285,7 @@ def _walk_chunk(
             var raw = DefaultCodecs.decompress(codec, body, usize, scratch)
             t1 = perf_counter_ns()
             st.decomp += t1 - t0
-            _count_page(st, codec, raw)
+            _count_scratch(st, scratch, scratch_high)
             var buf = raw
             var pos = 0
             if leaf.max_rep > 0:
@@ -353,7 +358,7 @@ def _walk_chunk(
                 )
                 var t2 = perf_counter_ns()
                 st.decomp += t2 - t1
-                _count_page(st, codec, raw)
+                _count_scratch(st, scratch, scratch_high)
                 _profile_values(
                     values, enc, leaf, raw, non_null, dict, has_dict, st
                 )

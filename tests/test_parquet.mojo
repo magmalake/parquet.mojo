@@ -186,12 +186,21 @@ def test_a_page_span_is_only_valid_until_the_next_page() raises:
     pass any value-level check while costing the whole `decomp` stage. The
     scratch buffer must be untouched: nothing was decompressed.
 
+    *Two compressed pages land in the same bytes.* One scratch buffer,
+    decompressed into twice; the second span must start at the same address as
+    the first, which is both the point of reusing the buffer and the reason a
+    span cannot be held. Asserted by address rather than by reading the first
+    span again afterwards, which would be reading bytes this very test says are
+    no longer the first page's.
+
     *Nothing may hold a page across the loop's turn.* A snappy column chunk of
-    many data pages behind one dictionary page, read end to end. Every page
-    decompresses into the same buffer, so a `read_column_chunk` that kept a
-    span — a lazily decoded dictionary, a deferred value pass — would read the
-    last page's bytes for all of them and give plausible, wrong values. The
-    corpus cannot catch that: its chunks are one page each.
+    many data pages behind one dictionary page, no two pages holding the same
+    values, read end to end. Every page decompresses into the same buffer, so a
+    `read_column_chunk` that kept a span — a lazily decoded dictionary, a
+    deferred value pass — reads another page's bytes and gives plausible, wrong
+    values. The control was exactly that, deferring every page's value decode
+    by one: it fails here, and in several corpus tests besides, so this half
+    names the rule rather than being its only guard.
     """
     var page = List[UInt8](capacity=4096)
     for i in range(4096):
@@ -208,11 +217,38 @@ def test_a_page_span_is_only_valid_until_the_next_page() raises:
     )
     assert_equal(len(scratch), 0, "an uncompressed page touched the scratch")
 
+    var half = List[UInt8](capacity=1024)
+    for i in range(1024):
+        half.append(UInt8((i * 17) % 241))
+    var big = DefaultCodecs.compress(CompressionCodec.SNAPPY.value, Span(page))
+    var small = DefaultCodecs.compress(
+        CompressionCodec.SNAPPY.value, Span(half)
+    )
+    var first = DefaultCodecs.decompress(
+        CompressionCodec.SNAPPY.value, Span(big), len(page), scratch
+    )
+    assert_equal(len(first), len(page))
+    assert_equal(Int(first[7]), Int(page[7]))
+    var at = Int(first.unsafe_ptr())
+    var second = DefaultCodecs.decompress(
+        CompressionCodec.SNAPPY.value, Span(small), len(half), scratch
+    )
+    assert_equal(len(second), len(half))
+    assert_equal(Int(second[7]), Int(half[7]))
+    assert_equal(
+        Int(second.unsafe_ptr()),
+        at,
+        "the second page did not reuse the first page's buffer",
+    )
+
     var options = WriterOptions()
     options.codec = CompressionCodec.SNAPPY.value
     options.data_page_size = 512  # 64 INT64 values a page
     options.write_page_index = False
-    var values = _cycled(64, 4096)
+    # 997 distinct values over 4000, so no two of the 64-value pages hold the
+    # same values — a per-page pattern that repeated would let a caller hold
+    # the first page's span and still get the right answer.
+    var values = _cycled(997, 4000)
     var bytes = _write_int64_column(Span(values), options^)
     var counts = _chunk_page_counts(Span(bytes))
     assert_equal(counts[0], 1, "the chunk should carry a dictionary page")

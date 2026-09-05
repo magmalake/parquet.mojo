@@ -789,8 +789,9 @@ def read_column_chunk[
     # Values written into `out.values` so far — the running count that
     # `page_value` samples once per page.
     var nvalues = 0
-    # One decompression buffer for the whole chunk, as `SerializedPageReader`
-    # has. Every span `Codecs.decompress` hands back is a view — of the file
+    # One decompression buffer for the whole chunk, grown in place and never
+    # shrunk, as `SerializedPageReader` has. Every span `Codecs.decompress`
+    # hands back is a view — of the file
     # for an uncompressed page, of this buffer otherwise — and is valid only
     # until the next page is decompressed into it. Nothing below outlives its
     # own iteration: the dictionary page is copied into `dict` by

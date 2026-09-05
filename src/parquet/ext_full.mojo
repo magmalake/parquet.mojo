@@ -19,12 +19,17 @@ from parquet.codec import (
     CodecSet,
     DefaultCodecs,
     copy_of,
-    gunzip,
+    gunzip_into,
     gzip_wrap,
     page_span,
+    sized_scratch,
     unsupported_codec,
 )
-from snappy import compress as snappy_compress, decompress as snappy_decompress
+from snappy import (
+    compress as snappy_compress,
+    decompress_into as snappy_decompress_into,
+    uncompressed_length as snappy_uncompressed_length,
+)
 from thrift import CompressionCodec
 
 
@@ -55,23 +60,38 @@ struct AllCodecs(CodecSet):
         if codec == CompressionCodec.UNCOMPRESSED.value:
             return page_span[O](data)
         if codec == CompressionCodec.SNAPPY.value:
-            scratch = snappy_decompress(data)
-            return page_span[O](Span(scratch))
+            # The block's own varint header, not the page header's number:
+            # `decompress_into` needs the length the stream itself declares.
+            var n = snappy_uncompressed_length(data)
+            var wrote = snappy_decompress_into(data, sized_scratch(scratch, n))
+            return page_span[O](Span(scratch)[:wrote])
         if codec == CompressionCodec.GZIP.value:
-            scratch = gunzip(data)
+            gunzip_into(data, scratch)
             return page_span[O](Span(scratch))
         if codec == CompressionCodec.ZSTD.value:
+            var size = zstd.frame_content_size(data)
+            if size:
+                var wrote = zstd.decompress_into(
+                    data, sized_scratch(scratch, size.value())
+                )
+                return page_span[O](Span(scratch)[:wrote])
+            # A frame streamed with no pledged size carries nothing to size the
+            # buffer from, so this one grows its own.
             scratch = zstd.decompress(data)
             return page_span[O](Span(scratch))
         if codec == CompressionCodec.BROTLI.value:
             # Brotli records no uncompressed size anywhere in the stream, so
             # the page header's is the only one there is.
-            scratch = brotli.decompress(data, uncompressed_size)
-            return page_span[O](Span(scratch))
+            var wrote = brotli.decompress_into(
+                data, sized_scratch(scratch, uncompressed_size)
+            )
+            return page_span[O](Span(scratch)[:wrote])
         if codec == CompressionCodec.LZ4_RAW.value:
             # A raw LZ4 block: the uncompressed size comes from the page header.
-            scratch = lz4.decompress_block(data, uncompressed_size)
-            return page_span[O](Span(scratch))
+            var wrote = lz4.decompress_block_into(
+                data, sized_scratch(scratch, uncompressed_size)
+            )
+            return page_span[O](Span(scratch)[:wrote])
         if codec == CompressionCodec.LZ4.value:
             # The deprecated `LZ4` codec never pinned its framing down, so
             # files in the wild carry either the Hadoop wrapper — repeated
@@ -79,11 +99,19 @@ struct AllCodecs(CodecSet):
             # or a bare LZ4 block with no wrapper at all. Nothing in the file
             # says which, so the only way to tell is to try the wrapper and
             # fall back. parquet-testing ships one of each.
+            #
+            # `lz4.mojo` has no `decompress_hadoop_into`, so the wrapped shape
+            # allocates. It is the deprecated codec on the fallback path of a
+            # codec no current writer emits; adding an entry point to the tin
+            # for it would cost more than it saves.
             try:
                 scratch = lz4.decompress_hadoop(data, uncompressed_size)
+                return page_span[O](Span(scratch))
             except:
-                scratch = lz4.decompress_block(data, uncompressed_size)
-            return page_span[O](Span(scratch))
+                var wrote = lz4.decompress_block_into(
+                    data, sized_scratch(scratch, uncompressed_size)
+                )
+                return page_span[O](Span(scratch)[:wrote])
         raise unsupported_codec(codec)
 
     @staticmethod
