@@ -41,6 +41,7 @@ from parquet.convert import append_null, append_value
 from parquet.encoding import PK_BOOL, PK_FIXED, PK_VAR, PhysBuffer
 from parquet.page import ColumnData, copy_mask_bits
 from parquet.schema import LeafColumn, ParquetSchema
+from std.memory import unsafe_memcpy
 from thrift import Type
 
 
@@ -410,30 +411,86 @@ def _fill_leaf[
     var dst = out.values.unsafe_ptr()
     var src = vals.bytes.unsafe_ptr()
     if packed:
-        # Spacing the values out into their slots, driven by the validity bits
-        # rather than by a definition level per slot.
+        # Spacing by *runs* rather than by slot. parquet-cpp's
+        # `SpacedExpandRightward` (`arrow/util/spaced_internal.h:66`) walks a
+        # set-bit-run reader and moves each run with one `memmove`; arrow-rs's
+        # `ValuesBuffer::pad_nulls` (`record_reader/buffer.rs:66`) is the same
+        # design over `iter_set_bits_rev`. At the null rates real data has, a
+        # run is a hundred values or more, so a chunk's 25,000 per-slot
+        # branches become a couple of hundred copies — and each copy is
+        # contiguous on both sides, which the per-slot loop never was.
+        #
+        # Forwards, not backwards: both references expand a buffer in place
+        # and have to walk from the end to avoid overwriting what they have
+        # not moved yet. `out.values` is a separate buffer, so the runs can go
+        # in the order the bitmap gives them.
         var vb = out.validity.unsafe_ptr()
+        var vb8 = vb.unsafe_bitcast[UInt64]()
         var vi = v0
-        if w == 8:
-            var d8 = dst.unsafe_bitcast[UInt64]()
-            var s8 = src.unsafe_bitcast[UInt64]()
-            for k in range(rows):
-                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
-                    d8.unsafe_store(k, s8.unsafe_load[alignment=1](vi))
-                    vi += 1
-        elif w == 4:
-            var d4 = dst.unsafe_bitcast[UInt32]()
-            var s4 = src.unsafe_bitcast[UInt32]()
-            for k in range(rows):
-                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
-                    d4.unsafe_store(k, s4.unsafe_load[alignment=1](vi))
-                    vi += 1
-        else:
-            for k in range(rows):
-                if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
-                    for b in range(w):
-                        dst.unsafe_store(k * w + b, src.unsafe_load(vi * w + b))
-                    vi += 1
+        var start = -1
+        var nbytes = rows >> 3
+        var b = 0
+        while b < nbytes:
+            # Eight bytes of "all valid" at a time: the overwhelmingly common
+            # shape, and the whole reason this is cheaper than a bit test.
+            if (b & 7) == 0 and b + 8 <= nbytes:
+                if vb8.unsafe_load[alignment=1](b >> 3) == UInt64.MAX:
+                    if start < 0:
+                        start = b << 3
+                    b += 8
+                    continue
+            var byte = vb.unsafe_load(b)
+            if byte == 0xFF:
+                if start < 0:
+                    start = b << 3
+                b += 1
+                continue
+            if byte == 0:
+                if start >= 0:
+                    var cnt = (b << 3) - start
+                    unsafe_memcpy(
+                        dest=dst.unsafe_offset(start * w),
+                        src=src.unsafe_offset(vi * w),
+                        count=cnt * w,
+                    )
+                    vi += cnt
+                    start = -1
+                b += 1
+                continue
+            for j in range(8):
+                if ((byte >> UInt8(j)) & 1) == 1:
+                    if start < 0:
+                        start = (b << 3) + j
+                elif start >= 0:
+                    var cnt = (b << 3) + j - start
+                    unsafe_memcpy(
+                        dest=dst.unsafe_offset(start * w),
+                        src=src.unsafe_offset(vi * w),
+                        count=cnt * w,
+                    )
+                    vi += cnt
+                    start = -1
+            b += 1
+        for k in range(nbytes << 3, rows):
+            if ((vb.unsafe_load(k >> 3) >> UInt8(k & 7)) & 1) == 1:
+                if start < 0:
+                    start = k
+            elif start >= 0:
+                var cnt = k - start
+                unsafe_memcpy(
+                    dest=dst.unsafe_offset(start * w),
+                    src=src.unsafe_offset(vi * w),
+                    count=cnt * w,
+                )
+                vi += cnt
+                start = -1
+        if start >= 0:
+            var cnt = rows - start
+            unsafe_memcpy(
+                dest=dst.unsafe_offset(start * w),
+                src=src.unsafe_offset(vi * w),
+                count=cnt * w,
+            )
         return True
     var defs = cd.defs.unsafe_ptr()
     var vi = v0
