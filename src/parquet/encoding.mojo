@@ -16,7 +16,9 @@ Three physical shapes cover all eight Parquet types:
 from std.memory import bitcast
 
 from parquet.bitio import (
+    HYBRID_BLOCK,
     HybridDecoder,
+    HybridRuns,
     bit_width,
     decode_hybrid_into,
     read_uleb128,
@@ -347,15 +349,7 @@ def gather_into(
     var entries = dict.count
     for i in range(n):
         if Int(idx.unsafe_load(i)) >= entries:
-            raise Error(
-                String(
-                    "parquet.encoding: dictionary index ",
-                    idx.unsafe_load(i),
-                    " out of range (dictionary has ",
-                    entries,
-                    " entries)",
-                )
-            )
+            raise _out_of_range(idx.unsafe_load(i), entries)
 
     if dict.kind == PK_BOOL:
         for i in range(n):
@@ -434,13 +428,9 @@ def gather_into(
     out.count += n
 
 
-def decode_dict_indices(
-    data: Span[UInt8, _], count: Int
-) raises -> List[UInt32]:
-    """`RLE_DICTIONARY` / `PLAIN_DICTIONARY` data: a bit width byte, then a
-    hybrid RLE run of that many indices."""
-    if count == 0:
-        return List[UInt32]()
+def _dict_index_width(data: Span[UInt8, _]) raises -> Int:
+    """The leading bit-width byte of `RLE_DICTIONARY` / `PLAIN_DICTIONARY`
+    page data."""
     if len(data) == 0:
         raise Error("parquet.encoding: dictionary page data is empty")
     var width = Int(data[0])
@@ -448,9 +438,208 @@ def decode_dict_indices(
         raise Error(
             String("parquet.encoding: dictionary index bit width ", width)
         )
+    return width
+
+
+def decode_dict_indices(
+    data: Span[UInt8, _], count: Int
+) raises -> List[UInt32]:
+    """`RLE_DICTIONARY` / `PLAIN_DICTIONARY` data: a bit width byte, then a
+    hybrid RLE run of that many indices."""
+    if count == 0:
+        return List[UInt32]()
+    var width = _dict_index_width(data)
     var out = List[UInt32](length=count, fill=0)
     decode_hybrid_into[DType.uint32](data[1:], width, count, out, 0)
     return out^
+
+
+def _out_of_range(index: UInt32, entries: Int) -> Error:
+    return Error(
+        String(
+            "parquet.encoding: dictionary index ",
+            index,
+            " out of range (dictionary has ",
+            entries,
+            " entries)",
+        )
+    )
+
+
+def _check_dict_block(
+    scratch: List[UInt32], n: Int, uniform: Bool, entries: Int
+) raises:
+    """Bounds-check one block of dictionary indices.
+
+    A block that came out of a repeated run is one comparison. A bit-packed
+    block is a max-reduction over the whole block — a widening fold rather than
+    a short-circuiting "is any of these too big", because the short-circuit is
+    what stops the compiler vectorising it; arrow-rs's `get_batch_with_dict`
+    carries the same note against the same code.
+
+    Only when the maximum is out of range is the block scanned for the first
+    offender, so the error raised is the one the separate full pass in
+    `gather_into` would have raised — same index, same message.
+    """
+    var p = scratch.unsafe_ptr()
+    if uniform:
+        if Int(p.unsafe_load(0)) < entries:
+            return
+    else:
+        comptime W = 8
+        var acc = SIMD[DType.uint32, W](0)
+        var i = 0
+        while i + W <= n:
+            acc = max(acc, p.unsafe_load[width=W, alignment=4](i))
+            i += W
+        var top = acc.reduce_max()
+        while i < n:
+            var v = p.unsafe_load(i)
+            if v > top:
+                top = v
+            i += 1
+        if Int(top) < entries:
+            return
+    for i in range(n):
+        var v = p.unsafe_load(i)
+        if Int(v) >= entries:
+            raise _out_of_range(v, entries)
+
+
+def gather_dict_into(
+    mut out: PhysBuffer, dict: PhysBuffer, data: Span[UInt8, _], count: Int
+) raises:
+    """Decode `count` dictionary indices out of `data` and gather them out of
+    `dict` onto the end of `out`, a block at a time.
+
+    `decode_dict_indices` followed by `gather_into` is the same work in three
+    passes over a page-sized `List[UInt32]`: one to write it, one to
+    bounds-check it, one to gather it — four bytes per value written to memory
+    and read back twice, plus the allocation. This walks the hybrid runs into
+    4 KiB of scratch instead, and each block is checked and gathered while it
+    is still in L1. parquet-cpp's `GetBatchWithDict` and arrow-rs's
+    `RleDecoder::get_batch_with_dict` are both this shape.
+
+    The bounds check is the same check in the same order — blocks come off the
+    stream in order and `_check_dict_block` reports the first offending index
+    in the first offending block — so a corrupt file raises exactly what it
+    raised before. Unlike `gather_into` the check is no longer complete
+    *before* the first value is written, so `out` may hold part of the page
+    when this raises; the caller is abandoning the read either way.
+    """
+    if count == 0:
+        return
+    var width = _dict_index_width(data)
+    if out.kind != dict.kind:
+        raise Error("parquet.encoding: cannot concatenate unlike pages")
+    if dict.kind == PK_BOOL:
+        # A dictionary of booleans is legal and pointless; nothing in the wild
+        # writes one, so it keeps the unfused path rather than a third gather.
+        gather_into(out, dict, decode_dict_indices(data, count))
+        return
+
+    var runs = HybridRuns(data[1:], width, count)
+    var scratch = List[UInt32](length=HYBRID_BLOCK, fill=0)
+    var entries = dict.count
+
+    if dict.kind == PK_VAR:
+        var doff = dict.offsets.unsafe_ptr()
+        var obase = len(out.offsets)
+        var vbase = len(out.bytes)
+        out.offsets.resize(obase + count, 0)
+        var ooff = out.offsets.unsafe_ptr()
+        var src = dict.bytes.unsafe_ptr()
+        var limit = len(dict.bytes) - 8
+        var total = vbase
+        var at = vbase
+        var done = 0
+        while True:
+            var block = runs.next_block(scratch)
+            var n = block[0]
+            if n == 0:
+                break
+            _check_dict_block(scratch, n, block[1], entries)
+            var idx = scratch.unsafe_ptr()
+            for i in range(n):
+                var k = Int(idx.unsafe_load(i))
+                total += Int(doff.unsafe_load(k + 1)) - Int(doff.unsafe_load(k))
+                if total > _MAX_VAR_BYTES:
+                    raise _var_bytes_overflow(total)
+                ooff.unsafe_store(obase + done + i, Int32(total))
+            # As in `decode_plain_into`: eight bytes of slack so a short value
+            # moves in one store. `resize` grows the capacity to exactly what
+            # it is handed, so the doubling a per-block grow needs is done by
+            # hand — otherwise a page of a thousand blocks reallocates and
+            # copies the whole buffer a thousand times.
+            var want = total + 8
+            if want > out.bytes.capacity():
+                var grown = out.bytes.capacity() * 2
+                out.bytes.reserve(want if want > grown else grown)
+            out.bytes.resize(want, 0)
+            var dst = out.bytes.unsafe_ptr()
+            for i in range(n):
+                var k = Int(idx.unsafe_load(i))
+                var src_at = Int(doff.unsafe_load(k))
+                var ln = Int(doff.unsafe_load(k + 1)) - src_at
+                if ln <= 8 and src_at <= limit:
+                    dst.unsafe_store[width=8](
+                        at, src.unsafe_load[width=8](src_at)
+                    )
+                else:
+                    var b = 0
+                    while b + 8 <= ln and src_at + b <= limit:
+                        dst.unsafe_store[width=8](
+                            at + b, src.unsafe_load[width=8](src_at + b)
+                        )
+                        b += 8
+                    while b < ln:
+                        dst.unsafe_store(at + b, src.unsafe_load(src_at + b))
+                        b += 1
+                at += ln
+            done += n
+        out.bytes.resize(total, 0)
+        out.count += count
+        return
+
+    var w = dict.width
+    if out.count == 0 and len(out.bytes) == 0:
+        out.width = w
+    if out.width != w:
+        raise Error("parquet.encoding: cannot concatenate unlike pages")
+    var vbase = len(out.bytes)
+    out.bytes.resize(vbase + count * w, 0)
+    var base = out.bytes.unsafe_ptr().unsafe_offset(vbase)
+    var src = dict.bytes.unsafe_ptr()
+    var done = 0
+    while True:
+        var block = runs.next_block(scratch)
+        var n = block[0]
+        if n == 0:
+            break
+        _check_dict_block(scratch, n, block[1], entries)
+        var idx = scratch.unsafe_ptr()
+        var dst = base.unsafe_offset(done * w)
+        if w == 8:
+            var d8 = dst.unsafe_bitcast[UInt64]()
+            var s8 = src.unsafe_bitcast[UInt64]()
+            for i in range(n):
+                d8.unsafe_store(
+                    i, s8.unsafe_load[alignment=1](Int(idx.unsafe_load(i)))
+                )
+        elif w == 4:
+            var d4 = dst.unsafe_bitcast[UInt32]()
+            var s4 = src.unsafe_bitcast[UInt32]()
+            for i in range(n):
+                d4.unsafe_store(
+                    i, s4.unsafe_load[alignment=1](Int(idx.unsafe_load(i)))
+                )
+        else:
+            for i in range(n):
+                var src_at = Int(idx.unsafe_load(i)) * w
+                for b in range(w):
+                    dst.unsafe_store(i * w + b, src.unsafe_load(src_at + b))
+        done += n
+    out.count += count
 
 
 def decode_rle_bool(data: Span[UInt8, _], count: Int) raises -> PhysBuffer:

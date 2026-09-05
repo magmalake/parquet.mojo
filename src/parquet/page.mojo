@@ -41,7 +41,7 @@ from parquet.encoding import (
     decode_plain_into,
     decode_rle_bool,
     gather,
-    gather_into,
+    gather_dict_into,
     physical_kind,
     physical_width,
 )
@@ -288,7 +288,7 @@ def _decode_values_into(
                     "' uses a dictionary encoding but has no dictionary page",
                 )
             )
-        gather_into(out, dict, decode_dict_indices(data, count))
+        gather_dict_into(out, dict, data, count)
         return
     if encoding == Encoding.PLAIN.value:
         decode_plain_into(out, leaf.physical, leaf.type_length, data, count)

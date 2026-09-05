@@ -13,8 +13,8 @@ Decode — the page walk mirrors `parquet.page.read_column_chunk`:
 | hdr | page headers (Thrift compact) |
 | decomp | `Codecs.decompress` per page, including the UNCOMPRESSED copy |
 | levels | definition and repetition levels into `List[UInt16]` |
-| values | the value encoding: PLAIN / dictionary indices / DELTA / BSS |
-| gather | dictionary index -> value materialisation |
+| values | the value encoding: PLAIN / DELTA / BSS |
+| gather | `gather_dict_into`: dictionary indices decoded, bounds-checked and materialised, which is one fused pass and so one row |
 | concat | `PhysBuffer.extend`, the per-page copy into the chunk buffer |
 | index | `_load`'s per-row slot/value index building |
 | assemble | Dremel assembly into Arrow buffers (`build_field`) |
@@ -65,14 +65,14 @@ from parquet import (
     WriterOptions,
 )
 from parquet.arrow import ArrayArena
+from parquet.bitio import HYBRID_BLOCK
 from parquet.codec import CodecSet
 from parquet.encoding import (
     PK_BOOL,
     PhysBuffer,
-    decode_dict_indices,
     decode_plain,
     decode_plain_into,
-    gather_into,
+    gather_dict_into,
     physical_kind,
     physical_width,
 )
@@ -366,20 +366,24 @@ def _profile_values(
     has_dict: Bool,
     mut st: Stages,
 ) raises:
-    """`_decode_values_into`, splitting the dictionary path into index + gather.
+    """`_decode_values_into`, with the dictionary path timed as `gather`.
+
+    Index decoding, the bounds check and the gather are one fused pass over a
+    4 KiB scratch block, so there is no page-sized index array to time or to
+    count as an allocation — which is the point of it, and why `values` and
+    `gather` no longer split the same page between them.
     """
     var t0 = perf_counter_ns()
     if (
         encoding == Encoding.RLE_DICTIONARY.value
         or encoding == Encoding.PLAIN_DICTIONARY.value
     ) and has_dict:
-        var indices = decode_dict_indices(data, count)
-        var t1 = perf_counter_ns()
-        st.values += t1 - t0
-        st.alloc_bytes += len(indices) * 4
+        gather_dict_into(values, dict, data, count)
+        st.gather += perf_counter_ns() - t0
+        # The scratch block `gather_dict_into` decodes into, which is what
+        # replaces the page-sized index array in this count.
+        st.alloc_bytes += HYBRID_BLOCK * 4
         st.alloc_count += 1
-        gather_into(values, dict, indices)
-        st.gather += perf_counter_ns() - t1
         return
     if encoding == Encoding.PLAIN.value:
         decode_plain_into(values, leaf.physical, leaf.type_length, data, count)
