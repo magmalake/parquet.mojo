@@ -69,6 +69,19 @@ struct ColumnData(Copyable, Defaultable, Movable):
     """Every slot is at the leaf's maximum definition level, so `defs` was
     never materialised. This is the usual case — a column with no nulls — and
     skipping the per-slot level array is worth a great deal on a wide read."""
+    var page_slot: List[Int]
+    """The first slot of each data page, and one final entry equal to
+    `num_slots`.
+
+    A checkpoint table, sampled at the one boundary the page walk already
+    knows: it turns "where do this row's values start" into a binary search
+    plus a scan bounded by one page, instead of an entry per row. One entry
+    per page is a few dozen `Int`s per chunk against `rows + 1` of them, and
+    it costs nothing to build — the counts are the loop variables of
+    `read_column_chunk` already."""
+    var page_value: List[Int]
+    """The first value of each data page, and one final entry equal to the
+    number of values in `values`. Parallel to `page_slot`."""
 
     def __init__(out self):
         self.defs = List[UInt16]()
@@ -76,6 +89,8 @@ struct ColumnData(Copyable, Defaultable, Movable):
         self.values = PhysBuffer()
         self.num_slots = 0
         self.all_present = True
+        self.page_slot = List[Int]()
+        self.page_value = List[Int]()
 
     def __init__(out self, *, copy: Self):
         self.defs = copy.defs.copy()
@@ -83,6 +98,8 @@ struct ColumnData(Copyable, Defaultable, Movable):
         self.values = copy.values.copy()
         self.num_slots = copy.num_slots
         self.all_present = copy.all_present
+        self.page_slot = copy.page_slot.copy()
+        self.page_value = copy.page_value.copy()
 
     def __init__(out self, *, deinit move: Self):
         self.defs = move.defs^
@@ -90,6 +107,35 @@ struct ColumnData(Copyable, Defaultable, Movable):
         self.values = move.values^
         self.num_slots = move.num_slots
         self.all_present = move.all_present
+        self.page_slot = move.page_slot^
+        self.page_value = move.page_value^
+
+    @always_inline
+    def value_at(self, row: Int, max_def: Int) -> Int:
+        """How many of the first `row` slots hold a value.
+
+        The answer for a slot that is a page boundary is stored; for anything
+        else it is that answer plus a scan of at most one page of definition
+        levels. Nothing here is per row, which is the point: the caller wants
+        this at a handful of batch boundaries, not at every row.
+        """
+        if row <= 0 or len(self.page_slot) == 0:
+            return 0
+        var lo = 0
+        var hi = len(self.page_slot) - 1
+        while lo < hi:
+            var mid = (lo + hi + 1) >> 1
+            if self.page_slot[mid] <= row:
+                lo = mid
+            else:
+                hi = mid - 1
+        var v = self.page_value[lo]
+        var defs = self.defs.unsafe_ptr()
+        var md = UInt16(max_def)
+        for k in range(self.page_slot[lo], row):
+            if defs.unsafe_load(k) == md:
+                v += 1
+        return v
 
     @always_inline
     def def_at(self, i: Int, max_def: Int) -> Int:
@@ -443,6 +489,9 @@ def read_column_chunk[
     var dict = PhysBuffer()
     var has_dict = False
     var codec = cm.codec.value
+    # Values written into `out.values` so far — the running count that
+    # `page_value` samples once per page.
+    var nvalues = 0
 
     while out.num_slots < want and offset < limit:
         var hdr = read_page_header(file, offset)
@@ -544,6 +593,9 @@ def read_column_chunk[
                 dict,
                 has_dict,
             )
+            out.page_slot.append(out.num_slots)
+            out.page_value.append(nvalues)
+            nvalues += non_null
             out.num_slots += n
             continue
 
@@ -630,11 +682,18 @@ def read_column_chunk[
                     dict,
                     has_dict,
                 )
+            out.page_slot.append(out.num_slots)
+            out.page_value.append(nvalues)
+            nvalues += non_null
             out.num_slots += n
             continue
 
         raise Error(String("parquet.page: unknown page type ", ph.type_.name()))
 
+    # The closing entry, so a lookup at the end of the chunk lands on a stored
+    # answer rather than off the end of the table.
+    out.page_slot.append(out.num_slots)
+    out.page_value.append(nvalues)
     if out.num_slots != want:
         raise Error(
             String(

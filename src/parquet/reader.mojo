@@ -418,6 +418,117 @@ def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
 # been decoded, and `parallel_for` has no barrier in the middle.
 
 
+comptime _RECORD_STRIDE = 1024
+"""Records between checkpoints in a nested leaf's row index.
+
+The index exists to answer a handful of questions per row group — one per
+batch boundary — so storing an answer per row is storing a thousand answers
+nobody asks. A checkpoint every `_RECORD_STRIDE` records costs `rows / 1024`
+`Int`s instead of `rows + 1`, and a lookup finishes by walking at most this
+many records' worth of levels from the nearest one. Neither reference builds
+an index at all — parquet-cpp's `TypedRecordReader::DelimitRecords` and
+arrow-rs's `read_records` delimit as they read and keep only a position — so
+this is the shape that keeps the sampling honest without keeping the array.
+"""
+
+
+struct _RowIndex(Copyable, Defaultable, Movable):
+    """How to find a row inside one decoded column chunk.
+
+    Three cases, and only the last one stores anything per row group:
+
+    * `flat` and `dense` — one slot per row and every slot holds a value, so
+      the row index *is* the slot index *is* the value index. Nothing stored.
+    * `flat` — one slot per row, but some are null, so the value index is a
+      running count of the non-null ones. Answered from `ColumnData.page_slot`
+      / `page_value`, which the page walk fills in for free.
+    * nested — a row spans as many slots as the repetition levels say, so
+      finding one means counting `rep == 0`. Checkpointed every
+      `_RECORD_STRIDE` records; a lookup walks forward from the last one.
+    """
+
+    var flat: Bool
+    """`max_rep == 0`: one slot per row, so the slot index is the row index."""
+    var dense: Bool
+    """Every slot of the chunk holds a value, so the value index is the slot
+    index and no null-counting is needed anywhere."""
+    var max_def: Int
+    var rows: Int
+    var total_slots: Int
+    var total_values: Int
+    var slot_cp: List[Int]
+    """Nested only: the first slot of record `k * _RECORD_STRIDE`."""
+    var value_cp: List[Int]
+    """Nested only, and only when the chunk has nulls: the first value of
+    record `k * _RECORD_STRIDE`."""
+
+    def __init__(out self):
+        self.flat = False
+        self.dense = True
+        self.max_def = 0
+        self.rows = 0
+        self.total_slots = 0
+        self.total_values = 0
+        self.slot_cp = List[Int]()
+        self.value_cp = List[Int]()
+
+    def __init__(out self, *, copy: Self):
+        self.flat = copy.flat
+        self.dense = copy.dense
+        self.max_def = copy.max_def
+        self.rows = copy.rows
+        self.total_slots = copy.total_slots
+        self.total_values = copy.total_values
+        self.slot_cp = copy.slot_cp.copy()
+        self.value_cp = copy.value_cp.copy()
+
+    def __init__(out self, *, deinit move: Self):
+        self.flat = move.flat
+        self.dense = move.dense
+        self.max_def = move.max_def
+        self.rows = move.rows
+        self.total_slots = move.total_slots
+        self.total_values = move.total_values
+        self.slot_cp = move.slot_cp^
+        self.value_cp = move.value_cp^
+
+    @always_inline
+    def record_at(self, cd: ColumnData, r: Int) -> Tuple[Int, Int]:
+        """The first slot and the first value of record `r`.
+
+        `r == rows` is the end of the chunk, which is a stored answer; anything
+        else walks the levels forward from the nearest checkpoint, which is at
+        most `_RECORD_STRIDE` records back.
+        """
+        if r >= self.rows:
+            return (self.total_slots, self.total_values)
+        var c = r // _RECORD_STRIDE
+        var k = self.slot_cp[c]
+        var rec = c * _RECORD_STRIDE
+        var reps = cd.reps.unsafe_ptr()
+        if self.dense:
+            while rec < r:
+                k += 1
+                if k >= self.total_slots:
+                    break
+                if reps.unsafe_load(k) == 0:
+                    rec += 1
+            # Dense: every slot holds a value, so the value index is the slot.
+            return (k, k)
+        var v = self.value_cp[c]
+        var defs = cd.defs.unsafe_ptr()
+        var md = UInt16(self.max_def)
+        while rec < r:
+            if defs.unsafe_load(k) == md:
+                v += 1
+            k += 1
+            if k >= self.total_slots:
+                break
+            if reps.unsafe_load(k) == 0:
+                rec += 1
+        return (k, v)
+
+
 def _decode_leaf[
     Codecs: CodecSet
 ](
@@ -427,14 +538,12 @@ def _decode_leaf[
     verify_crc: Bool,
     rows: Int,
     mut data: ColumnData,
-    mut flat: Bool,
-    mut slot: List[Int],
-    mut value: List[Int],
+    mut index: _RowIndex,
 ) raises:
     """Decode one column chunk of one row group, and index it by row.
 
     A pure function of its inputs: it reads the file bytes, which nothing
-    mutates for the life of a reader, and writes only into its own four
+    mutates for the life of a reader, and writes only into its own two
     outputs. Both the sequential and the threaded path in `_load` call this and
     nothing else, so what a column decodes to cannot depend on which one ran,
     or on how many workers it ran with.
@@ -447,10 +556,16 @@ def _decode_leaf[
     var max_def = leaf.max_def
     var max_rep = leaf.max_rep
     var nvals = 0
+    index = _RowIndex()
+    index.max_def = max_def
+    index.dense = data.all_present
+    index.rows = rows
+    index.total_slots = data.num_slots
     if max_rep == 0:
-        # One slot per row, so the slot index *is* the row index and `slot`
-        # never has to be built.
-        flat = True
+        # One slot per row, so the slot index *is* the row index, and the value
+        # index of any row is a count of non-null slots the page walk has
+        # already checkpointed. Nothing to build here at all.
+        index.flat = True
         if data.num_slots != rows:
             raise Error(
                 String(
@@ -463,20 +578,8 @@ def _decode_leaf[
                     " rows",
                 )
             )
-        if not data.all_present:
-            # One entry per row plus a sentinel: the size is known up front, so
-            # the index is `rows` stores into a sized buffer rather than `rows`
-            # appends to a growing one.
-            if rows > len(data.defs):
-                raise Error(_short_levels(leaf, "definition"))
-            value.resize(rows + 1, 0)
-            var vp = value.unsafe_ptr()
-            var defs = data.defs.unsafe_ptr()
-            for k in range(rows):
-                vp.unsafe_store(k, nvals)
-                if Int(defs.unsafe_load(k)) == max_def:
-                    nvals += 1
-            vp.unsafe_store(rows, nvals)
+        if not data.all_present and rows > len(data.defs):
+            raise Error(_short_levels(leaf, "definition"))
         return
     var nslots = data.num_slots
     var all_present = data.all_present
@@ -484,23 +587,31 @@ def _decode_leaf[
         raise Error(_short_levels(leaf, "repetition"))
     if not all_present and nslots > len(data.defs):
         raise Error(_short_levels(leaf, "definition"))
-    slot.resize(rows + 1, 0)
+    # The scan below is not optional — `records != rows` is a corruption check
+    # every nested chunk has to pass — but what it *stores* is: one checkpoint
+    # per `_RECORD_STRIDE` records rather than an entry per row.
+    var ncp = rows // _RECORD_STRIDE + 1
+    index.slot_cp.resize(ncp, 0)
     if not all_present:
-        value.resize(rows + 1, 0)
-    var sp = slot.unsafe_ptr()
-    var vp = value.unsafe_ptr()
+        index.value_cp.resize(ncp, 0)
+    var sp = index.slot_cp.unsafe_ptr()
+    var vp = index.value_cp.unsafe_ptr()
     var reps = data.reps.unsafe_ptr()
     var defs = data.defs.unsafe_ptr()
     var records = 0
+    var next_cp = 0
+    var cp = 0
     for k in range(nslots):
         if reps.unsafe_load(k) == 0:
             # A chunk that starts more records than the row group claims is
             # caught right after the loop; up to then, only write inside the
             # sized buffer.
-            if records < rows:
-                sp.unsafe_store(records, k)
+            if records == next_cp and cp < ncp:
+                sp.unsafe_store(cp, k)
                 if not all_present:
-                    vp.unsafe_store(records, nvals)
+                    vp.unsafe_store(cp, nvals)
+                cp += 1
+                next_cp += _RECORD_STRIDE
             records += 1
         if all_present or Int(defs.unsafe_load(k)) == max_def:
             nvals += 1
@@ -516,55 +627,54 @@ def _decode_leaf[
                 " rows",
             )
         )
-    sp.unsafe_store(rows, nslots)
-    if not all_present:
-        vp.unsafe_store(rows, nvals)
+    index.total_values = nvals
 
 
 @always_inline
 def _leaf_slices(
     needed: List[Bool],
     chunks: List[ColumnData],
-    flat: List[Bool],
-    slot: List[List[Int]],
-    value: List[List[Int]],
+    index: List[_RowIndex],
     r0: Int,
     r1: Int,
 ) -> List[LeafSlice]:
     """Where rows `[r0, r1)` sit in each leaf's decoded chunk.
 
     One entry per leaf of the file schema, `LeafSlice()` for the ones this read
-    does not want. Pure arithmetic over the per-row indices `_decode_leaf`
-    built, so it does not matter which of them ran on which thread, or whether
-    the row group came out of `_load` or out of a prefetched window: the same
-    row range gives the same slices. Both paths call this and nothing else,
-    which is what makes that true rather than merely intended.
+    does not want. A pure function of the decoded chunk and its row index, so
+    it does not matter which leaf ran on which thread, or whether the row group
+    came out of `_load` or out of a prefetched window: the same row range gives
+    the same slices. Both paths call this and nothing else, which is what makes
+    that true rather than merely intended.
 
-    `@always_inline` is not decoration. The per-row indices are
-    `List[List[Int]]` with an entry per row, and handing them to an out-of-line
-    call costs **9.6% of `bench_read_big` on a sequential read** — measured,
-    and the entire cost of pulling this body out of `_assemble`. Inlined, the
-    sequential path is within 0.3% of never having moved it.
+    `@always_inline` is not decoration: handing the row indices to an
+    out-of-line call cost **9.6% of `bench_read_big` on a sequential read** —
+    measured, and the entire cost of pulling this body out of `_assemble`.
     """
     var slices = List[LeafSlice]()
     for i in range(len(needed)):
         if not needed[i]:
             slices.append(LeafSlice())
             continue
+        ref ix = index[i]
         var s0 = r0
         var s1 = r1
-        if not flat[i]:
-            if len(slot[i]) <= r1:
+        var v0 = r0
+        if not ix.flat:
+            if r1 > ix.rows:
                 slices.append(LeafSlice())
                 continue
-            s0 = slot[i][r0]
-            s1 = slot[i][r1]
+            var at = ix.record_at(chunks[i], r0)
+            s0 = at[0]
+            v0 = at[1]
+            s1 = ix.record_at(chunks[i], r1)[0]
         elif r1 > chunks[i].num_slots:
             slices.append(LeafSlice())
             continue
-        # An empty `value` means every slot holds a value, so the value index
-        # and the slot index are the same number.
-        var v0 = s0 if len(value[i]) == 0 else value[i][r0]
+        elif not ix.dense:
+            # Every slot is a row here, so the value index is how many of the
+            # rows before this one held a value.
+            v0 = chunks[i].value_at(r0, ix.max_def)
         slices.append(LeafSlice(s0, s1, v0))
     return slices^
 
@@ -580,25 +690,19 @@ struct _RowGroupData(Defaultable, Movable):
     var rg: Int
     """The row group this holds, or -1 once it has been handed to the reader."""
     var chunks: List[ColumnData]
-    var flat: List[Bool]
-    var slot: List[List[Int]]
-    var value: List[List[Int]]
+    var index: List[_RowIndex]
 
     def __init__(out self):
         self.rg = -1
         self.chunks = List[ColumnData]()
-        self.flat = List[Bool]()
-        self.slot = List[List[Int]]()
-        self.value = List[List[Int]]()
+        self.index = List[_RowIndex]()
 
     def __init__(out self, *, deinit move: Self):
         self.rg = move.rg
         self.chunks = move.chunks^
-        self.flat = move.flat^
-        self.slot = move.slot^
-        self.value = move.value^
+        self.index = move.index^
 
-    # The four outputs, moved out; the value keeps an empty list in place. A
+    # The two outputs, moved out; the value keeps an empty list in place. A
     # field cannot be transferred out of the middle of a live value, and this
     # one is still live at that point, so each one swaps rather than moves.
 
@@ -607,19 +711,9 @@ struct _RowGroupData(Defaultable, Movable):
         self.chunks = List[ColumnData]()
         return taken^
 
-    def take_flat(mut self) -> List[Bool]:
-        var taken = self.flat^
-        self.flat = List[Bool]()
-        return taken^
-
-    def take_slot(mut self) -> List[List[Int]]:
-        var taken = self.slot^
-        self.slot = List[List[Int]]()
-        return taken^
-
-    def take_value(mut self) -> List[List[Int]]:
-        var taken = self.value^
-        self.value = List[List[Int]]()
+    def take_index(mut self) -> List[_RowIndex]:
+        var taken = self.index^
+        self.index = List[_RowIndex]()
         return taken^
 
 
@@ -654,9 +748,7 @@ struct _LoadCtx(Movable):
     var dest: List[Int]
     """Task `k` writes the output slots at `dest[k]`."""
     var chunks: List[ColumnData]
-    var flat: List[Bool]
-    var slot: List[List[Int]]
-    var value: List[List[Int]]
+    var index: List[_RowIndex]
     var errors: List[String]
     """Per output slot, empty when it decoded. A task cannot raise — pthread
     has no exception channel — so a failure lands in its own slot and the
@@ -684,16 +776,12 @@ struct _LoadCtx(Movable):
         self.rows = List[Int]()
         self.dest = List[Int]()
         self.chunks = List[ColumnData]()
-        self.flat = List[Bool]()
-        self.slot = List[List[Int]]()
-        self.value = List[List[Int]]()
+        self.index = List[_RowIndex]()
         self.errors = List[String]()
         self.fatal = List[String]()
         for _ in range(ngroups * nleaves):
             self.chunks.append(ColumnData())
-            self.flat.append(False)
-            self.slot.append(List[Int]())
-            self.value.append(List[Int]())
+            self.index.append(_RowIndex())
             self.errors.append(String())
         for _ in range(ngroups):
             self.fatal.append(String())
@@ -708,9 +796,7 @@ struct _LoadCtx(Movable):
         self.rows = move.rows^
         self.dest = move.dest^
         self.chunks = move.chunks^
-        self.flat = move.flat^
-        self.slot = move.slot^
-        self.value = move.value^
+        self.index = move.index^
         self.errors = move.errors^
         self.fatal = move.fatal^
 
@@ -728,21 +814,17 @@ struct _LoadCtx(Movable):
             var cd = ColumnData()
             swap(cd, self.chunks[base + i])
             out.chunks.append(cd^)
-            out.flat.append(self.flat[base + i])
-            var s = List[Int]()
-            swap(s, self.slot[base + i])
-            out.slot.append(s^)
-            var v = List[Int]()
-            swap(v, self.value[base + i])
-            out.value.append(v^)
+            var ix = _RowIndex()
+            swap(ix, self.index[base + i])
+            out.index.append(ix^)
         return out^
 
 
 def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
     """One column chunk of one row group, on whichever worker drew task `k`.
 
-    Writes only the four output slots at `dest[k]` — or, on a failure, that
-    slot's error cell — none of which another task touches, and reads only
+    Writes only the two output slots at `dest[k]` — or, on a failure, that
+    slot's error cell — neither of which another task touches, and reads only
     fields nothing writes while the fan-out runs.
     """
     var d = ctx.dest[k]
@@ -754,9 +836,7 @@ def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
             ctx.verify_crc,
             ctx.rows[k],
             ctx.chunks[d],
-            ctx.flat[d],
-            ctx.slot[d],
-            ctx.value[d],
+            ctx.index[d],
         )
     except e:
         ctx.errors[d] = String(e)
@@ -962,13 +1042,8 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     empty list means the whole row group."""
     var _loaded_rg: Int
     var _chunks: List[ColumnData]
-    var _row_flat: List[Bool]
-    """Per leaf: slot index == row index, so `_row_slot` is not built."""
-    var _row_slot: List[List[Int]]
-    """Per leaf, the first *slot* of each row. Empty when `_row_flat`."""
-    var _row_value: List[List[Int]]
-    """Per leaf, the first *value* of each row. Empty when every slot of the
-    chunk is present, in which case the value index is the slot index."""
+    var _row_index: List[_RowIndex]
+    """Per leaf, how to turn a row number into a slot and a value index."""
     var _prefetched: List[_RowGroupData]
     """Row groups `read_table` decoded ahead, in visit order.
 
@@ -1025,9 +1100,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._ranges = List[List[Tuple[Int, Int]]]()
         self._loaded_rg = -1
         self._chunks = List[ColumnData]()
-        self._row_flat = List[Bool]()
-        self._row_slot = List[List[Int]]()
-        self._row_value = List[List[Int]]()
+        self._row_index = List[_RowIndex]()
         self._prefetched = List[_RowGroupData]()
 
     def __init__(out self, *, deinit move: Self):
@@ -1050,9 +1123,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._ranges = move._ranges^
         self._loaded_rg = move._loaded_rg
         self._chunks = move._chunks^
-        self._row_flat = move._row_flat^
-        self._row_slot = move._row_slot^
-        self._row_value = move._row_value^
+        self._row_index = move._row_index^
         self._prefetched = move._prefetched^
 
     @staticmethod
@@ -1324,9 +1395,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 continue
             self._prefetched[g].rg = -1
             self._chunks = self._prefetched[g].take_chunks()
-            self._row_flat = self._prefetched[g].take_flat()
-            self._row_slot = self._prefetched[g].take_slot()
-            self._row_value = self._prefetched[g].take_value()
+            self._row_index = self._prefetched[g].take_index()
             self._loaded_rg = rg
             return True
         return False
@@ -1338,9 +1407,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         # Drop the row group being replaced before anything else, so that at
         # most one loaded group is alive at a time on this side of the reader.
         self._chunks = List[ColumnData]()
-        self._row_flat = List[Bool]()
-        self._row_slot = List[List[Int]]()
-        self._row_value = List[List[Int]]()
+        self._row_index = List[_RowIndex]()
         if self._take_prefetched(rg):
             return
         var rows = Int(self.meta.row_groups[rg].num_rows)
@@ -1364,17 +1431,13 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         for i in range(nleaves):
             if not self._needed[i]:
                 self._chunks.append(ColumnData())
-                self._row_flat.append(False)
-                self._row_slot.append(List[Int]())
-                self._row_value.append(List[Int]())
+                self._row_index.append(_RowIndex())
                 continue
             ref chunk = self.meta.row_groups[rg].columns[i]
             if not chunk.meta_data:
                 raise _no_chunk_meta(rg, i)
             var cd = ColumnData()
-            var flat = False
-            var slot = List[Int]()
-            var value = List[Int]()
+            var ix = _RowIndex()
             _decode_leaf[Self.Codecs](
                 self.data,
                 chunk.meta_data.value(),
@@ -1382,14 +1445,10 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 self.verify_crc,
                 rows,
                 cd,
-                flat,
-                slot,
-                value,
+                ix,
             )
             self._chunks.append(cd^)
-            self._row_flat.append(flat)
-            self._row_slot.append(slot^)
-            self._row_value.append(value^)
+            self._row_index.append(ix^)
         self._loaded_rg = rg
 
     def _decode_groups(
@@ -1472,9 +1531,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var one: List[Int] = [rg]
         var got = self._decode_groups(one, nleaves, workers)
         self._chunks = got[0].take_chunks()
-        self._row_flat = got[0].take_flat()
-        self._row_slot = got[0].take_slot()
-        self._row_value = got[0].take_value()
+        self._row_index = got[0].take_index()
         self._loaded_rg = rg
 
     def _prefetched_group(self, rg: Int) -> Int:
@@ -1549,9 +1606,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 _leaf_slices(
                     self._needed,
                     ctx.groups[g].chunks,
-                    ctx.groups[g].flat,
-                    ctx.groups[g].slot,
-                    ctx.groups[g].value,
+                    ctx.groups[g].index,
                     plans[p].r0,
                     plans[p].r1,
                 )
@@ -1690,9 +1745,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var slices = _leaf_slices(
             self._needed,
             self._chunks,
-            self._row_flat,
-            self._row_slot,
-            self._row_value,
+            self._row_index,
             r0,
             r1,
         )
