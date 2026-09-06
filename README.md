@@ -104,13 +104,21 @@ tins — see [Codecs](#codecs).
 | `.page_row_ranges(rg, predicates)` | the row ranges those pages cover |
 | `.pages_read()` | data pages decoded since the last `rewind` — what pruning drops |
 | `.batch_size` | rows per batch (default 65536) |
+| `.max_batch_value_bytes` | `BYTE_ARRAY` bytes per batch per column (default 2 GiB — an Arrow 32-bit offset) |
 | `.verify_crc` | check page CRC32s when present (default true) |
 | `.num_workers` | threads decoding column chunks, and — in `read_table` — row groups and Arrow assembly (default 1; `0` means one per core) — see [More than one core](#more-than-one-core) |
 | `.read_batch()` / `.has_next()` / `.rewind()` | iterate batches |
 | `.read_table()` | every selected row group, as a `Table` |
 
 A batch never spans two row groups, and never crosses a gap left by page
-pruning, so the last batch of each range can be shorter than `batch_size`.
+pruning, so the last batch of each range can be shorter than `batch_size`. It
+is also cut short when its `BYTE_ARRAY` bytes would outgrow an Arrow 32-bit
+offset: a column chunk may hold more than 2 GiB of them — the decoded buffer
+behind it is 64-bit — but the arrays a batch is made of may not, so the cut is
+where the file is absorbed. The cut is the same row for every column, because
+the columns of a batch are aligned. `large_string_map.brotli.parquet` in
+apache/parquet-testing is the file this is for: two rows whose map keys are a
+gibibyte each, which read as two batches of one row.
 
 ### `RecordBatch` and `Table`
 
@@ -379,6 +387,13 @@ Beyond value parity the suite covers:
   record, which no writer here or in pyarrow produces: a window that opens on
   such a seam decodes the whole chunk instead, and one that ends on it keeps
   only whole rows;
+- **batches cut by their value bytes**, with `max_batch_value_bytes` lowered so
+  the machinery `large_string_map.brotli.parquet` needs is testable without a
+  two-gibibyte fixture: 40 rows of `list<string>` at 128 value bytes a row must
+  come back in ten batches of four at a 512-byte cap, unchanged and in order at
+  caps that do not divide evenly and at one row a batch, the same with the
+  row-group axis running — and a cap below a single row must raise with the
+  column named, because no batch boundary splits one row;
 - statistics decoded to typed min/max compared against pyarrow's, per column
   chunk of five fixtures;
 - `split_offsets`, `created_by` and key/value metadata against the oracle;
@@ -646,13 +661,12 @@ longer the answer for the rest. pyarrow keeps a tighter p90 on both.
 
 ## Gaps
 
-* **More than 2 GiB of `BYTE_ARRAY` data in one column chunk** — Arrow's
-  `binary`/`string` layout addresses value bytes with 32-bit offsets, so such a
-  chunk raises rather than wrapping its offsets negative. Reading one needs
-  64-bit offsets (`large_binary`) or the column split across record batches.
-  `large_string_map.brotli.parquet` in apache/parquet-testing is the one file in
-  that corpus that hits it — its Brotli pages decode fine; the offsets are the
-  gap.
+* **A single row holding more than 2 GiB of `BYTE_ARRAY` data** — a *chunk*
+  that large now reads: `PhysBuffer` addresses its bytes with 64-bit offsets,
+  and the batch is cut short so each Arrow array stays inside the 32-bit offset
+  its `binary`/`string` layout has (see `max_batch_value_bytes`). One row that
+  large has no batch boundary that would help, and raises with the column
+  named. Reading *that* needs Arrow's `large_binary`, which this does not have.
 * **Encryption** — a `PARE` footer or an encrypted column raises. Parquet
   modular encryption is not implemented.
 * **`ARROW:schema` metadata** — pyarrow stores an Arrow IPC schema in the

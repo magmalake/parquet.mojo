@@ -62,36 +62,16 @@ def physical_kind(phys: Int32) -> Int:
     return PK_FIXED
 
 
-comptime _MAX_VAR_BYTES = 0x7FFF_FFFF
-"""How many bytes of `BYTE_ARRAY` data one column chunk can hold.
+comptime MAX_ARROW_VAR_BYTES = 0x7FFF_FFFF
+"""How many bytes of `BYTE_ARRAY` data one Arrow array can address.
 
 Arrow's `binary`/`string` layout addresses value bytes with **32-bit** offsets,
-and `PhysBuffer.offsets` is `List[Int32]` to match. Past 2 GiB in a single
-chunk those offsets wrap negative, and the wrap does not surface here — it
-surfaces much later as an out-of-bounds slice during assembly, which trips a
-bounds assert and takes the process down instead of raising. So the four places
-that grow a `PK_VAR` buffer check for it.
-
-Actually reading such a file needs either Arrow's `large_binary` (64-bit
-offsets) or the column split across several record batches. parquet.mojo does
-neither yet; `large_string_map.brotli.parquet` in apache/parquet-testing is the
-one file in the corpus that hits this.
+so this is the ceiling on a *record batch*, not on a column chunk:
+`PhysBuffer.offsets` is `List[Int]`, wide enough for anything a chunk can hold,
+and the reader cuts a batch short before its value bytes reach this. Keeping
+the physical buffer wide is what makes that cut possible at all — an overflow
+that has already happened during decode cannot be split away afterwards.
 """
-
-
-def _var_bytes_overflow(total: Int) -> Error:
-    return Error(
-        String(
-            "parquet.encoding: column chunk holds ",
-            total,
-            (
-                " bytes of BYTE_ARRAY data, past the 2 GiB an Arrow 32-bit"
-                " offset can address — this file needs 64-bit offsets"
-                " (large_binary) or the column split across record batches,"
-                " neither of which parquet.mojo supports yet"
-            ),
-        )
-    )
 
 
 struct PhysBuffer(Copyable, Defaultable, Movable):
@@ -101,21 +81,21 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
     var width: Int
     var count: Int
     var bytes: List[UInt8]
-    var offsets: List[Int32]
+    var offsets: List[Int]
 
     def __init__(out self):
         self.kind = PK_FIXED
         self.width = 0
         self.count = 0
         self.bytes = List[UInt8]()
-        self.offsets = List[Int32]()
+        self.offsets = List[Int]()
 
     def __init__(out self, kind: Int, width: Int):
         self.kind = kind
         self.width = width
         self.count = 0
         self.bytes = List[UInt8]()
-        self.offsets = List[Int32]()
+        self.offsets = List[Int]()
         if kind == PK_VAR:
             self.offsets.append(0)
 
@@ -147,9 +127,7 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
     def append_bytes(mut self, src: Span[UInt8, _]) raises:
         """Append one `PK_VAR` value."""
         self.bytes.extend(src)
-        if len(self.bytes) > _MAX_VAR_BYTES:
-            raise _var_bytes_overflow(len(self.bytes))
-        self.offsets.append(Int32(len(self.bytes)))
+        self.offsets.append(len(self.bytes))
         self.count += 1
 
     def reserve_values(mut self, count: Int, bytes: Int):
@@ -179,10 +157,8 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
         if self.kind == PK_VAR:
             var base = len(self.bytes)
             self.bytes.extend(Span(other.bytes))
-            if len(self.bytes) > _MAX_VAR_BYTES:
-                raise _var_bytes_overflow(len(self.bytes))
             for i in range(1, len(other.offsets)):
-                self.offsets.append(Int32(base) + other.offsets[i])
+                self.offsets.append(base + other.offsets[i])
             self.count += other.count
             return
         self.bytes.extend(Span(other.bytes))
@@ -191,9 +167,7 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
     def value_span(self, i: Int) -> Span[UInt8, origin_of(self.bytes)]:
         """The bytes of value `i` — `PK_VAR` or `PK_FIXED` only."""
         if self.kind == PK_VAR:
-            return Span(self.bytes)[
-                Int(self.offsets[i]) : Int(self.offsets[i + 1])
-            ]
+            return Span(self.bytes)[self.offsets[i] : self.offsets[i + 1]]
         return Span(self.bytes)[i * self.width : (i + 1) * self.width]
 
 
@@ -282,9 +256,7 @@ def decode_plain_into(
             _need(data, pos + n, "PLAIN byte array body")
             pos += n
             total += n
-            if vbase + total > _MAX_VAR_BYTES:
-                raise _var_bytes_overflow(vbase + total)
-            ooff.unsafe_store(obase + i, Int32(vbase + total))
+            ooff.unsafe_store(obase + i, vbase + total)
         # Eight bytes of slack let a short value — which is most of them —
         # move in a single 8-byte store; the overhang is overwritten by the
         # next value, and the buffer is trimmed back at the end.
@@ -365,10 +337,8 @@ def gather_into(
         var total = vbase
         for i in range(n):
             var k = Int(idx.unsafe_load(i))
-            total += Int(doff.unsafe_load(k + 1)) - Int(doff.unsafe_load(k))
-            if total > _MAX_VAR_BYTES:
-                raise _var_bytes_overflow(total)
-            ooff.unsafe_store(obase + i, Int32(total))
+            total += doff.unsafe_load(k + 1) - doff.unsafe_load(k)
+            ooff.unsafe_store(obase + i, total)
         # As in `decode_plain_into`: eight bytes of slack so a short value
         # moves in one store.
         out.bytes.resize(total + 8, 0)
@@ -562,10 +532,8 @@ def gather_dict_into(
             var idx = scratch.unsafe_ptr()
             for i in range(n):
                 var k = Int(idx.unsafe_load(i))
-                total += Int(doff.unsafe_load(k + 1)) - Int(doff.unsafe_load(k))
-                if total > _MAX_VAR_BYTES:
-                    raise _var_bytes_overflow(total)
-                ooff.unsafe_store(obase + done + i, Int32(total))
+                total += doff.unsafe_load(k + 1) - doff.unsafe_load(k)
+                ooff.unsafe_store(obase + done + i, total)
             # As in `decode_plain_into`: eight bytes of slack so a short value
             # moves in one store. `resize` grows the capacity to exactly what
             # it is handed, so the doubling a per-block grow needs is done by

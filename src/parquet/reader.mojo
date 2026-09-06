@@ -42,6 +42,7 @@ from parquet.arrow import (
 from parquet.assemble import LeafSlice, build_field, first_leaf
 from parquet.carrow import ExportedArray, export_c
 from parquet.codec import CodecSet, DefaultCodecs
+from parquet.encoding import MAX_ARROW_VAR_BYTES, PK_VAR
 from parquet.page import ColumnData, PageWindow, read_column_chunk
 from parquet.schema import ArrowField, LeafColumn, ParquetSchema, build_schema
 from parquet.stats import (
@@ -716,6 +717,106 @@ def _leaf_slices(
     return slices^
 
 
+@always_inline
+def _value_index(cd: ColumnData, ix: _RowIndex, row: Int) -> Int:
+    """Where row group row `row` starts in a leaf's value buffer.
+
+    The value half of what `_leaf_slices` computes, on its own, because the
+    batch limit below needs it at rows it is still deciding about.
+    """
+    if not ix.flat:
+        return ix.record_at(cd, row)[1]
+    var s = row - ix.row0
+    if ix.dense:
+        return s
+    return cd.value_at(s, ix.max_def)
+
+
+def _row_too_wide(leaf: LeafColumn, bytes: Int, limit: Int) -> Error:
+    return Error(
+        String(
+            "parquet: one row of column '",
+            leaf.dotted(),
+            "' holds ",
+            bytes,
+            " bytes of BYTE_ARRAY data, past the ",
+            limit,
+            (
+                " a batch may carry — no batch boundary splits a single row, so"
+                " this column needs 64-bit offsets (large_binary), which"
+                " parquet.mojo does not have"
+            ),
+        )
+    )
+
+
+def _arrow_batch_end(
+    leaves: List[LeafColumn],
+    needed: List[Bool],
+    chunks: List[ColumnData],
+    index: List[_RowIndex],
+    r0: Int,
+    r1: Int,
+    limit: Int,
+) raises -> Int:
+    """`r1`, pulled back until every column's value bytes fit an Arrow offset.
+
+    A column chunk can hold more than 2 GiB of `BYTE_ARRAY` data —
+    `PhysBuffer` addresses its bytes with 64-bit offsets, so decoding one is
+    not the problem — but an Arrow `binary`/`string` array cannot, and a batch
+    is Arrow arrays. So the batch is cut instead, which is machinery
+    `read_batch` already has: it bounds a batch at `batch_size` rows and never
+    lets one span two row groups, and this is a third bound on the same
+    number.
+
+    **One split point for every column.** The columns of a batch are aligned
+    row for row, so a cut that suited only the column that overflowed would
+    tear the others apart. The answer is the smallest row any leaf can reach,
+    and every column stops there.
+
+    Nothing but an oversized chunk pays for this: a chunk whose *whole* value
+    buffer fits inside an Arrow offset — which is every chunk of every
+    ordinary file — is dismissed on one comparison, before any row is looked
+    up.
+
+    A single row that holds more than the limit on its own has no split point
+    that would help, so that is where this raises, with the column named — the
+    one shape of this file that batching cannot rescue.
+    """
+    var end = r1
+    for i in range(len(chunks)):
+        if not needed[i]:
+            continue
+        ref cd = chunks[i]
+        if cd.values.kind != PK_VAR:
+            continue
+        if len(cd.values.bytes) <= limit:
+            continue
+        var base = cd.values.offsets[_value_index(cd, index[i], r0)]
+        if cd.values.offsets[_value_index(cd, index[i], end)] - base <= limit:
+            continue
+        # Bytes grow with the row, so the last row that fits is a binary
+        # search. `r0 + 1` is the floor: a batch of no rows would not end.
+        var lo = r0 + 1
+        var hi = end
+        while lo < hi:
+            var mid = (lo + hi + 1) // 2
+            var at = cd.values.offsets[_value_index(cd, index[i], mid)]
+            if at - base <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        if cd.values.offsets[_value_index(cd, index[i], lo)] - base > limit:
+            raise _row_too_wide(
+                leaves[i],
+                cd.values.offsets[_value_index(cd, index[i], lo)] - base,
+                limit,
+            )
+        if lo < end:
+            end = lo
+    return end
+
+
 struct _RowGroupData(Defaultable, Movable):
     """One row group's decode state — what a loaded reader holds.
 
@@ -1020,6 +1121,22 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var meta: FileMetaData
     var schema: ParquetSchema
     var batch_size: Int
+    var max_batch_value_bytes: Int
+    """The most `BYTE_ARRAY` bytes one batch may carry, per column.
+
+    A third bound on a batch, next to `batch_size` and the row group. It exists
+    because an Arrow `binary`/`string` array addresses its value bytes with a
+    **32-bit** offset while the decoded column chunk behind it does not — a
+    chunk holding more than 2 GiB decodes perfectly well and only the batch cut
+    from it has to be smaller. `large_string_map.brotli.parquet` in
+    apache/parquet-testing is such a file: two rows whose keys are a gibibyte
+    each, which read as two batches of one row.
+
+    The default is that 2 GiB ceiling, and a batch of ordinary strings never
+    comes near it — the check is one comparison against the whole chunk's byte
+    count and is skipped there. Lowering it caps a batch's value bytes, which
+    is what makes the splitting testable without a two-gibibyte fixture.
+    """
     var verify_crc: Bool
     var num_workers: Int
     """How many OS threads turn file bytes into Arrow at once.
@@ -1129,6 +1246,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self.meta = read_footer(self.data)
         self.schema = build_schema(self.meta.schema)
         self.batch_size = 65536
+        self.max_batch_value_bytes = MAX_ARROW_VAR_BYTES
         self.verify_crc = True
         self.num_workers = 1
         self._row_groups = List[Int]()
@@ -1155,6 +1273,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self.meta = move.meta^
         self.schema = move.schema^
         self.batch_size = move.batch_size
+        self.max_batch_value_bytes = move.max_batch_value_bytes
         self.verify_crc = move.verify_crc
         self.num_workers = move.num_workers
         self._row_groups = move._row_groups^
@@ -1657,7 +1776,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 return g
         return -1
 
-    def _plan_window(mut self, past: Int) -> List[_BatchPlan]:
+    def _plan_window(mut self, past: Int) raises -> List[_BatchPlan]:
         """Cut every batch this window hands out, without building any of them.
 
         The batch walk of `read_batch`, with `_load` and `_assemble` taken out:
@@ -1684,7 +1803,21 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             var r1 = r0 + self.batch_size
             if r1 > span[1]:
                 r1 = span[1]
-            plans.append(_BatchPlan(rg, self._prefetched_group(rg), r0, r1))
+            var g = self._prefetched_group(rg)
+            if g >= 0:
+                # The same third bound `read_batch` applies, on the window's
+                # own copy of the chunks: a batch cannot carry more value bytes
+                # than an Arrow offset can address.
+                r1 = _arrow_batch_end(
+                    self.schema.leaves,
+                    self._needed,
+                    self._prefetched[g].chunks,
+                    self._prefetched[g].index,
+                    r0,
+                    r1,
+                    self.max_batch_value_bytes,
+                )
+            plans.append(_BatchPlan(rg, g, r0, r1))
             self._row_pos = r1
         return plans^
 
@@ -1860,6 +1993,15 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var r1 = r0 + self.batch_size
         if r1 > span[1]:
             r1 = span[1]
+        r1 = _arrow_batch_end(
+            self.schema.leaves,
+            self._needed,
+            self._chunks,
+            self._row_index,
+            r0,
+            r1,
+            self.max_batch_value_bytes,
+        )
         var batch = self._assemble(r0, r1)
         self._row_pos = r1
         return batch^

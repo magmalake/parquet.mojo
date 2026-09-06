@@ -737,7 +737,7 @@ def shred_flat(
             cols[leaf_i].values.bytes.extend(Span(a.values)[lo:hi])
             for k in range(n):
                 cols[leaf_i].values.offsets.append(
-                    Int32(vbase + Int(off.unsafe_load(r0 + k + 1)) - lo)
+                    vbase + Int(off.unsafe_load(r0 + k + 1)) - lo
                 )
         else:
             for k in range(n):
@@ -747,7 +747,7 @@ def shred_flat(
                 var hi = Int(off.unsafe_load(r0 + k + 1))
                 cols[leaf_i].values.bytes.extend(Span(a.values)[lo:hi])
                 cols[leaf_i].values.offsets.append(
-                    Int32(len(cols[leaf_i].values.bytes))
+                    len(cols[leaf_i].values.bytes)
                 )
         cols[leaf_i].values.count += present
         return True
