@@ -201,6 +201,98 @@ def _mask_count(mask: List[UInt8], at: Int, n: Int) -> Int:
     )
 
 
+struct PageWindow(Copyable, Defaultable, Movable):
+    """Which pages of a column chunk `read_column_chunk` has to decode.
+
+    Default-constructed — no page rows, an empty row range — it means *all of
+    them*, which is what every read without page pruning asks for and is the
+    path this reader always had.
+
+    `first_rows` is `OffsetIndex.page_locations[k].first_row_index`, one entry
+    per **data** page in file order: the number of records of the row group
+    that are complete before page `k` starts. With `first_rows[npages]` taken
+    to be `group_rows`, page `k` can hold values for rows
+
+        [first_rows[k], first_rows[k + 1]]
+
+    — closed at the top, because a record can still be *in flight* when a page
+    ends and then has values in both pages. That one row of overhang is the
+    whole difference between a repeated column and a flat one here, and getting
+    it wrong drops list elements at a page seam. A flat column's pages hold
+    `[first_rows[k], first_rows[k + 1])` exactly, one slot per row.
+    """
+
+    var first_rows: List[Int]
+    """Per data page, the first row of the row group it can hold. Empty means
+    no page index, so nothing can be skipped."""
+    var row_lo: Int
+    var row_hi: Int
+    """The rows the caller still wants, as one outer hull. `row_hi <= row_lo`
+    means no restriction."""
+    var group_rows: Int
+    """Rows in the whole row group — the implied `first_rows[npages]`."""
+
+    def __init__(out self):
+        self.first_rows = List[Int]()
+        self.row_lo = 0
+        self.row_hi = 0
+        self.group_rows = 0
+
+    def __init__(out self, *, copy: Self):
+        self.first_rows = copy.first_rows.copy()
+        self.row_lo = copy.row_lo
+        self.row_hi = copy.row_hi
+        self.group_rows = copy.group_rows
+
+    def __init__(out self, *, deinit move: Self):
+        self.first_rows = move.first_rows^
+        self.row_lo = move.row_lo
+        self.row_hi = move.row_hi
+        self.group_rows = move.group_rows
+
+    @always_inline
+    def restricts(self) -> Bool:
+        """Is there anything here that could let a page be skipped?"""
+        return len(self.first_rows) > 0 and self.row_hi > self.row_lo
+
+    @always_inline
+    def page_first_row(self, k: Int) -> Int:
+        """`first_rows[k]`, with the one-past-the-end entry spelled out."""
+        if k >= len(self.first_rows):
+            return self.group_rows
+        return self.first_rows[k]
+
+    def page_range(self, flat: Bool) raises -> Tuple[Int, Int]:
+        """The half-open range of data pages that can hold the wanted rows.
+
+        A page is in it when the rows it can hold meet `[row_lo, row_hi)`. For
+        a flat column that is `first_rows[k] < row_hi` and
+        `first_rows[k + 1] > row_lo`; a repeated column widens the second test
+        to `>=`, which is the in-flight record the struct's own note describes.
+        """
+        var n = len(self.first_rows)
+        var lo = 0
+        while lo < n:
+            var end = self.page_first_row(lo + 1)
+            if end > self.row_lo or (not flat and end >= self.row_lo):
+                break
+            lo += 1
+        var hi = lo
+        while hi < n and self.page_first_row(hi) < self.row_hi:
+            hi += 1
+        if hi <= lo:
+            raise Error(
+                String(
+                    "parquet.page: the page index selects no page for rows [",
+                    self.row_lo,
+                    ", ",
+                    self.row_hi,
+                    ")",
+                )
+            )
+        return (lo, hi)
+
+
 struct ColumnData(Copyable, Defaultable, Movable):
     """One decoded column chunk: levels and non-null values."""
 
@@ -209,6 +301,19 @@ struct ColumnData(Copyable, Defaultable, Movable):
     var values: PhysBuffer
     var num_slots: Int
     """Level slots — the number of values including nulls."""
+    var first_row: Int
+    """The row group row this chunk's first record is. Non-zero only when page
+    pruning let whole leading pages be skipped."""
+    var num_rows: Int
+    """Records this chunk covers, or -1 when it covers the whole row group and
+    the row group's own count is the answer."""
+    var pages_read: Int
+    """Data pages actually decompressed and decoded.
+
+    The evidence that page pruning does something: a skipped page has its
+    header parsed — that is how the next page is found — and nothing else, so
+    this counts the pages whose bytes were really turned into levels and
+    values."""
     var all_present: Bool
     """Every slot is at the leaf's maximum definition level, so `defs` was
     never materialised. This is the usual case — a column with no nulls — and
@@ -243,6 +348,9 @@ struct ColumnData(Copyable, Defaultable, Movable):
         self.reps = List[UInt16]()
         self.values = PhysBuffer()
         self.num_slots = 0
+        self.first_row = 0
+        self.num_rows = -1
+        self.pages_read = 0
         self.all_present = True
         self.page_slot = List[Int]()
         self.page_value = List[Int]()
@@ -254,6 +362,9 @@ struct ColumnData(Copyable, Defaultable, Movable):
         self.reps = copy.reps.copy()
         self.values = copy.values.copy()
         self.num_slots = copy.num_slots
+        self.first_row = copy.first_row
+        self.num_rows = copy.num_rows
+        self.pages_read = copy.pages_read
         self.all_present = copy.all_present
         self.page_slot = copy.page_slot.copy()
         self.page_value = copy.page_value.copy()
@@ -265,6 +376,9 @@ struct ColumnData(Copyable, Defaultable, Movable):
         self.reps = move.reps^
         self.values = move.values^
         self.num_slots = move.num_slots
+        self.first_row = move.first_row
+        self.num_rows = move.num_rows
+        self.pages_read = move.pages_read
         self.all_present = move.all_present
         self.page_slot = move.page_slot^
         self.page_value = move.page_value^
@@ -748,8 +862,29 @@ def read_column_chunk[
     cm: ColumnMetaData,
     leaf: LeafColumn,
     verify_crc: Bool,
+    window: PageWindow,
 ) raises -> ColumnData:
-    """Decode every page of one column chunk."""
+    """Decode the pages of one column chunk that `window` still wants.
+
+    A default `PageWindow` — what every read without page pruning passes — is
+    every page, and then this is the whole-chunk decode it always was: nothing
+    below branches on the window until there is one.
+
+    With a window, the pages outside it are found from the page index and never
+    decompressed. Their headers are still read, because that is how the next
+    page's offset is known, so what is saved is decompression, level decoding
+    and value decoding — everything after `Codecs.decompress` — which is where
+    a column chunk's time is.
+
+    **A record can span a page boundary.** The Parquet spec has pages change on
+    record boundaries when there is an `OffsetIndex`, but nothing in a file
+    proves it, and a window that starts inside a record would drop that
+    record's leading values and silently shorten a list. That is exactly what
+    the first slot's repetition level says: a chunk that begins a record has
+    `reps[0] == 0`. When it does not, this falls back to decoding the whole
+    chunk rather than trusting the seam — a rare, self-correcting cost, and the
+    only alternative that cannot be wrong.
+    """
     var out = ColumnData()
     # One optional level and no repetition: a definition level is a bit, so
     # the levels of this chunk are its validity bitmap and go straight there.
@@ -783,6 +918,18 @@ def read_column_chunk[
             )
         )
     var want = Int(cm.num_values)
+    # The half-open range of data pages to decode, and the rows they cover.
+    # `first_page == 0` and `last_page == -1` is "all of them", the path with
+    # no window at all.
+    var first_page = 0
+    var last_page = -1
+    if window.restricts():
+        var pages = window.page_range(leaf.max_rep == 0)
+        first_page = pages[0]
+        last_page = pages[1]
+        out.first_row = window.page_first_row(first_page)
+        out.num_rows = window.page_first_row(last_page) - out.first_row
+    var page_ix = 0
     var dict = PhysBuffer()
     var has_dict = False
     var codec = cm.codec.value
@@ -816,6 +963,23 @@ def read_column_chunk[
                 )
             )
         var body = file[body_at : body_at + csize]
+        # Is this page inside the window? Decided here, before the CRC, so a
+        # skipped page costs the header parse and nothing else — not the hash
+        # of its bytes, and not its decompression.
+        var is_data = (
+            ph.type_ == PageType.DATA_PAGE or ph.type_ == PageType.DATA_PAGE_V2
+        )
+        var skip = False
+        if is_data and last_page >= 0:
+            if page_ix >= last_page:
+                break
+            skip = page_ix < first_page
+            page_ix += 1
+        if skip:
+            offset = body_at + csize
+            continue
+        if is_data:
+            out.pages_read += 1
         if verify_crc and ph.crc:
             var want_crc = ph.crc.value()
             var got = crc32(body)
@@ -1003,7 +1167,7 @@ def read_column_chunk[
     if len(out.page_slot) > 0:
         out.page_slot.append(out.num_slots)
         out.page_value.append(nvalues)
-    if out.num_slots != want:
+    if last_page < 0 and out.num_slots != want:
         raise Error(
             String(
                 "parquet.page: column '",
@@ -1013,6 +1177,19 @@ def read_column_chunk[
                 " value slot(s) but the chunk metadata says ",
                 want,
             )
+        )
+    if (
+        last_page >= 0
+        and leaf.max_rep > 0
+        and len(out.reps) > 0
+        and out.reps[0] != 0
+    ):
+        # The window opened in the middle of a record: this page holds the
+        # tail of one that started in a page the window skipped, so the seam
+        # cannot be trusted. Decode the chunk whole instead — see the note on
+        # this function.
+        return read_column_chunk[Codecs](
+            file, cm, leaf, verify_crc, PageWindow()
         )
     if leaf.max_rep == 0:
         out.reps.clear()

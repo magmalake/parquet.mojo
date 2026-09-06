@@ -59,7 +59,7 @@ from parquet.bloom import BloomFilter, read_bloom_filter
 from parquet.carrow import CArrowArray, CArrowSchema, ExportedArray, export_c
 from parquet.codec import CodecSet, DefaultCodecs
 from parquet.encoding import PhysBuffer
-from parquet.page import ColumnData, read_column_chunk
+from parquet.page import ColumnData, PageWindow, read_column_chunk
 from parquet.reader import (
     OP_EQ,
     OP_GE,
