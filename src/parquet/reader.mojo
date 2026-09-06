@@ -42,7 +42,8 @@ from parquet.arrow import (
 from parquet.assemble import LeafSlice, build_field, first_leaf
 from parquet.carrow import ExportedArray, export_c
 from parquet.codec import CodecSet, DefaultCodecs
-from parquet.page import ColumnData, read_column_chunk
+from parquet.encoding import MAX_ARROW_VAR_BYTES, PK_VAR
+from parquet.page import ColumnData, PageWindow, read_column_chunk
 from parquet.schema import ArrowField, LeafColumn, ParquetSchema, build_schema
 from parquet.stats import (
     SV_BYTES,
@@ -453,7 +454,12 @@ struct _RowIndex(Copyable, Defaultable, Movable):
     """Every slot of the chunk holds a value, so the value index is the slot
     index and no null-counting is needed anywhere."""
     var max_def: Int
+    var row0: Int
+    """The row group row this chunk's first record is, which page pruning can
+    move off zero. Every row asked of this index is a row group row, so this
+    is subtracted before anything is looked up and added nowhere else."""
     var rows: Int
+    """Rows this chunk covers, starting at `row0`."""
     var total_slots: Int
     var total_values: Int
     var slot_cp: List[Int]
@@ -466,6 +472,7 @@ struct _RowIndex(Copyable, Defaultable, Movable):
         self.flat = False
         self.dense = True
         self.max_def = 0
+        self.row0 = 0
         self.rows = 0
         self.total_slots = 0
         self.total_values = 0
@@ -476,6 +483,7 @@ struct _RowIndex(Copyable, Defaultable, Movable):
         self.flat = copy.flat
         self.dense = copy.dense
         self.max_def = copy.max_def
+        self.row0 = copy.row0
         self.rows = copy.rows
         self.total_slots = copy.total_slots
         self.total_values = copy.total_values
@@ -486,6 +494,7 @@ struct _RowIndex(Copyable, Defaultable, Movable):
         self.flat = move.flat
         self.dense = move.dense
         self.max_def = move.max_def
+        self.row0 = move.row0
         self.rows = move.rows
         self.total_slots = move.total_slots
         self.total_values = move.total_values
@@ -493,13 +502,16 @@ struct _RowIndex(Copyable, Defaultable, Movable):
         self.value_cp = move.value_cp^
 
     @always_inline
-    def record_at(self, cd: ColumnData, r: Int) -> Tuple[Int, Int]:
-        """The first slot and the first value of record `r`.
+    def record_at(self, cd: ColumnData, row: Int) -> Tuple[Int, Int]:
+        """The first slot and the first value of row group row `row`.
 
-        `r == rows` is the end of the chunk, which is a stored answer; anything
-        else walks the levels forward from the nearest checkpoint, which is at
-        most `_RECORD_STRIDE` records back.
+        `row == row0 + rows` is the end of the chunk, which is a stored answer;
+        anything else walks the levels forward from the nearest checkpoint,
+        which is at most `_RECORD_STRIDE` records back.
         """
+        var r = row - self.row0
+        if r < 0:
+            r = 0
         if r >= self.rows:
             return (self.total_slots, self.total_values)
         var c = r // _RECORD_STRIDE
@@ -537,6 +549,7 @@ def _decode_leaf[
     leaf: LeafColumn,
     verify_crc: Bool,
     rows: Int,
+    window: PageWindow,
     mut data: ColumnData,
     mut index: _RowIndex,
 ) raises:
@@ -552,21 +565,26 @@ def _decode_leaf[
     aim them straight at its own slots in `_LoadCtx`, with nothing to move
     afterwards.
     """
-    data = read_column_chunk[Codecs](file, cm, leaf, verify_crc)
+    data = read_column_chunk[Codecs](file, cm, leaf, verify_crc, window)
     var max_def = leaf.max_def
     var max_rep = leaf.max_rep
     var nvals = 0
+    # Page pruning can leave the chunk holding a window of the row group rather
+    # than all of it; everything below counts within that window, and `row0` is
+    # what turns a row group row into one of these.
+    var covered = data.num_rows if data.num_rows >= 0 else rows
     index = _RowIndex()
     index.max_def = max_def
     index.dense = data.all_present
-    index.rows = rows
+    index.row0 = data.first_row
+    index.rows = covered
     index.total_slots = data.num_slots
     if max_rep == 0:
         # One slot per row, so the slot index *is* the row index, and the value
         # index of any row is a count of non-null slots the page walk has
         # already checkpointed. Nothing to build here at all.
         index.flat = True
-        if data.num_slots != rows:
+        if data.num_slots != covered:
             raise Error(
                 String(
                     "parquet: column '",
@@ -574,7 +592,7 @@ def _decode_leaf[
                     "' has ",
                     data.num_slots,
                     " value(s) in a row group of ",
-                    rows,
+                    covered,
                     " rows",
                 )
             )
@@ -582,7 +600,7 @@ def _decode_leaf[
             # Levels are either one bitmap or one `UInt16` per slot; whichever
             # this chunk has, it has to reach as far as the row group claims.
             var have = len(data.mask) * 8 if data.masked() else len(data.defs)
-            if rows > have:
+            if covered > have:
                 raise Error(_short_levels(leaf, "definition"))
         return
     var nslots = data.num_slots
@@ -594,7 +612,7 @@ def _decode_leaf[
     # The scan below is not optional — `records != rows` is a corruption check
     # every nested chunk has to pass — but what it *stores* is: one checkpoint
     # per `_RECORD_STRIDE` records rather than an entry per row.
-    var ncp = rows // _RECORD_STRIDE + 1
+    var ncp = covered // _RECORD_STRIDE + 1
     index.slot_cp.resize(ncp, 0)
     if not all_present:
         index.value_cp.resize(ncp, 0)
@@ -605,8 +623,19 @@ def _decode_leaf[
     var records = 0
     var next_cp = 0
     var cp = 0
+    var end_slots = nslots
+    var end_values = -1
     for k in range(nslots):
         if reps.unsafe_load(k) == 0:
+            if records == covered:
+                # The window's last page can end with a record still in
+                # flight, whose remaining values are in a page the window
+                # skipped. That record is past every row this read asked for,
+                # so the index stops at its first slot and nothing downstream
+                # can reach a truncated list.
+                end_slots = k
+                end_values = nvals
+                break
             # A chunk that starts more records than the row group claims is
             # caught right after the loop; up to then, only write inside the
             # sized buffer.
@@ -619,7 +648,7 @@ def _decode_leaf[
             records += 1
         if all_present or Int(defs.unsafe_load(k)) == max_def:
             nvals += 1
-    if records != rows:
+    if records != covered:
         raise Error(
             String(
                 "parquet: column '",
@@ -627,11 +656,12 @@ def _decode_leaf[
                 "' assembles ",
                 records,
                 " record(s) in a row group of ",
-                rows,
+                covered,
                 " rows",
             )
         )
-    index.total_values = nvals
+    index.total_slots = end_slots
+    index.total_values = nvals if end_values < 0 else end_values
 
 
 @always_inline
@@ -661,26 +691,130 @@ def _leaf_slices(
             slices.append(LeafSlice())
             continue
         ref ix = index[i]
-        var s0 = r0
-        var s1 = r1
-        var v0 = r0
+        # Rows are row group rows; a chunk page pruning trimmed starts at
+        # `row0`, so that is what turns one into an index into this chunk. It
+        # is zero for every read that skipped no page, which is every read
+        # without page pruning.
+        var s0 = r0 - ix.row0
+        var s1 = r1 - ix.row0
+        var v0 = s0
         if not ix.flat:
-            if r1 > ix.rows:
+            if r1 > ix.row0 + ix.rows or r0 < ix.row0:
                 slices.append(LeafSlice())
                 continue
             var at = ix.record_at(chunks[i], r0)
             s0 = at[0]
             v0 = at[1]
             s1 = ix.record_at(chunks[i], r1)[0]
-        elif r1 > chunks[i].num_slots:
+        elif s1 > chunks[i].num_slots or s0 < 0:
             slices.append(LeafSlice())
             continue
         elif not ix.dense:
             # Every slot is a row here, so the value index is how many of the
             # rows before this one held a value.
-            v0 = chunks[i].value_at(r0, ix.max_def)
+            v0 = chunks[i].value_at(s0, ix.max_def)
         slices.append(LeafSlice(s0, s1, v0))
     return slices^
+
+
+@always_inline
+def _value_index(cd: ColumnData, ix: _RowIndex, row: Int) -> Int:
+    """Where row group row `row` starts in a leaf's value buffer.
+
+    The value half of what `_leaf_slices` computes, on its own, because the
+    batch limit below needs it at rows it is still deciding about.
+    """
+    if not ix.flat:
+        return ix.record_at(cd, row)[1]
+    var s = row - ix.row0
+    if ix.dense:
+        return s
+    return cd.value_at(s, ix.max_def)
+
+
+def _row_too_wide(leaf: LeafColumn, bytes: Int, limit: Int) -> Error:
+    return Error(
+        String(
+            "parquet: one row of column '",
+            leaf.dotted(),
+            "' holds ",
+            bytes,
+            " bytes of BYTE_ARRAY data, past the ",
+            limit,
+            (
+                " a batch may carry — no batch boundary splits a single row, so"
+                " this column needs 64-bit offsets (large_binary), which"
+                " parquet.mojo does not have"
+            ),
+        )
+    )
+
+
+def _arrow_batch_end(
+    leaves: List[LeafColumn],
+    needed: List[Bool],
+    chunks: List[ColumnData],
+    index: List[_RowIndex],
+    r0: Int,
+    r1: Int,
+    limit: Int,
+) raises -> Int:
+    """`r1`, pulled back until every column's value bytes fit an Arrow offset.
+
+    A column chunk can hold more than 2 GiB of `BYTE_ARRAY` data —
+    `PhysBuffer` addresses its bytes with 64-bit offsets, so decoding one is
+    not the problem — but an Arrow `binary`/`string` array cannot, and a batch
+    is Arrow arrays. So the batch is cut instead, which is machinery
+    `read_batch` already has: it bounds a batch at `batch_size` rows and never
+    lets one span two row groups, and this is a third bound on the same
+    number.
+
+    **One split point for every column.** The columns of a batch are aligned
+    row for row, so a cut that suited only the column that overflowed would
+    tear the others apart. The answer is the smallest row any leaf can reach,
+    and every column stops there.
+
+    Nothing but an oversized chunk pays for this: a chunk whose *whole* value
+    buffer fits inside an Arrow offset — which is every chunk of every
+    ordinary file — is dismissed on one comparison, before any row is looked
+    up.
+
+    A single row that holds more than the limit on its own has no split point
+    that would help, so that is where this raises, with the column named — the
+    one shape of this file that batching cannot rescue.
+    """
+    var end = r1
+    for i in range(len(chunks)):
+        if not needed[i]:
+            continue
+        ref cd = chunks[i]
+        if cd.values.kind != PK_VAR:
+            continue
+        if len(cd.values.bytes) <= limit:
+            continue
+        var base = cd.values.offsets[_value_index(cd, index[i], r0)]
+        if cd.values.offsets[_value_index(cd, index[i], end)] - base <= limit:
+            continue
+        # Bytes grow with the row, so the last row that fits is a binary
+        # search. `r0 + 1` is the floor: a batch of no rows would not end.
+        var lo = r0 + 1
+        var hi = end
+        while lo < hi:
+            var mid = (lo + hi + 1) // 2
+            var at = cd.values.offsets[_value_index(cd, index[i], mid)]
+            if at - base <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        if cd.values.offsets[_value_index(cd, index[i], lo)] - base > limit:
+            raise _row_too_wide(
+                leaves[i],
+                cd.values.offsets[_value_index(cd, index[i], lo)] - base,
+                limit,
+            )
+        if lo < end:
+            end = lo
+    return end
 
 
 struct _RowGroupData(Defaultable, Movable):
@@ -749,6 +883,8 @@ struct _LoadCtx(Movable):
     through the reader while the caller holds it mutably."""
     var leaves: List[LeafColumn]
     var rows: List[Int]
+    var windows: List[PageWindow]
+    """Per queued leaf, which of its pages page pruning still wants."""
     var dest: List[Int]
     """Task `k` writes the output slots at `dest[k]`."""
     var chunks: List[ColumnData]
@@ -778,6 +914,7 @@ struct _LoadCtx(Movable):
         self.metas = List[ColumnMetaData]()
         self.leaves = List[LeafColumn]()
         self.rows = List[Int]()
+        self.windows = List[PageWindow]()
         self.dest = List[Int]()
         self.chunks = List[ColumnData]()
         self.index = List[_RowIndex]()
@@ -798,6 +935,7 @@ struct _LoadCtx(Movable):
         self.metas = move.metas^
         self.leaves = move.leaves^
         self.rows = move.rows^
+        self.windows = move.windows^
         self.dest = move.dest^
         self.chunks = move.chunks^
         self.index = move.index^
@@ -839,6 +977,7 @@ def _decode_leaf_task[Codecs: CodecSet](k: Int, mut ctx: _LoadCtx) -> None:
             ctx.leaves[k],
             ctx.verify_crc,
             ctx.rows[k],
+            ctx.windows[k],
             ctx.chunks[d],
             ctx.index[d],
         )
@@ -982,6 +1121,22 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     var meta: FileMetaData
     var schema: ParquetSchema
     var batch_size: Int
+    var max_batch_value_bytes: Int
+    """The most `BYTE_ARRAY` bytes one batch may carry, per column.
+
+    A third bound on a batch, next to `batch_size` and the row group. It exists
+    because an Arrow `binary`/`string` array addresses its value bytes with a
+    **32-bit** offset while the decoded column chunk behind it does not — a
+    chunk holding more than 2 GiB decodes perfectly well and only the batch cut
+    from it has to be smaller. `large_string_map.brotli.parquet` in
+    apache/parquet-testing is such a file: two rows whose keys are a gibibyte
+    each, which read as two batches of one row.
+
+    The default is that 2 GiB ceiling, and a batch of ordinary strings never
+    comes near it — the check is one comparison against the whole chunk's byte
+    count and is skipped there. Lowering it caps a batch's value bytes, which
+    is what makes the splitting testable without a two-gibibyte fixture.
+    """
     var verify_crc: Bool
     var num_workers: Int
     """How many OS threads turn file bytes into Arrow at once.
@@ -1056,6 +1211,8 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     batching, assembly, row order — is the code it always was. Empty for every
     other caller, which is what keeps the streaming memory contract intact.
     """
+    var _pages_read: Int
+    """Data pages decoded since the last `rewind`. See `pages_read`."""
 
     def __init__(out self, var data: List[UInt8]) raises:
         """Take ownership of the file bytes."""
@@ -1089,6 +1246,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self.meta = read_footer(self.data)
         self.schema = build_schema(self.meta.schema)
         self.batch_size = 65536
+        self.max_batch_value_bytes = MAX_ARROW_VAR_BYTES
         self.verify_crc = True
         self.num_workers = 1
         self._row_groups = List[Int]()
@@ -1106,6 +1264,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._chunks = List[ColumnData]()
         self._row_index = List[_RowIndex]()
         self._prefetched = List[_RowGroupData]()
+        self._pages_read = 0
 
     def __init__(out self, *, deinit move: Self):
         self._owned = move._owned^
@@ -1114,6 +1273,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self.meta = move.meta^
         self.schema = move.schema^
         self.batch_size = move.batch_size
+        self.max_batch_value_bytes = move.max_batch_value_bytes
         self.verify_crc = move.verify_crc
         self.num_workers = move.num_workers
         self._row_groups = move._row_groups^
@@ -1129,6 +1289,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._chunks = move._chunks^
         self._row_index = move._row_index^
         self._prefetched = move._prefetched^
+        self._pages_read = move._pages_read
 
     @staticmethod
     def open(path: StringSlice) raises -> Self:
@@ -1372,7 +1533,62 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._row_pos = 0
         self._did_empty = False
         self._loaded_rg = -1
+        self._pages_read = 0
         self._drop_prefetch()
+
+    def pages_read(self) -> Int:
+        """Data pages this reader has decoded since the last `rewind`.
+
+        What `prune_pages` is *for*: a page the page index puts outside every
+        wanted row range has its header parsed, so that the next page can be
+        found, and is then stepped over — not decompressed, not decoded. This
+        is the count that drops when that happens, and the only way to tell a
+        read that skipped pages from one that read them all, since both give
+        the same values.
+        """
+        return self._pages_read
+
+    def _page_window(self, slot: Int, rg: Int, leaf: Int) raises -> PageWindow:
+        """Which pages of one column chunk this read still wants.
+
+        The outer hull of the row ranges page pruning left, turned into a page
+        range by the leaf's own `OffsetIndex`. A hull rather than the ranges
+        themselves: a chunk is decoded into one contiguous run of slots, so the
+        rows it covers have to be contiguous too, and skipping only what lies
+        before the first wanted row and after the last one keeps that true
+        while still dropping everything a selective predicate excludes at the
+        ends of the chunk.
+
+        Empty — decode everything — when nothing was pruned, when the hull is
+        the whole row group, or when the column has no page index.
+        """
+        var w = PageWindow()
+        if slot < 0 or len(self._ranges) == 0:
+            return w^
+        var ranges = self._ranges_for(slot)
+        if len(ranges) == 0:
+            return w^
+        var rows = Int(self.meta.row_groups[rg].num_rows)
+        var lo = ranges[0][0]
+        var hi = ranges[len(ranges) - 1][1]
+        if lo <= 0 and hi >= rows:
+            return w^
+        var oi = self.offset_index(rg, leaf)
+        if not oi:
+            return w^
+        ref locs = oi.value().page_locations
+        if len(locs) == 0:
+            return w^
+        for k in range(len(locs)):
+            w.first_rows.append(Int(locs[k].first_row_index))
+        if w.first_rows[0] != 0:
+            # A page index whose first page does not start the row group is
+            # not one this can reason from.
+            return PageWindow()
+        w.row_lo = lo
+        w.row_hi = hi
+        w.group_rows = rows
+        return w^
 
     def _resolved_workers(self) -> Int:
         """`num_workers` with `0` spelt out as the core count."""
@@ -1404,7 +1620,14 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             return True
         return False
 
-    def _load(mut self, rg: Int) raises:
+    def _load(mut self, rg: Int, slot: Int = -1) raises:
+        """Decode row group `rg`, which the selection holds at `slot`.
+
+        The slot is what says which row ranges page pruning left, and so which
+        of each chunk's pages have to be decoded at all; `-1` is "no slot, no
+        window", which is what the empty-row-group path and any caller with
+        nothing pruned passes.
+        """
         if self._loaded_rg == rg:
             return
         var nleaves = len(self.schema.leaves)
@@ -1430,7 +1653,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             if workers > projected:
                 workers = projected
         if workers > 1:
-            self._load_threaded(rg, nleaves, workers)
+            self._load_threaded(rg, slot, nleaves, workers)
             return
         for i in range(nleaves):
             if not self._needed[i]:
@@ -1448,15 +1671,17 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 self.schema.leaves[i],
                 self.verify_crc,
                 rows,
+                self._page_window(slot, rg, i),
                 cd,
                 ix,
             )
+            self._pages_read += cd.pages_read
             self._chunks.append(cd^)
             self._row_index.append(ix^)
         self._loaded_rg = rg
 
     def _decode_groups(
-        self, rgs: List[Int], nleaves: Int, workers: Int
+        self, rgs: List[Int], slots: List[Int], nleaves: Int, workers: Int
     ) raises -> List[_RowGroupData]:
         """Decode every projected leaf of every row group in `rgs`, threaded.
 
@@ -1507,6 +1732,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 ctx.metas.append(chunk.meta_data.value().copy())
                 ctx.leaves.append(self.schema.leaves[i].copy())
                 ctx.rows.append(rows)
+                ctx.windows.append(self._page_window(slots[g], rg, i))
                 ctx.dest.append(g * nleaves + i)
         var n = len(ctx.dest)
         # The typed `parallel_for` holds `ctx` for the whole call, joins
@@ -1525,7 +1751,9 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             out.append(ctx.take_group(g))
         return out^
 
-    def _load_threaded(mut self, rg: Int, nleaves: Int, workers: Int) raises:
+    def _load_threaded(
+        mut self, rg: Int, slot: Int, nleaves: Int, workers: Int
+    ) raises:
         """`_load`'s body on `workers` threads, one task per projected leaf.
 
         A window of exactly one row group: the second axis has no width here,
@@ -1533,7 +1761,10 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         caller has not asked for yet.
         """
         var one: List[Int] = [rg]
-        var got = self._decode_groups(one, nleaves, workers)
+        var at: List[Int] = [slot]
+        var got = self._decode_groups(one, at, nleaves, workers)
+        for c in got[0].chunks:
+            self._pages_read += c.pages_read
         self._chunks = got[0].take_chunks()
         self._row_index = got[0].take_index()
         self._loaded_rg = rg
@@ -1545,7 +1776,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 return g
         return -1
 
-    def _plan_window(mut self, past: Int) -> List[_BatchPlan]:
+    def _plan_window(mut self, past: Int) raises -> List[_BatchPlan]:
         """Cut every batch this window hands out, without building any of them.
 
         The batch walk of `read_batch`, with `_load` and `_assemble` taken out:
@@ -1572,7 +1803,21 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             var r1 = r0 + self.batch_size
             if r1 > span[1]:
                 r1 = span[1]
-            plans.append(_BatchPlan(rg, self._prefetched_group(rg), r0, r1))
+            var g = self._prefetched_group(rg)
+            if g >= 0:
+                # The same third bound `read_batch` applies, on the window's
+                # own copy of the chunks: a batch cannot carry more value bytes
+                # than an Arrow offset can address.
+                r1 = _arrow_batch_end(
+                    self.schema.leaves,
+                    self._needed,
+                    self._prefetched[g].chunks,
+                    self._prefetched[g].index,
+                    r0,
+                    r1,
+                    self.max_batch_value_bytes,
+                )
+            plans.append(_BatchPlan(rg, g, r0, r1))
             self._row_pos = r1
         return plans^
 
@@ -1660,6 +1905,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         sequential one does and no more.
         """
         var rgs = List[Int]()
+        var slots = List[Int]()
         for s in range(first, past):
             var rg = self._row_groups[s]
             if Int(self.meta.row_groups[rg].num_rows) == 0:
@@ -1674,9 +1920,15 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             if seen:
                 continue
             rgs.append(rg)
+            slots.append(s)
         if len(rgs) == 0:
             return
-        var got = self._decode_groups(rgs, len(self.schema.leaves), workers)
+        var got = self._decode_groups(
+            rgs, slots, len(self.schema.leaves), workers
+        )
+        for g in range(len(got)):
+            for c in got[g].chunks:
+                self._pages_read += c.pages_read
         self._prefetched = got^
 
     def _ranges_for(self, slot: Int) -> List[Tuple[Int, Int]]:
@@ -1731,7 +1983,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         if not self._seek():
             return RecordBatch()
         var rg = self._row_groups[self._rg_pos]
-        self._load(rg)
+        self._load(rg, self._rg_pos)
         if Int(self.meta.row_groups[rg].num_rows) == 0:
             self._did_empty = True
             return self._assemble(0, 0)
@@ -1741,6 +1993,15 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         var r1 = r0 + self.batch_size
         if r1 > span[1]:
             r1 = span[1]
+        r1 = _arrow_batch_end(
+            self.schema.leaves,
+            self._needed,
+            self._chunks,
+            self._row_index,
+            r0,
+            r1,
+            self.max_batch_value_bytes,
+        )
         var batch = self._assemble(r0, r1)
         self._row_pos = r1
         return batch^
@@ -1780,6 +2041,22 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         Uses the `ColumnIndex` bounds and the `OffsetIndex` first-row indices.
         A column without a page index puts no restriction on the answer, so a
         file written without one behaves exactly as it did before.
+
+        **A repeated column's pages do line up with rows** — through
+        `OffsetIndex.first_row_index`, which is the number of records of the
+        row group complete before the page starts. What it does *not* line up
+        with is record boundaries: a record can still be in flight when a page
+        ends, so page `k` holds values for rows
+
+            [first_row_index[k], first_row_index[k + 1]]
+
+        with the top end *closed*. That last row is the overhang, and this
+        rounds outward to keep it: a page whose bounds match contributes one
+        row more than it completes. Rounding inward instead — treating the
+        range as half-open, as a flat column's is — drops the row whose list
+        straddles the seam, which is a wrong answer that looks like a right
+        one. A flat column has no records to be in flight and keeps the
+        half-open range it always had.
         """
         var rows = Int(self.meta.row_groups[rg].num_rows)
         var out = List[Tuple[Int, Int]]()
@@ -1788,10 +2065,7 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
             var leaf = self.schema.leaf_by_path(p.column)
             if leaf < 0:
                 continue
-            if self.schema.leaves[leaf].max_rep > 0:
-                # A repeated column's pages do not line up with rows one to
-                # one in a way a simple predicate can use.
-                continue
+            var nested = self.schema.leaves[leaf].max_rep > 0
             var oi = self.offset_index(rg, leaf)
             var ci = self.column_index(rg, leaf)
             if not oi or not ci:
@@ -1806,6 +2080,13 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 var end = rows
                 if k + 1 < len(locs):
                     end = Int(locs[k + 1].first_row_index)
+                    if nested:
+                        # The in-flight record, rounded outward. A page that
+                        # completes no record at all — `end == start` — still
+                        # holds part of row `start`, and keeps exactly it.
+                        end += 1
+                        if end > rows:
+                            end = rows
                 if start >= end:
                     continue
                 if idx.null_pages[k]:
@@ -1821,7 +2102,10 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
                 )
                 if range_can_match(p.op, lo, hi, p.value):
                     keep.append((start, end))
-            out = _intersect_ranges(out, keep)
+            # Rounding a repeated column's pages outward makes consecutive
+            # kept pages overlap by a row, and `_intersect_ranges` wants
+            # disjoint inputs.
+            out = _intersect_ranges(out, _merge_ranges(keep^))
         return _merge_ranges(out^)
 
     def prune_pages(mut self, predicates: List[Predicate]) raises -> Int:

@@ -72,7 +72,7 @@ from parquet import (
     export_c,
     array_str,
 )
-from parquet.page import chunk_start
+from parquet.page import PageWindow, chunk_start, read_column_chunk
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.writer import DICT_MAX_VALUES
 from parquet.bitio import (
@@ -97,7 +97,12 @@ from parquet.encoding import (
     gather_dict_into,
     gather_into,
 )
-from parquet.schema import REP_OPTIONAL, REP_REPEATED, REP_REQUIRED
+from parquet.schema import (
+    REP_OPTIONAL,
+    REP_REPEATED,
+    REP_REQUIRED,
+    LeafColumn,
+)
 from std.memory import bitcast
 from std.testing import (
     TestSuite,
@@ -108,13 +113,18 @@ from std.testing import (
     assert_true,
 )
 from thrift import (
+    ColumnMetaData,
     CompressionCodec,
     ConvertedType,
+    DataPageHeader,
+    Encoding,
     FieldRepetitionType,
     ListType,
     LogicalType,
+    PageHeader,
     PageType,
     SchemaElement,
+    TCompactProtocolWriter,
     Type,
     read_page_header,
     read_parquet_file,
@@ -1054,6 +1064,565 @@ def test_page_pruning() raises:
         if mk[1][i] and mk[0][i] >= 600 and mk[0][i] < 605:
             mfound += 1
     assert_equal(mfound, 5, "our own page index must not drop a matching row")
+
+
+def _write_list_column(
+    rows: Int, per_row: Int, var options: WriterOptions
+) raises -> List[UInt8]:
+    """`rows` lists of `per_row` ascending `INT64`s, written by us.
+
+    Row `r` holds `r * 16 + k` for `k` in `[0, per_row)`, so the values climb
+    with the row and every page's `ColumnIndex` bounds are disjoint from every
+    other page's — which is what gives a predicate anything to prune. The list
+    is `required` and so are its elements, so the leaf has `max_rep == 1`: the
+    column page pruning used to leave alone.
+    """
+    var child = ArrayData(ArrowType(AT_INT64), String("element"))
+    child.nullable = False
+    child.length = rows * per_row
+    for r in range(rows):
+        for k in range(per_row):
+            var u = bitcast[DType.uint64](Int64(r * 16 + k))
+            for b in range(8):
+                child.values.append(UInt8((u >> UInt64(8 * b)) & 0xFF))
+    var li = ArrayData(ArrowType(AT_LIST), String("l"))
+    li.nullable = False
+    li.length = rows
+    for r in range(rows + 1):
+        li.offsets.append(Int32(r * per_row))
+    var arena = ArrayArena()
+    li.children.append(arena.add(child^))
+    var roots: List[Int] = [arena.add(li^)]
+    var w = ParquetWriter(options^)
+    w.write_batch(arena, roots)
+    return w^.finish()
+
+
+def _table_rows(t: Table) raises -> List[String]:
+    """Every row of column 0, rendered the way the pyarrow oracle renders it —
+    so an element attached to the wrong row is different text, not a value that
+    happens to compare equal."""
+    var out = List[String]()
+    for b in range(len(t.batches)):
+        ref batch = t.batches[b]
+        for i in range(batch.num_rows):
+            var s = String()
+            canon_value(batch.arena, batch.roots[0], i, s)
+            out.append(s^)
+    return out^
+
+
+def _assert_pruned_rows_match_a_full_read(
+    mut r: ParquetReader[DefaultCodecs],
+    t: Table,
+    predicates: List[Predicate],
+    want: List[String],
+    what: String,
+) raises:
+    """The rows a pruned read returned are the rows the page index says it
+    should have, holding what a full read of those same rows holds."""
+    var got = _table_rows(t)
+    var at = 0
+    var base = 0
+    for g in range(r.num_row_groups()):
+        var ranges = r.page_row_ranges(g, predicates)
+        for span in ranges:
+            for i in range(span[0], span[1]):
+                assert_equal(
+                    got[at], want[base + i], String(what, ": row ", base + i)
+                )
+                at += 1
+        base += Int(r.meta.row_groups[g].num_rows)
+    assert_equal(at, len(got), String(what, ": rows returned"))
+
+
+def test_page_pruning_skips_pages_of_a_repeated_column() raises:
+    """A predicate on a nested leaf must skip pages, not merely be correct.
+
+    Not skipping is also correct, so values alone prove nothing: what is
+    asserted here is `pages_read()`, the count of data pages actually
+    decompressed and decoded. 800 rows of `list<int64>` in four row groups at
+    two records a page is 400 data pages; a predicate that matches two rows
+    must leave the reader having decoded a handful.
+
+    The three shapes that can go wrong:
+
+    * a predicate whose rows sit inside one page;
+    * one whose rows **straddle a page boundary**, where the record in flight
+      at the seam is the element the outward rounding exists to keep;
+    * one nothing matches, which must decode no page at all.
+
+    And in every case the rows that come back must be, value for value, the
+    rows a full read gives at those same positions.
+    """
+    comptime ROWS = 800
+    comptime PER = 4
+    var opts = WriterOptions()
+    opts.use_dictionary = False
+    opts.data_page_size = PER * 16  # two records a page
+    opts.row_group_size = ROWS // 4
+    var bytes = _write_list_column(ROWS, PER, opts^)
+
+    var full = ParquetReader[DefaultCodecs](bytes.copy())
+    var path = full.schema.leaves[0].dotted()
+    assert_true(
+        full.schema.leaves[0].max_rep > 0,
+        String("the fixture leaf '", path, "' is not repeated"),
+    )
+    var whole = full.read_table()
+    assert_equal(whole.num_rows, ROWS)
+    var want = _table_rows(whole)
+    var all_pages = full.pages_read()
+    assert_equal(
+        all_pages,
+        400,
+        String(
+            "800 rows at two records a page should be 400 data pages, not ",
+            all_pages,
+        ),
+    )
+
+    # Rows 401 and 402 — the pair that straddles the seam between the page
+    # holding rows 400-401 and the one holding rows 402-403.
+    var straddle: List[Predicate] = [
+        Predicate(path.copy(), OP_GE, ScalarValue.of_int(401 * 16)),
+        Predicate(path.copy(), OP_LT, ScalarValue.of_int(403 * 16)),
+    ]
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
+    var left = r.prune_pages(straddle)
+    # Five, not four. The two pages whose bounds match complete rows 400-401
+    # and 402-403; each of them also holds whatever of row 404 was in flight at
+    # its end, so each contributes one row more than it completes and the union
+    # is rows 400-404. Four would mean the outward rounding was skipped.
+    assert_equal(
+        left,
+        5,
+        String("a repeated column's pages pruned to ", left, " of ", ROWS),
+    )
+    var t = r.read_table()
+    assert_equal(t.num_rows, left)
+    var pruned_pages = r.pages_read()
+    assert_equal(
+        pruned_pages,
+        3,
+        String(
+            "a two-row predicate decoded ",
+            pruned_pages,
+            " of ",
+            all_pages,
+            (
+                " data pages — three is the seam's two plus the page the"
+                " outward rounding keeps"
+            ),
+        ),
+    )
+    _assert_pruned_rows_match_a_full_read(
+        r, t, straddle, want, String("straddling the seam")
+    )
+    # The rows that actually match have to be among the ones kept.
+    var kept = r.page_row_ranges(2, straddle)
+    var have401 = False
+    var have402 = False
+    for span in kept:
+        if span[0] <= 1 and 1 < span[1]:
+            have401 = True
+        if span[0] <= 2 and 2 < span[1]:
+            have402 = True
+    assert_true(have401 and have402, "a matching row was pruned away")
+
+    # A predicate whose rows sit inside a single page.
+    var inside: List[Predicate] = [
+        Predicate(path.copy(), OP_GE, ScalarValue.of_int(600 * 16)),
+        Predicate(path.copy(), OP_LT, ScalarValue.of_int(600 * 16 + PER)),
+    ]
+    var r2 = ParquetReader[DefaultCodecs](bytes.copy())
+    var left2 = r2.prune_pages(inside)
+    assert_true(left2 > 0 and left2 < 16, String("inside one page: ", left2))
+    var t2 = r2.read_table()
+    assert_equal(t2.num_rows, left2)
+    assert_true(
+        r2.pages_read() <= 3,
+        String("one page's worth of rows decoded ", r2.pages_read(), " pages"),
+    )
+    _assert_pruned_rows_match_a_full_read(
+        r2, t2, inside, want, String("inside one page")
+    )
+
+    # A predicate nothing can match reads no page at all.
+    var r3 = ParquetReader[DefaultCodecs](bytes.copy())
+    var none: List[Predicate] = [
+        Predicate(path.copy(), OP_GT, ScalarValue.of_int(1000000000000))
+    ]
+    assert_equal(r3.prune_pages(none), 0)
+    assert_equal(r3.read_table().num_rows, 0)
+    assert_equal(
+        r3.pages_read(), 0, "a predicate nothing matches still decoded a page"
+    )
+
+    # …and the same answer with the row-group axis running, where the window
+    # is prefetched rather than loaded one row group at a time.
+    var r4 = ParquetReader[DefaultCodecs](bytes.copy())
+    r4.num_workers = 4
+    assert_equal(r4.prune_pages(straddle), left)
+    var t4 = r4.read_table()
+    assert_equal(t4.num_rows, left)
+    assert_equal(
+        r4.pages_read(),
+        pruned_pages,
+        String("threaded: ", r4.pages_read(), " of ", all_pages, " pages"),
+    )
+    _assert_pruned_rows_match_a_full_read(
+        r4, t4, straddle, want, String("straddling, threaded")
+    )
+
+    # Batching must not move a row either: the same rows, cut differently.
+    var r5 = ParquetReader[DefaultCodecs](bytes.copy())
+    _ = r5.prune_pages(straddle)
+    r5.batch_size = 2
+    var t5 = r5.read_table()
+    assert_equal(t5.num_rows, left)
+    _assert_pruned_rows_match_a_full_read(
+        r5, t5, straddle, want, String("straddling, batch size 2")
+    )
+
+
+def test_a_repeated_page_range_rounds_outward() raises:
+    """The page-selection rule, on an index a record demonstrably spans.
+
+    `first_row_index = [0, 2, 2, 5, 9]` says page 1 completes no record at all,
+    so record 2 has values in pages 0, 1, 2 and 3. Reading rows `[2, 3)`
+    therefore needs *every one of those pages*, and the half-open rule a flat
+    column uses — "page `k` holds rows `[fri[k], fri[k+1])`" — would start at
+    page 2 and lose the front of the list. The two answers are asserted side by
+    side because the difference between them is the whole bug.
+    """
+    var w = PageWindow()
+    w.first_rows = [0, 2, 2, 5, 9]
+    w.group_rows = 12
+    w.row_lo = 2
+    w.row_hi = 3
+    var nested = w.page_range(False)
+    assert_equal(
+        nested[0], 0, "a repeated column skipped the page it starts in"
+    )
+    assert_equal(nested[1], 3)
+    var flat = w.page_range(True)
+    assert_equal(flat[0], 2, "the flat rule must stay the tight one")
+    assert_equal(flat[1], 3)
+
+
+def _mid_record_chunk() raises -> List[UInt8]:
+    """A `list<int64>` column chunk whose pages break *inside* a record.
+
+    Six records of two elements each, cut after slots 5 and 9: page 0 completes
+    records 0 and 1 and leaves record 2 in flight, page 1 finishes it and
+    leaves record 4 in flight, page 2 finishes the rest. Its page index would
+    read `first_row_index = [0, 2, 4]` — strictly increasing, so nothing in the
+    index says a record is spanning a seam.
+
+    No writer in this repository emits such a chunk and neither does pyarrow;
+    the Parquet spec has pages change on record boundaries where there is an
+    `OffsetIndex`. Nothing in a *file* proves it, which is why the reader has a
+    path for it, and this is what that path is tested against.
+    """
+    var records = 6
+    var per = 2
+    var slots = records * per
+    var bounds: List[Int] = [0, 5, 9, slots]
+    var bytes = List[UInt8]()
+    for pg in range(len(bounds) - 1):
+        var s0 = bounds[pg]
+        var s1 = bounds[pg + 1]
+        var reps = List[UInt16]()
+        var defs = List[UInt16]()
+        for k in range(s0, s1):
+            reps.append(UInt16(0) if k % per == 0 else UInt16(1))
+            defs.append(UInt16(1))
+        var body = List[UInt8]()
+        body.extend(Span(encode_levels(Span(reps), 1)))
+        body.extend(Span(encode_levels(Span(defs), 1)))
+        for k in range(s0, s1):
+            var u = bitcast[DType.uint64](Int64(k))
+            for b in range(8):
+                body.append(UInt8((u >> UInt64(8 * b)) & 0xFF))
+        var ph = PageHeader()
+        ph.type_ = PageType.DATA_PAGE
+        ph.uncompressed_page_size = Int32(len(body))
+        ph.compressed_page_size = Int32(len(body))
+        var dph = DataPageHeader()
+        dph.num_values = Int32(s1 - s0)
+        dph.encoding = Encoding.PLAIN
+        dph.definition_level_encoding = Encoding.RLE
+        dph.repetition_level_encoding = Encoding.RLE
+        ph.data_page_header = dph^
+        var w = TCompactProtocolWriter()
+        ph.write(w)
+        var hdr = w^.take()
+        bytes.extend(Span(hdr))
+        bytes.extend(Span(body))
+    return bytes^
+
+
+def _mid_record_meta(nbytes: Int) -> ColumnMetaData:
+    """`_mid_record_chunk`'s metadata: twelve slots, uncompressed, at offset 0.
+    """
+    var cm = ColumnMetaData()
+    cm.type_ = Type.INT64
+    cm.codec = CompressionCodec.UNCOMPRESSED
+    cm.num_values = 12
+    cm.data_page_offset = 0
+    cm.total_compressed_size = Int64(nbytes)
+    return cm^
+
+
+def _list_leaf() raises -> LeafColumn:
+    """The leaf of `required group l (LIST) { repeated group list { required
+    int64 element; } }` — `max_rep == 1`, `max_def == 1`."""
+    var els = List[SchemaElement]()
+    els.append(_group(String("schema"), REP_REQUIRED, 1, False))
+    els.append(_group(String("l"), REP_REQUIRED, 1, True))
+    els.append(_group(String("list"), REP_REPEATED, 1, False))
+    els.append(_leaf(String("element"), REP_REQUIRED, Type.INT64.value))
+    var s = build_schema(els)
+    return s.leaves[0].copy()
+
+
+def test_a_window_opening_mid_record_decodes_the_whole_chunk() raises:
+    """The seam the page index cannot warn about, and the only safe answer.
+
+    Rows `[4, 6)` of `_mid_record_chunk` select pages 1 and 2, and page 1 opens
+    with the second half of record 2 — repetition level 1, not 0. Trusting that
+    seam would attach page 1's leading element to a record that never started
+    and shorten the list it belongs to, which is a wrong answer that reads like
+    a right one. So the window is dropped and the chunk decoded whole: the
+    result has to be the *same* chunk a read with no window at all produces.
+    """
+    var made = _mid_record_chunk()
+    var cm = _mid_record_meta(len(made))
+    var leaf = _list_leaf()
+    var whole = read_column_chunk[DefaultCodecs](
+        Span(made), cm, leaf, True, PageWindow()
+    )
+    assert_equal(whole.num_slots, 12)
+    assert_equal(whole.pages_read, 3)
+
+    var w = PageWindow()
+    w.first_rows = [0, 2, 4]
+    w.group_rows = 6
+    w.row_lo = 4
+    w.row_hi = 6
+    var pages = w.page_range(False)
+    assert_equal(pages[0], 1, "the window should have started at page 1")
+    assert_equal(pages[1], 3)
+    var got = read_column_chunk[DefaultCodecs](Span(made), cm, leaf, True, w)
+    assert_equal(
+        got.num_slots, whole.num_slots, "the mid-record seam was trusted"
+    )
+    assert_equal(got.pages_read, 3, "the fallback did not re-read every page")
+    assert_equal(got.first_row, 0)
+    assert_equal(got.num_rows, -1)
+    for i in range(whole.num_slots):
+        assert_equal(Int(got.reps[i]), Int(whole.reps[i]), String("rep ", i))
+    assert_equal(len(got.values.bytes), len(whole.values.bytes))
+    for i in range(len(whole.values.bytes)):
+        assert_equal(
+            Int(got.values.bytes[i]),
+            Int(whole.values.bytes[i]),
+            String("value byte ", i),
+        )
+
+
+def test_a_window_ending_mid_record_keeps_only_whole_rows() raises:
+    """The other end of the same seam.
+
+    Rows `[0, 2)` select page 0 alone, and page 0 holds two whole records plus
+    the first slot of record 2 — an overhang the batch walk must never see.
+    The chunk says so itself: five slots decoded, but only two rows covered, so
+    the row index stops at the record boundary and the overhanging slot is
+    unreachable.
+    """
+    var made = _mid_record_chunk()
+    var cm = _mid_record_meta(len(made))
+    var leaf = _list_leaf()
+    var w = PageWindow()
+    w.first_rows = [0, 2, 4]
+    w.group_rows = 6
+    w.row_lo = 0
+    w.row_hi = 2
+    var pages = w.page_range(False)
+    assert_equal(pages[0], 0)
+    assert_equal(pages[1], 1)
+    var got = read_column_chunk[DefaultCodecs](Span(made), cm, leaf, True, w)
+    assert_equal(got.pages_read, 1, "one page's rows read more than one page")
+    assert_equal(got.first_row, 0)
+    assert_equal(got.num_rows, 2, "the in-flight record was counted as a row")
+    assert_equal(got.num_slots, 5)
+
+
+def test_page_skipping_leaves_a_flat_column_where_it_was() raises:
+    """The flat path is the one that already worked, and it has to keep
+    working while decoding fewer pages.
+
+    `manypages.parquet` is pyarrow's, so its page index is not one we wrote:
+    the rows a predicate leaves must be the same rows as before, and the pages
+    read must drop.
+    """
+    var full = _reader("manypages")
+    var whole = full.read_table()
+    var want = _table_rows(whole)
+    var all_pages = full.pages_read()
+    assert_equal(all_pages, 120, String(all_pages, " data pages in manypages"))
+    var r = _reader("manypages")
+    var p: List[Predicate] = [
+        Predicate(String("k"), OP_GE, ScalarValue.of_int(1200)),
+        Predicate(String("k"), OP_LT, ScalarValue.of_int(1210)),
+    ]
+    var left = r.prune_pages(p)
+    var t = r.read_table()
+    assert_equal(t.num_rows, left)
+    assert_equal(
+        r.pages_read(),
+        3,
+        String(
+            "flat page pruning decoded ",
+            r.pages_read(),
+            " of ",
+            all_pages,
+            " data pages",
+        ),
+    )
+    _assert_pruned_rows_match_a_full_read(r, t, p, want, String("manypages"))
+
+
+def _write_string_list_column(
+    rows: Int, per_row: Int, width: Int, var options: WriterOptions
+) raises -> List[UInt8]:
+    """`rows` lists of `per_row` distinct strings of `width` bytes each.
+
+    The shape of `large_string_map.brotli.parquet`, minus four orders of
+    magnitude: a repeated `BYTE_ARRAY` leaf whose value bytes are what a batch
+    has to be cut by.
+    """
+    var child = ArrayData(ArrowType(AT_UTF8), String("element"))
+    child.nullable = False
+    child.length = rows * per_row
+    var at = 0
+    child.offsets.append(0)
+    for r in range(rows):
+        for k in range(per_row):
+            for b in range(width):
+                child.values.append(UInt8(97 + ((r * 7 + k * 3 + b) % 26)))
+            at += width
+            child.offsets.append(Int32(at))
+    var li = ArrayData(ArrowType(AT_LIST), String("l"))
+    li.nullable = False
+    li.length = rows
+    for r in range(rows + 1):
+        li.offsets.append(Int32(r * per_row))
+    var arena = ArrayArena()
+    li.children.append(arena.add(child^))
+    var roots: List[Int] = [arena.add(li^)]
+    var w = ParquetWriter(options^)
+    w.write_batch(arena, roots)
+    return w^.finish()
+
+
+def test_a_batch_is_cut_by_its_value_bytes() raises:
+    """A column chunk holding more `BYTE_ARRAY` data than an Arrow offset can
+    address is read by splitting it across batches.
+
+    `PhysBuffer` addresses a chunk's value bytes with 64-bit offsets, so the
+    decode itself never overflows; only the Arrow arrays a batch is made of are
+    32-bit, and `read_batch` already bounds a batch — by rows, and by the row
+    group. This is the third bound. The real file is
+    `large_string_map.brotli.parquet`, two rows whose keys are a gibibyte each;
+    `max_batch_value_bytes` is lowered here so the same machinery is testable
+    without one.
+
+    Two things have to hold: the batches must be cut at the row where the bytes
+    run out, and the rows must come out of them unchanged and in order,
+    whatever the cut.
+    """
+    comptime ROWS = 40
+    comptime PER = 2
+    comptime WIDTH = 64
+    var opts = WriterOptions()
+    opts.use_dictionary = False
+    opts.row_group_size = ROWS
+    var bytes = _write_string_list_column(ROWS, PER, WIDTH, opts^)
+
+    var full = ParquetReader[DefaultCodecs](bytes.copy())
+    var whole = full.read_table()
+    assert_equal(whole.num_rows, ROWS)
+    assert_equal(len(whole.batches), 1, "the fixture should be one batch")
+    var want = _table_rows(whole)
+
+    # Each row carries PER * WIDTH = 128 value bytes, so a 512-byte cap is
+    # four rows a batch and ten batches.
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
+    r.max_batch_value_bytes = 4 * PER * WIDTH
+    var t = r.read_table()
+    assert_equal(t.num_rows, ROWS)
+    assert_equal(len(t.batches), ROWS // 4, "the batches were not cut by bytes")
+    for b in range(len(t.batches)):
+        assert_equal(t.batches[b].num_rows, 4, String("batch ", b))
+    var got = _table_rows(t)
+    assert_equal(len(got), len(want))
+    for i in range(len(want)):
+        assert_equal(got[i], want[i], String("row ", i, " after the split"))
+
+    # A cap that does not divide the rows evenly, and one of exactly one row.
+    var caps: List[Int] = [3 * PER * WIDTH, PER * WIDTH]
+    for cap in caps:
+        var r2 = ParquetReader[DefaultCodecs](bytes.copy())
+        r2.max_batch_value_bytes = cap
+        var t2 = r2.read_table()
+        assert_equal(t2.num_rows, ROWS, String("cap ", cap, ": rows"))
+        var got2 = _table_rows(t2)
+        for i in range(len(want)):
+            assert_equal(got2[i], want[i], String("cap ", cap, ": row ", i))
+
+    # …and with the row-group axis running, where the batches are planned
+    # against a prefetched window rather than a loaded row group.
+    var opts4 = WriterOptions()
+    opts4.use_dictionary = False
+    opts4.row_group_size = ROWS // 4
+    var many = _write_string_list_column(ROWS, PER, WIDTH, opts4^)
+    var fullm = ParquetReader[DefaultCodecs](many.copy())
+    var wantm = _table_rows(fullm.read_table())
+    var r4 = ParquetReader[DefaultCodecs](many.copy())
+    r4.num_workers = 4
+    r4.max_batch_value_bytes = 3 * PER * WIDTH
+    var t4 = r4.read_table()
+    assert_equal(t4.num_rows, ROWS)
+    var got4 = _table_rows(t4)
+    for i in range(len(wantm)):
+        assert_equal(got4[i], wantm[i], String("threaded: row ", i))
+
+
+def test_a_single_row_too_wide_for_arrow_says_so() raises:
+    """No batch boundary splits one row, and the error has to say so.
+
+    The reader cuts at the last row that fits and hands assembly a batch of
+    one; when even that row is too wide there is nothing left to cut, and what
+    the caller gets is a named column and a byte count rather than a wrapped
+    offset and an array that reads past its buffer.
+    """
+    var opts = WriterOptions()
+    opts.use_dictionary = False
+    opts.row_group_size = 8
+    var bytes = _write_string_list_column(8, 2, 64, opts^)
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
+    r.max_batch_value_bytes = 100  # one row is 128 bytes
+    with assert_raises(contains="one row of column"):
+        _ = r.read_table()
+    # …and the row that fits exactly does not raise: the limit is a limit, not
+    # a strict inequality, and every row comes back one batch at a time.
+    var ok = ParquetReader[DefaultCodecs](bytes.copy())
+    ok.max_batch_value_bytes = 128
+    var t = ok.read_table()
+    assert_equal(t.num_rows, 8)
+    assert_equal(len(t.batches), 8)
 
 
 def test_statistics_match_pyarrow() raises:
@@ -2127,7 +2696,7 @@ def test_integer_statistics_bounds() raises:
     vals[997] = -99999
     vals[998] = 99999
     var bytes = _write_int64_column(Span(vals), WriterOptions())
-    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
     var st = r.statistics(0, 0)
     assert_true(st.has_min_max, "int64 bounds missing")
     assert_equal(st.min.i, -99999, "int64 min")
@@ -2204,7 +2773,7 @@ def test_from_span_reads_the_same_table_as_the_owning_constructor() raises:
     var owned = ParquetReader[DefaultCodecs](bytes.copy())
     var want = owned.read_table()
 
-    var borrowed = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var borrowed = ParquetReader[DefaultCodecs](bytes.copy())
     var got = borrowed.read_table()
 
     assert_equal(got.num_rows, want.num_rows)
@@ -2216,9 +2785,9 @@ def test_from_span_reads_the_same_table_as_the_owning_constructor() raises:
 def test_from_span_reads_the_same_buffer_twice() raises:
     """The reason the borrowing path exists: many reads, one allocation."""
     var bytes = fixture_bytes("big")
-    var first = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var first = ParquetReader[DefaultCodecs](bytes.copy())
     var rows_first = first.read_table().num_rows
-    var second = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var second = ParquetReader[DefaultCodecs](bytes.copy())
     var rows_second = second.read_table().num_rows
     assert_equal(rows_first, rows_second)
     keep(bytes)
@@ -2234,7 +2803,7 @@ def test_owning_reader_survives_a_move() raises:
 
 def test_projection_works_on_a_borrowed_reader() raises:
     var bytes = fixture_bytes("prune")
-    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
     var all_cols = r.read_table()
     assert_equal(all_cols.num_rows, 1000)
     keep(bytes)
@@ -2289,7 +2858,7 @@ def test_value_index_before_the_first_null_page() raises:
     opts.use_dictionary = False
     var bytes = _write_nullable_int64(Span(values), Span(valid), opts^)
 
-    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
     r.verify_crc = False
     r._load(0)
     ref cd = r._chunks[0]
@@ -2313,7 +2882,7 @@ def test_value_index_before_the_first_null_page() raises:
     # …and end to end, at batch sizes that start inside the null-free region.
     var sizes: List[Int] = [1, 7, 64, 999, 65536]
     for bs in sizes:
-        var r2 = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+        var r2 = ParquetReader[DefaultCodecs](bytes.copy())
         r2.verify_crc = False
         r2.batch_size = bs
         var t = r2.read_table()
@@ -2681,7 +3250,7 @@ def test_corrupt_file_error_does_not_depend_on_the_winner() raises:
     The error reported is the lowest-numbered leaf's either way, because the
     slots are scanned in leaf order after the join."""
     var bytes = fixture_bytes("big")
-    var r = ParquetReader[DefaultCodecs].from_span(Span(bytes))
+    var r = ParquetReader[DefaultCodecs](bytes.copy())
     var leaves = len(r.schema.leaves)
     assert_true(leaves >= 3, String("big.parquet has only ", leaves, " leaves"))
     var bad = _corrupt_chunk(_corrupt_chunk(bytes^, 0), leaves - 1)

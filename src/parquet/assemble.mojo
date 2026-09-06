@@ -38,7 +38,13 @@ from parquet.arrow import (
     bit_set,
 )
 from parquet.convert import append_null, append_value
-from parquet.encoding import PK_BOOL, PK_FIXED, PK_VAR, PhysBuffer
+from parquet.encoding import (
+    MAX_ARROW_VAR_BYTES,
+    PK_BOOL,
+    PK_FIXED,
+    PK_VAR,
+    PhysBuffer,
+)
 from parquet.page import ColumnData, copy_mask_bits
 from parquet.schema import LeafColumn, ParquetSchema
 from std.memory import unsafe_memcpy
@@ -318,14 +324,16 @@ def _fill_leaf[
         if v0 + present + 1 > len(vals.offsets):
             raise Error(_short_values(leaf))
         var voff = vals.offsets.unsafe_ptr()
-        var base = Int(voff.unsafe_load(v0))
-        var last = Int(voff.unsafe_load(v0 + present))
+        var base = voff.unsafe_load(v0)
+        var last = voff.unsafe_load(v0 + present)
+        if last - base > MAX_ARROW_VAR_BYTES:
+            raise _too_wide_for_arrow(leaf, last - base)
         out.values.extend(Span(vals.bytes)[base:last])
         out.offsets.resize(rows + 1, 0)
         var ooff = out.offsets.unsafe_ptr()
         if dense:
             for k in range(rows + 1):
-                ooff.unsafe_store(k, voff.unsafe_load(v0 + k) - Int32(base))
+                ooff.unsafe_store(k, Int32(voff.unsafe_load(v0 + k) - base))
         elif packed:
             # Presence is the validity buffer this call just built, so the
             # offsets come off one bit per slot rather than one `UInt16`.
@@ -540,6 +548,32 @@ def _short_levels(s: ParquetSchema, fi: Int, which: StringSlice) -> String:
         "' asks for ",
         which,
         " levels past the end of the decoded chunk",
+    )
+
+
+def _too_wide_for_arrow(leaf: LeafColumn, bytes: Int) -> Error:
+    """A batch whose value bytes an Arrow 32-bit offset cannot address.
+
+    The reader cuts a batch short before this happens (`_arrow_batch_end`),
+    so reaching it means a *single row* holds more than 2 GiB of `BYTE_ARRAY`
+    data and there is no split point that would help. Assembly is where it is
+    caught rather than where it is prevented, because this is the boundary the
+    limit belongs to: the physical buffer behind it is 64-bit and holds the
+    whole chunk quite happily.
+    """
+    return Error(
+        String(
+            "parquet.assemble: one row of column '",
+            leaf.dotted(),
+            "' holds ",
+            bytes,
+            (
+                " bytes of BYTE_ARRAY data, past the 2 GiB an Arrow 32-bit"
+                " offset can address — no batch boundary can split a single"
+                " row, so this column needs 64-bit offsets (large_binary),"
+                " which parquet.mojo does not have"
+            ),
+        )
     )
 
 
