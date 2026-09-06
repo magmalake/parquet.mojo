@@ -178,12 +178,48 @@ bench = "mkdir -p build && mojo build -I src -I $CONDA_PREFIX/lib/mojo bench/ben
 # dependencies above install into $CONDA_PREFIX/lib/mojo).
 lint-bench = { cmd = "mojolint --lsp -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../bench.mojo/src bench" }
 
+# ── the GPU spike (experiments/gpu_gather) ──────────────────────────────────
+# A Metal implementation of the dictionary gather, kept deliberately OUTSIDE
+# `src/`. The published tin must not gain a `max` dependency: `max-core` is
+# ~67 MiB, the `stable` environment pins `mojo-compiler` alone and ships no
+# `max.gpu` at all, and the package consumers install today is stable-built.
+# So the spike gets its own feature and its own environment, and nothing under
+# `[package]`, `[feature.stable]` or `[feature.codecs]` refers to it —
+# `pixi build`, `-e stable check` and every existing CI leg are unchanged.
+# `experiments/` is not `src`, `tests`, `bench` or `tools`, so no existing
+# lint, format or build task walks it either; `lint-gpu` below is its own.
+#
+# The `-I` list is the one the other nightly tasks use, plus
+# `-I experiments/gpu_gather` so the spike's own modules resolve.
+[feature.gpu.dependencies]
+modular = ">=26.6.0.dev2026082605,<27"
+
+[feature.gpu.tasks]
+# Whether this machine has a Metal device the Mojo GPU stack can drive at all.
+gpu-probe = { cmd = "mkdir -p build && mojo build experiments/gpu_gather/probe.mojo -I src -I experiments/gpu_gather -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/gpu-probe && ./build/gpu-probe" }
+# The gate: real dictionary pages gathered on both paths and compared byte for
+# byte, plus the non-vacuity assertions — and then the same gate again against a
+# GPU path launched one block short, which must FAIL. Both halves are in one
+# binary so the control can never drift away from the thing it is controlling.
+# Run this before believing any number below.
+gpu-parity = { cmd = "mkdir -p build && mojo build experiments/gpu_gather/parity.mojo -I src -I experiments/gpu_gather -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/gpu-parity && ./build/gpu-parity" }
+# CPU versus GPU with every overhead included, at several page and dictionary
+# sizes. Built, never `mojo run`: a JIT number is not comparable to an AOT one.
+gpu-bench = { cmd = "mkdir -p build && mojo build experiments/gpu_gather/bench_gpu_gather.mojo -I src -I experiments/gpu_gather -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/gpu-bench && ./build/gpu-bench" }
+# Is `map_to_host` a mapping or a copy on this unified-memory machine, and what
+# does the first dispatch of a kernel cost.
+gpu-memory = { cmd = "mkdir -p build && mojo build experiments/gpu_gather/memprobe.mojo -I src -I experiments/gpu_gather -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/gpu-memprobe && ./build/gpu-memprobe" }
+gpu-check = { depends-on = ["gpu-probe", "gpu-parity"] }
+lint-gpu = { cmd = "mojolint --lsp -I src -I experiments/gpu_gather -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src experiments" }
+fmt-gpu = { cmd = "mojo format experiments" }
+
 [environments]
 default = ["nightly"]
 stable = ["stable"]
 codecs = ["nightly", "codecs"]
 codecs-stable = ["stable", "codecs"]
 bench = ["stable", "bench"]
+gpu = ["gpu"]
 
 [dependencies]
 # Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi
