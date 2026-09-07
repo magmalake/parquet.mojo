@@ -888,6 +888,180 @@ def test_projection_by_field_id() raises:
         r2.select_field_ids([Int32(99)])
 
 
+def test_needed_byte_ranges_names_only_the_projected_chunks() raises:
+    var r = _reader("big")
+    var whole = len(read_parquet_file(String(FIXTURES, "big.parquet")))
+    r.select_columns([String("i"), String("s")])
+    var ranges = r.needed_byte_ranges()
+    assert_true(len(ranges) > 0)
+
+    # Ascending and disjoint, and each range is a real extent.
+    var total = 0
+    for k in range(len(ranges)):
+        assert_true(ranges[k][1] > 0)
+        if k > 0:
+            assert_true(ranges[k - 1][0] + ranges[k - 1][1] < ranges[k][0])
+        total += ranges[k][1]
+
+    # Exactly the wanted chunks, and no others. A leaf that was not selected
+    # sits *between* two that were, so a range list that quietly swallowed it
+    # would fail here rather than merely read more than it needed.
+    for g in range(r.num_row_groups()):
+        for i in range(len(r.schema.leaves)):
+            ref cm = r.meta.row_groups[g].columns[i].meta_data.value()
+            var at = chunk_start(cm)
+            var end = at + Int(cm.total_compressed_size)
+            var covered = False
+            for k in range(len(ranges)):
+                if ranges[k][0] <= at and end <= ranges[k][0] + ranges[k][1]:
+                    covered = True
+            assert_equal(covered, r._needed[i])
+
+    # Asked for in full, the ranges collapse to the one run every chunk of
+    # every row group forms, and cover exactly those chunks' bytes.
+    r.select_all()
+    var all_ranges = r.needed_byte_ranges()
+    var all_total = 0
+    for k in range(len(all_ranges)):
+        all_total += all_ranges[k][1]
+    assert_equal(len(all_ranges), 1)
+    var chunk_bytes = 0
+    for g in range(r.num_row_groups()):
+        for i in range(len(r.schema.leaves)):
+            chunk_bytes += Int(
+                r.meta.row_groups[g]
+                .columns[i]
+                .meta_data.value()
+                .total_compressed_size
+            )
+    assert_equal(all_total, chunk_bytes)
+
+    # Non-vacuity: if the projection did not actually skip bytes, everything
+    # above would pass while proving nothing. `f` alone is a third of this
+    # file, so the two-column projection must leave a large hole behind.
+    assert_true(total < all_total)
+    assert_true(all_total - total > whole // 4)
+
+
+def test_open_projected_reads_what_a_whole_file_read_reads() raises:
+    """The point of `open_projected` is that fetching a fifth of the bytes
+    produces the same arrays, byte for byte and node for node."""
+    var cases: List[List[String]] = [
+        [String("i"), String("s")],
+        [String("s")],
+        [String("i"), String("f"), String("s"), String("b"), String("l")],
+    ]
+    var path = String(FIXTURES, "big.parquet")
+    var whole = len(read_parquet_file(path))
+    for c in range(len(cases)):
+        var a = ParquetReader.open(path)
+        a.select_columns(cases[c].copy())
+        var want = table_fingerprint(a.read_table())
+
+        var b = ParquetReader[DefaultCodecs].open_projected(
+            path, cases[c].copy()
+        )
+        var fetched = 0
+        var ranges = b.needed_byte_ranges()
+        for k in range(len(ranges)):
+            fetched += ranges[k][1]
+        assert_equal(table_fingerprint(b.read_table()), want)
+        # The narrow cases must genuinely have read less, or this test is
+        # comparing a whole-file read against a whole-file read.
+        if len(cases[c]) < 5:
+            assert_true(fetched < whole)
+
+    # A multi-row-group file interleaves the chunks of every column, so the
+    # range list has one entry per row group per run of wanted columns.
+    var pruned = ParquetReader[DefaultCodecs].open_projected(
+        String(FIXTURES, "prune.parquet"), [String("k")]
+    )
+    var full = ParquetReader.open(String(FIXTURES, "prune.parquet"))
+    full.select_columns([String("k")])
+    assert_equal(
+        table_fingerprint(pruned.read_table()),
+        table_fingerprint(full.read_table()),
+    )
+
+
+def _assert_covered(
+    ranges: List[Tuple[Int, Int]], at: Int, n: Int, what: StringSlice
+) raises:
+    for k in range(len(ranges)):
+        if ranges[k][0] <= at and at + n <= ranges[k][0] + ranges[k][1]:
+            return
+    raise Error(
+        String(
+            "no fetched range covers the ",
+            what,
+            " at ",
+            at,
+            " (+",
+            n,
+            ")",
+        )
+    )
+
+
+def test_open_projected_fetches_the_page_index_as_well() raises:
+    """A `ColumnIndex` and an `OffsetIndex` live outside every column chunk,
+    and `prune_pages` reads the index of whatever the *predicate* names —
+    which need not be a column the projection asked for. A range list built
+    from the projected chunks alone therefore left page pruning reading
+    uninitialised bytes: found by iceberg.mojo's suite, not by this one.
+    """
+    var path = String(FIXTURES, "manypages.parquet")
+    var preds: List[Predicate] = [
+        Predicate(String("k"), OP_GE, ScalarValue.of_int(1200)),
+        Predicate(String("k"), OP_LT, ScalarValue.of_int(1210)),
+    ]
+
+    # `s` is projected; `k`, which the predicate names, is not.
+    var full = ParquetReader.open(path)
+    full.select_columns([String("s")])
+    assert_equal(full.prune_row_groups(preds), 1)
+    var want_left = full.prune_pages(preds)
+    assert_true(want_left > 0 and want_left < 1000)
+    var want = table_fingerprint(full.read_table())
+
+    var lean = ParquetReader[DefaultCodecs].open_projected(path, [String("s")])
+    assert_equal(lean.prune_row_groups(preds), 1)
+    assert_equal(lean.prune_pages(preds), want_left)
+    assert_equal(table_fingerprint(lean.read_table()), want)
+
+    # And say it directly, because the behavioural half above can pass for
+    # the wrong reason: `open` and `open_projected` ask the allocator for
+    # buffers of the same size one after the other, so a gap that was never
+    # written can still hold the right bytes from the previous read. The
+    # range list is the contract, so assert on the range list.
+    var named = ParquetReader.open(path)
+    named.select_columns([String("s")])
+    var ranges = named.needed_byte_ranges()
+    var indexes = 0
+    for g in range(named.num_row_groups()):
+        ref cols = named.meta.row_groups[g].columns
+        for i in range(len(cols)):
+            if cols[i].offset_index_offset and cols[i].offset_index_length:
+                indexes += 1
+                _assert_covered(
+                    ranges,
+                    Int(cols[i].offset_index_offset.value()),
+                    Int(cols[i].offset_index_length.value()),
+                    "OffsetIndex",
+                )
+            if cols[i].column_index_offset and cols[i].column_index_length:
+                indexes += 1
+                _assert_covered(
+                    ranges,
+                    Int(cols[i].column_index_offset.value()),
+                    Int(cols[i].column_index_length.value()),
+                    "ColumnIndex",
+                )
+    # Non-vacuity: manypages.parquet has a page index, so this must have
+    # checked some.
+    assert_true(indexes >= 2 * 2 * named.num_row_groups())
+
+
 def test_typed_accessors() raises:
     var r = _reader("primitives")
     var t = r.read_table()

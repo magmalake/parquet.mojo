@@ -79,6 +79,8 @@ from parquet.reader import (
     array_i64_into,
     array_str,
     array_str_into,
+    footer_only_buffer,
+    footer_start_of,
     op_name,
 )
 from parquet.schema import (

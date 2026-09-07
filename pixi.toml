@@ -82,10 +82,15 @@ test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I sr
 # `python tools/encoding_report.py build/encodings [reference-dir]`. Needs the
 # codecs env because `codecs.parquet` has a column per codec.
 encodings = { cmd = "mkdir -p build/encodings && mojo build tools/encoding_corpus.mojo -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/encoding-corpus && ./build/encoding-corpus" }
+# The projected-scan profile: one file, a handful of its columns, per-stage
+# times with the bytes and the bandwidth beside them. Lives here rather than
+# next to `profile` because the files worth pointing it at are ZSTD.
+# Example: `pixi run -e codecs profile-scan <file.parquet> --select a,b`.
+profile-scan = { cmd = "mkdir -p build && mojo build bench/profile_scan.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -o build/profile-scan" }
 # The three files `lint` and `lint-tools` can only text-mode-fallback on
 # (they import zstd/lz4/brotli): resolved fully here, with the codecs env's
 # sibling checkouts on the path.
-lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src src/parquet/ext_full.mojo tests/test_codecs.mojo tools/conformance.mojo tools/encoding_corpus.mojo" }
+lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src src/parquet/ext_full.mojo tests/test_codecs.mojo tools/conformance.mojo tools/encoding_corpus.mojo bench/profile_scan.mojo" }
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.

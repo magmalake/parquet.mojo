@@ -43,7 +43,12 @@ from parquet.assemble import LeafSlice, build_field, first_leaf
 from parquet.carrow import ExportedArray, export_c
 from parquet.codec import CodecSet, DefaultCodecs
 from parquet.encoding import MAX_ARROW_VAR_BYTES, PK_VAR
-from parquet.page import ColumnData, PageWindow, read_column_chunk
+from parquet.page import (
+    ColumnData,
+    PageWindow,
+    chunk_start,
+    read_column_chunk,
+)
 from parquet.schema import ArrowField, LeafColumn, ParquetSchema, build_schema
 from parquet.stats import (
     SV_BYTES,
@@ -54,9 +59,11 @@ from parquet.stats import (
     decode_statistic,
     decode_stats,
 )
-from std.memory import bitcast
+from std.memory import bitcast, unsafe_memcpy
+from std.os.path import getsize
 from threads import num_cpus, parallel_for
 from thrift import (
+    FOOTER_TRAILER_SIZE,
     ColumnIndex,
     ColumnMetaData,
     FileMetaData,
@@ -92,6 +99,101 @@ struct Predicate(Copyable, Movable):
         self.column = move.column^
         self.op = move.op
         self.value = move.value^
+
+
+def _magic_is_par1(data: Span[UInt8, _], at: Int) -> Bool:
+    if at < 0 or at + 4 > len(data):
+        return False
+    return (
+        data[at] == 0x50
+        and data[at + 1] == 0x41
+        and data[at + 2] == 0x52
+        and data[at + 3] == 0x31
+    )
+
+
+def _want_range(mut starts: List[Int], mut ends: List[Int], at: Int, n: Int):
+    """Add `[at, at + n)` to a range list kept sorted by offset.
+
+    Insertion order rather than a sort at the end: a row group offers a
+    handful of extents and they arrive nearly sorted, so this walks a step or
+    two. Offsets below the 4-byte magic, and empty extents, are not ranges.
+    """
+    if at < 4 or n <= 0:
+        return
+    var k = len(starts)
+    while k > 0 and starts[k - 1] > at:
+        k -= 1
+    starts.insert(k, at)
+    ends.insert(k, at + n)
+
+
+def footer_start_of(size: Int, tail: Span[UInt8, _]) -> Int:
+    """Where the serialised `FileMetaData` begins, from a file's last 8 bytes.
+
+    `-1` when `tail` is not a Parquet trailer or the length it declares does
+    not fit, so a caller that reads the tail speculatively can fall back to
+    reading the whole file instead of raising.
+    """
+    if len(tail) != FOOTER_TRAILER_SIZE:
+        return -1
+    if not _magic_is_par1(tail, 4):
+        return -1
+    var n = (
+        Int(tail[0])
+        | (Int(tail[1]) << 8)
+        | (Int(tail[2]) << 16)
+        | (Int(tail[3]) << 24)
+    )
+    if n <= 0:
+        return -1
+    var start = size - FOOTER_TRAILER_SIZE - n
+    if start < 4:
+        return -1
+    return start
+
+
+def footer_only_buffer(
+    size: Int, footer_start: Int, footer: Span[UInt8, _]
+) raises -> List[UInt8]:
+    """A `size`-byte buffer holding nothing but the magic and the footer.
+
+    `ParquetReader` addresses every page by its absolute file offset, so a
+    buffer of the file's real length with the chunks a projection wants
+    written into it decodes exactly as the whole file does — and the bytes
+    between them are never read. This builds that buffer with the gap left
+    **uninitialised**: fresh pages are not faulted in until something writes
+    them, and zero-filling instead would cost most of what the sparse read
+    saves. Fill the wanted ranges — `needed_byte_ranges` names them — before
+    handing it to a reader, and never read a byte outside them.
+
+    `footer` is the file from `footer_start` to its end: the metadata, the
+    4-byte length and the trailing `PAR1`.
+    """
+    if footer_start < 4 or footer_start + len(footer) != size:
+        raise Error(
+            String(
+                "parquet: a footer of ",
+                len(footer),
+                " bytes at ",
+                footer_start,
+                " does not end a ",
+                size,
+                "-byte file",
+            )
+        )
+    var buf = List[UInt8]()
+    # `reserve` before the uninitialised resize: growing past the capacity
+    # afterwards would reallocate and copy the whole file, which is the cost
+    # this exists to avoid.
+    buf.reserve(size)
+    buf.resize(unsafe_uninit_length=footer_start)
+    buf[0] = 0x50
+    buf[1] = 0x41
+    buf[2] = 0x52
+    buf[3] = 0x31
+    buf.extend(footer)
+    return buf^
 
 
 def op_name(op: Int) -> String:
@@ -1294,6 +1396,193 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
     @staticmethod
     def open(path: StringSlice) raises -> Self:
         return Self(read_parquet_file(String(path)))
+
+    @staticmethod
+    def open_projected(path: StringSlice, columns: List[String]) raises -> Self:
+        """Open `path`, fetching only the bytes `columns` actually needs.
+
+        `open` slurps the whole file. That is the right default when a caller
+        wants all of it, and pure waste when it does not: a four-column
+        projection out of a nineteen-column file touches about a fifth of the
+        bytes, and on a 60 MiB NYC-taxi file reading the other four fifths
+        costs more than decompressing the fifth that is wanted.
+
+        So this reads the footer, applies the projection, asks
+        `needed_byte_ranges` which chunks that reaches, and reads those. The
+        buffer is still the file's full length — Parquet addresses everything
+        by absolute offset, so a sparse buffer decodes exactly as the whole
+        file does — but the gaps are never written and so are never faulted
+        in. Filling them with zeroes instead would put most of the cost back.
+
+        **The returned reader is projected already, and may not be
+        re-projected.** Selecting a column whose bytes were not fetched reads
+        the gap, which is uninitialised memory: `select_columns`,
+        `select_fields` and `select_all` are not safe on it. Nothing enforces
+        that, which is the price of not reading the file twice.
+
+        Anything unexpected about the footer — too short, bad magic, a length
+        that does not fit — falls back to reading the whole file, so this is
+        never wrong, only sometimes no faster.
+        """
+        var name = String(path)
+        var size = Int(getsize(name))
+        var buf: List[UInt8]
+        var footer_start = -1
+        with open(name, "r") as f:
+            if size >= FOOTER_TRAILER_SIZE + 4:
+                _ = f.seek(size - FOOTER_TRAILER_SIZE)
+                var tail = f.read_bytes(FOOTER_TRAILER_SIZE)
+                footer_start = footer_start_of(size, Span(tail))
+            if footer_start < 0:
+                var whole = Self(read_parquet_file(name))
+                whole.select_columns(columns.copy())
+                return whole^
+            _ = f.seek(footer_start)
+            buf = footer_only_buffer(
+                size,
+                footer_start,
+                Span(f.read_bytes(size - footer_start)),
+            )
+
+            # The projection is resolved against a reader over the footer
+            # alone. It borrows `buf` and must be dead before `buf` is
+            # written, which is what the explicit destruction below is for:
+            # in Mojo a value dies at its last *textual* use, so leaving that
+            # to fall out of the block would be a contract kept by accident.
+            var ranges: List[Tuple[Int, Int]]
+            var probe = Self.from_span(Span(buf))
+            probe.select_columns(columns.copy())
+            ranges = probe.needed_byte_ranges()
+            _ = probe^
+
+            var dst = buf.unsafe_ptr()
+            for k in range(len(ranges)):
+                var at = ranges[k][0]
+                var n = ranges[k][1]
+                if at < 4 or n <= 0 or at + n > footer_start:
+                    continue
+                _ = f.seek(at)
+                var got = f.read_bytes(n)
+                unsafe_memcpy(
+                    dest=dst.unsafe_offset(at),
+                    src=got.unsafe_ptr(),
+                    count=len(got),
+                )
+
+        var reader = Self(buf^)
+        reader.select_columns(columns.copy())
+        return reader^
+
+    def fill_range(mut self, offset: Int, src: Span[UInt8, _]) raises:
+        """Write `src` into this reader's file buffer at absolute `offset`.
+
+        The other half of `footer_only_buffer`. A footer is enough to build a
+        reader, resolve a projection against it and ask `needed_byte_ranges`
+        which chunks that reaches — but not to decode them, because those
+        bytes have not been fetched. This is where a caller with its own I/O
+        — an object store, an `iceberg.FileIO` — puts them.
+
+        Legal only on a reader that owns its buffer, and only for bytes it
+        has not read yet. The footer is already parsed into values of the
+        reader's own, so filling a gap changes nothing it has looked at;
+        writing past the end of the file raises rather than leaving a reader
+        that would go on to decode nonsense.
+        """
+        if len(self._owned) == 0:
+            raise Error(
+                "parquet: fill_range needs a reader that owns its bytes"
+            )
+        if offset < 4 or len(src) < 0 or offset + len(src) > len(self._owned):
+            raise Error(
+                String(
+                    "parquet: fill_range of ",
+                    len(src),
+                    " bytes at ",
+                    offset,
+                    " does not fit inside a ",
+                    len(self._owned),
+                    "-byte file",
+                )
+            )
+        if len(src) == 0:
+            return
+        unsafe_memcpy(
+            dest=self._owned.unsafe_ptr().unsafe_offset(offset),
+            src=src.unsafe_ptr(),
+            count=len(src),
+        )
+
+    def needed_byte_ranges(self) raises -> List[Tuple[Int, Int]]:
+        """The file bytes a read with this projection would actually touch.
+
+        One `(offset, length)` per column chunk that the current projection
+        and row-group selection reach, in ascending offset order, with
+        neighbours that touch or overlap merged into one. The footer is not
+        in the list: a caller cannot have built this reader without it.
+
+        This is what a reader over a network wants — it turns "download the
+        object" into one range request per run of wanted chunks — and it is
+        what `open_projected` uses for a local path. Row-group pruning is
+        honoured, so calling `prune_row_groups` first narrows the answer.
+        """
+        var starts = List[Int]()
+        var ends = List[Int]()
+
+        for gi in range(len(self._row_groups)):
+            var g = self._row_groups[gi]
+            ref cols = self.meta.row_groups[g].columns
+            for i in range(len(cols)):
+                # The page index of *every* column, not only the projected
+                # ones: `prune_pages` reads the `ColumnIndex` of whatever the
+                # predicate names, and a predicate column need not be in the
+                # projection. Both structures are small and sit together at
+                # the end of the file, so they cost one merged range.
+                if cols[i].offset_index_offset and cols[i].offset_index_length:
+                    _want_range(
+                        starts,
+                        ends,
+                        Int(cols[i].offset_index_offset.value()),
+                        Int(cols[i].offset_index_length.value()),
+                    )
+                if cols[i].column_index_offset and cols[i].column_index_length:
+                    _want_range(
+                        starts,
+                        ends,
+                        Int(cols[i].column_index_offset.value()),
+                        Int(cols[i].column_index_length.value()),
+                    )
+                if i >= len(self._needed) or not self._needed[i]:
+                    continue
+                if not cols[i].meta_data:
+                    continue
+                ref cm = cols[i].meta_data.value()
+                _want_range(
+                    starts, ends, chunk_start(cm), Int(cm.total_compressed_size)
+                )
+                # A bloom filter is only read when a caller asks for one, and
+                # its length is optional in the metadata — so it is fetched
+                # when the file says how long it is and skipped when it does
+                # not. `read_bloom_filter` on a reader built from a sparse
+                # buffer of a file that omitted the length has nothing to
+                # read; that is the one thing this list cannot promise.
+                if cm.bloom_filter_offset and cm.bloom_filter_length:
+                    _want_range(
+                        starts,
+                        ends,
+                        Int(cm.bloom_filter_offset.value()),
+                        Int(cm.bloom_filter_length.value()),
+                    )
+
+        var out = List[Tuple[Int, Int]]()
+        for k in range(len(starts)):
+            if len(out) > 0:
+                var last = out[len(out) - 1]
+                if starts[k] <= last[0] + last[1]:
+                    if ends[k] > last[0] + last[1]:
+                        out[len(out) - 1] = (last[0], ends[k] - last[0])
+                    continue
+            out.append((starts[k], ends[k] - starts[k]))
+        return out^
 
     # ── metadata ───────────────────────────────────────────────────────────
 
