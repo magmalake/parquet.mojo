@@ -10,6 +10,22 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-07
+
+A projected scan reads only the bytes it needs. On the eight-query
+[taxibench](https://github.com/magmalake/taxibench.example) suite, through
+iceberg-mojo, the single-threaded total went from 4054 ms to 3225 ms and the
+ten-thread total from 1540 ms to 906 ms. The query that projects all nineteen
+columns does not move, which is the check that this is a projection effect and
+not an artefact.
+
+Two null results came with it, and they are worth as much as the change: the
+decoder itself had **no headroom worth taking** — column-for-column it is
+already about 8.5% cheaper than pyarrow's — and neither late materialisation
+nor the page index was worth building, because Arrow's own scanner does the
+first not at all and ignores the second, and these files carry no page index
+to read.
+
 ### Added
 - **`ParquetReader.open_projected(path, columns)` — read only the bytes the
   projection needs.** `open` slurps the whole file, which is right when a
