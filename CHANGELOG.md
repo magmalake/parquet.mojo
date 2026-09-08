@@ -10,6 +10,20 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-08
+
+Builds on September nightlies again. 0.9.0 shipped with `nightly` and `gpu`
+capped below `26.6.0.dev2026090105`, because threads-mojo reached the atomics
+through compiler intrinsics that stopped parsing there. threads-mojo 0.5.0
+moved onto `std.atomic`, so the cap is gone and both environments now take
+`>=26.6.0.dev2026090705`.
+
+Building from **source paths** needs one more include beside
+`-I ../threads.mojo/src`: the compat directory holding the one line that
+differs between Mojo 1.0.0 and nightly. This repository sets `$THREADS_COMPAT`
+per feature, so no task names a toolchain. Consumers of the published tin need
+nothing.
+
 ## [0.9.0] - 2026-09-08
 
 The Arrow layer is no longer here. `ArrayData`, `ArrayArena`, `RecordBatch` and
