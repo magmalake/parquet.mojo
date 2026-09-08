@@ -20,11 +20,9 @@ platforms = ["osx-arm64", "linux-64"]
 # `parquet.carrow_import` are re-export shims so that the import paths
 # consumers already write keep resolving.
 #
-# NOTE: arrow-mlake-mojo is not on mojoshelf yet, so the rev below is its
-# `main`, not a published release. **It has to move to the published rev before
-# parquet.mojo is released** — every other package dependency here names a rev
-# the registry published, and a release that does not would be unreproducible
-# from the shelf.
+# The rev below is arrow-mlake-mojo 0.1.0 as the registry published it, which is
+# what every other package dependency here names — a release pinning anything
+# else would not be reproducible from the shelf.
 #
 # threads.mojo is one of those source-path siblings and needs nothing else: it
 # calls the pthread symbols libc already exports, with no shim and no build

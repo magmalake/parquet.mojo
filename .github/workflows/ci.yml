@@ -68,6 +68,18 @@ jobs:
         # which has the sibling checkouts for it.
         run: pixi run -e ${{ matrix.env }} check
 
+      # `mojo format` runs on the nightly leg only. The 1.0.0 formatter aborts
+      # with `'_python_symbols' object has no attribute
+      # 'old_comptime_assert_stmt'` on thirteen of this repo's files — a
+      # toolchain defect, not a formatting one: the same files come back
+      # unchanged from a nightly at or after 26.6.0.dev2026090705, which is
+      # what the lock now resolves. Stable is pinned to 1.0.0 and cannot be
+      # moved, so gating both legs would fail for a reason no edit here fixes.
+      - name: Format check
+        if: matrix.env == 'default'
+        working-directory: parquet.mojo
+        run: pixi run -e default format-check
+
       # The threaded read path under load: the same fixtures read over and
       # over at 2, 4, 8 and 10 workers, with a watchdog, so a hung join or an
       # answer that depends on which worker won fails here rather than in

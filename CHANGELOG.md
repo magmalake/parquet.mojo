@@ -10,6 +10,17 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+### Fixed
+- **`mojo format` works again, and CI now gates on it.** Thirteen of this
+  repo's files could not be formatted at all: the formatter aborted with
+  `'_python_symbols' object has no attribute 'old_comptime_assert_stmt'`, on
+  both toolchains, including files no recent change had touched. It was a
+  defect in the formatter rather than anything about the code — the same files
+  come back unchanged from a nightly at or after `26.6.0.dev2026090705`, which
+  the lock now resolves. `format-check` runs on the nightly leg of CI; it
+  cannot run on stable, which is pinned to Mojo 1.0.0 and still carries the
+  bug.
+
 ### Changed
 - **The Arrow layer moved to
   [arrow-mlake.mojo](https://github.com/magmalake/arrow-mlake.mojo)**, and this
