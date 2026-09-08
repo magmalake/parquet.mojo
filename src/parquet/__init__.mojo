@@ -11,13 +11,16 @@ for i in range(t.num_columns()):
     print(t.name(i), String(t.type(i)))
 ```
 
-Metadata comes from `thrift.mojo`, page CRC32s from `hashes.mojo`, Snappy from
-`snappy.mojo` and the DEFLATE half of GZIP from `avro.mojo` — all pure Mojo and
-all consumed by source path. `ZSTD` and `LZ4` need `parquet.ext_full`, which
-pulls in the two FFI tins.
+The Arrow side — `ArrayData`, `ArrayArena`, `RecordBatch` and the C Data
+Interface — is `arrow-mlake.mojo`, and is re-exported here so that
+`from parquet.arrow import ArrayData` and `from parquet import RecordBatch`
+keep resolving. Metadata comes from `thrift.mojo`, page CRC32s from
+`hashes.mojo`, Snappy from `snappy.mojo` and the DEFLATE half of GZIP from
+`avro.mojo` — all pure Mojo and all consumed by source path. `ZSTD` and `LZ4`
+need `parquet.ext_full`, which pulls in the two FFI tins.
 """
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DATE32,
@@ -56,8 +59,24 @@ from parquet.arrow import (
     unit_name,
 )
 from parquet.bloom import BloomFilter, read_bloom_filter
-from parquet.carrow import CArrowArray, CArrowSchema, ExportedArray, export_c
-from parquet.carrow_import import (
+from arrow_mlake.batch import (
+    RecordBatch,
+    array_bool,
+    array_bool_into,
+    array_f64,
+    array_f64_into,
+    array_i64,
+    array_i64_into,
+    array_str,
+    array_str_into,
+)
+from arrow_mlake.carrow import (
+    CArrowArray,
+    CArrowSchema,
+    ExportedArray,
+    export_c,
+)
+from arrow_mlake.carrow_import import (
     CArrowArrayStream,
     ImportedArray,
     ImportedStream,
@@ -77,16 +96,7 @@ from parquet.reader import (
     OP_NE,
     ParquetReader,
     Predicate,
-    RecordBatch,
     Table,
-    array_bool,
-    array_bool_into,
-    array_f64,
-    array_f64_into,
-    array_i64,
-    array_i64_into,
-    array_str,
-    array_str_into,
     footer_only_buffer,
     footer_start_of,
     op_name,

@@ -17,7 +17,7 @@ Three views come out of it:
   the `key_value` group as its single `STRUCT` child, exactly as Arrow wants.
 """
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DATE32,

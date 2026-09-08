@@ -13,7 +13,7 @@ parquet-mr's historical order was wrong — such a column reports no bounds
 rather than a wrong one).
 """
 
-from parquet.arrow import AT_DECIMAL128, AT_UINT32, AT_UINT64, ArrowType
+from arrow_mlake.arrow import AT_DECIMAL128, AT_UINT32, AT_UINT64, ArrowType
 from parquet.convert import int96_to_nanos
 from parquet.schema import LeafColumn
 from std.memory import bitcast

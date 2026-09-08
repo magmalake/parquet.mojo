@@ -8,7 +8,7 @@ an `INT32` annotated `Int(8, true)` is one byte in Arrow, a `DECIMAL` over
 straight into the destination `ArrayData`'s buffers.
 """
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DATE32,

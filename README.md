@@ -70,11 +70,13 @@ include path instead and check the sibling tins out next to it:
 
 ```console
 mojo build app.mojo \
-    -I ../parquet.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src \
-    -I ../snappy.mojo/src -I ../avro.mojo/src
+    -I ../parquet.mojo/src -I ../arrow-mlake.mojo/src -I ../thrift.mojo/src \
+    -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src
 ```
 
-The four core dependencies are all pure Mojo:
+The five core dependencies are all pure Mojo:
+[arrow-mlake.mojo](https://github.com/magmalake/arrow-mlake.mojo) for the Arrow
+memory layout and the C Data Interface,
 [thrift.mojo](https://github.com/magmalake/thrift.mojo) for the metadata,
 [hashes.mojo](https://github.com/magmalake/hashes.mojo) for page CRC32 and the
 bloom filters' XXH64, [snappy.mojo](https://github.com/magmalake/snappy.mojo)
@@ -82,6 +84,23 @@ for the SNAPPY codec, and
 [avro.mojo](https://github.com/magmalake/avro.mojo)'s `deflate.inflate` for the
 DEFLATE half of GZIP. `ZSTD` and `LZ4` are optional and pull in the two FFI
 tins — see [Codecs](#codecs).
+
+### The Arrow layer lives next door
+
+`ArrayData`, `ArrayArena`, `ArrowType`, `RecordBatch` and both directions of
+the C Data Interface are
+[arrow-mlake.mojo](https://github.com/magmalake/arrow-mlake.mojo). They used to
+live in `src/parquet`; the Arrow layout is not Parquet's, and it stayed here
+only because this is where it was first needed. It moved out when `lancedb.mojo`
+needed the same code and taking `parquet-mojo` for it would have meant nine tin
+dependencies, three of them compression codecs it never calls.
+
+Nothing a consumer writes has to change. `parquet.arrow`, `parquet.carrow` and
+`parquet.carrow_import` are re-export shims, and `from parquet import
+RecordBatch` and `from parquet.reader import RecordBatch` both still resolve —
+they are the same types, not copies. A **source-path** consumer does need to
+add `-I ../arrow-mlake.mojo/src`, as above; a consumer taking the tin gets it
+as a run dependency.
 
 ## API
 
@@ -449,10 +468,11 @@ Beyond value parity the suite covers:
 - the C Data Interface, inbound: every column of every fixture exported and
   imported back and compared on both values *and* arena layout, a producer's
   `offset` honoured at three unaligned starts, a wrong `n_buffers`, a child
-  shorter than the list that indexes it, a released pair, every format string
-  we write parsed back to itself and ten we refuse named in the error — plus
-  an `ArrowArrayStream` driven by a hand-written C producer to the end, and
-  one that fails mid-scan;
+  shorter than the list that indexes it, and a released pair. The Arrow layer's
+  own unit tests — format strings, `ArrowArrayStream`, arrays built by hand
+  rather than read out of a fixture — are
+  [arrow-mlake.mojo](https://github.com/magmalake/arrow-mlake.mojo)'s, along
+  with the pyarrow-as-producer gate;
 - unit tests for bit widths, ULEB128, zigzag, hybrid RLE runs, legacy
   `BIT_PACKED`, PLAIN, dictionary gather, `BYTE_STREAM_SPLIT` and
   `DELTA_BINARY_PACKED` headers;
@@ -480,18 +500,13 @@ all-null file and a legacy list file — import into pyarrow and compare equal.
 
 ### The C Data Interface inbound, verified against pyarrow
 
-`pixi run verify-c-import` is the same idea pointed the other way, and it is
-the check that matters for the importer: `tools/produce_c_data.py` has
-**pyarrow** build the arrays and `_export_to_c` hand them over, so the
-producer is one we did not write. **63 cases** — every primitive width, utf8
-and binary in both offset widths, `bool`, `null`, decimals, dates, times and
-timestamps with and without a zone, list, large list, struct, map, list of
-struct, struct of list, empty and all-null arrays, and 24 *slices* at
-unaligned starts — are each checked twice: once on the type we parsed the
-format string into, and once by re-exporting and asking pyarrow whether it
-got back what it sent. Two malformed producers are checked too. Breaking the
-importer's `offset` handling fails 22 of them; mapping `ttu` to the wrong
-storage width fails another.
+That gate moved with the code it gates:
+`pixi run verify-c-import` is
+[arrow-mlake.mojo](https://github.com/magmalake/arrow-mlake.mojo)'s now. It has
+**pyarrow** build the arrays and `_export_to_c` hand them over, so the producer
+is one we did not write, and checks 63 cases twice each — once on the type the
+format string parsed into, and once by re-exporting and asking pyarrow whether
+it got back what it sent.
 
 ### Fixtures
 

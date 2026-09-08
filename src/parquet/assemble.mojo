@@ -23,7 +23,7 @@ which is what makes it possible to build a struct's children independently and
 still have them line up.
 """
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DECIMAL128,
