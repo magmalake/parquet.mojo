@@ -151,7 +151,28 @@ zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "20887001113
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "36ec6c5ca1cef06c970db67710e072fd64849be7" }
 brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "bddf7c6811e756a4924fb13c7e9c14041644429a" }
 [feature.nightly.dependencies]
-modular = ">=26.6.0.dev2026082605,<27"
+# Capped below 26.6.0.dev2026090705: threads.mojo's `atomic.mojo` does not
+# compile on it ("invalid MLIR attribute: expected '<'"), and every environment
+# that builds against the sibling source paths needs threads. The cap belongs
+# here rather than in threads.mojo's own floor because it is this repo's
+# environments that break; lift it when threads.mojo builds on a newer nightly.
+modular = ">=26.6.0.dev2026082605,<26.6.0.dev2026090105"
+
+# `mojo format` only parses — it never builds against a sibling — so the
+# formatter can run on a newer compiler than the build environments can. It has
+# to: the 1.0.0 and dev2026082905 formatters abort on thirteen of this repo's
+# files with `'_python_symbols' object has no attribute
+# 'old_comptime_assert_stmt'`, and dev2026090705 formats all thirty-two
+# unchanged. Keeping it its own environment is what stops a formatter fix from
+# moving the compiler that has to agree with threads.mojo.
+[feature.fmt.dependencies]
+modular = ">=26.6.0.dev2026090705,<27"
+
+# The environment takes `no-default-feature`, so the task has to live here to
+# be reachable from it.
+[feature.fmt.tasks]
+fmt = { cmd = "mojo format src tests bench" }
+format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- src tests bench" }
 
 [feature.stable.dependencies]
 mojo-compiler = "==1.0.0"
@@ -215,7 +236,9 @@ lint-bench = { cmd = "mojolint --lsp -I src -I ../arrow-mlake.mojo/src -I ../thr
 # The `-I` list is the one the other nightly tasks use, plus
 # `-I experiments/gpu_gather` so the spike's own modules resolve.
 [feature.gpu.dependencies]
-modular = ">=26.6.0.dev2026082605,<27"
+# Same cap as `nightly`, and for the same reason: this environment builds
+# against threads.mojo too.
+modular = ">=26.6.0.dev2026082605,<26.6.0.dev2026090105"
 
 [feature.gpu.tasks]
 # Whether this machine has a Metal device the Mojo GPU stack can drive at all.
@@ -243,6 +266,7 @@ codecs = ["nightly", "codecs"]
 codecs-stable = ["stable", "codecs"]
 bench = ["stable", "bench"]
 gpu = ["gpu"]
+fmt = { features = ["fmt"], no-default-feature = true }
 
 [dependencies]
 # Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi

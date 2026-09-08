@@ -19,7 +19,12 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
   come back unchanged from a nightly at or after `26.6.0.dev2026090705`, which
   the lock now resolves. `format-check` runs on the nightly leg of CI; it
   cannot run on stable, which is pinned to Mojo 1.0.0 and still carries the
-  bug.
+  bug. The formatter lives in its own `fmt` environment because the build
+  environments had to be **capped below `26.6.0.dev2026090105`** in the same
+  breath: `threads.mojo`'s `atomic.mojo` stopped compiling above it with
+  `invalid MLIR attribute: expected '<'`, so moving one compiler to fix
+  formatting broke every environment that builds against the sibling source
+  paths. `mojo format` only parses, so the two can and now do move separately.
 
 ### Changed
 - **The Arrow layer moved to
