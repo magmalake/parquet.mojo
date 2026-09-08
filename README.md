@@ -519,6 +519,24 @@ verbatim and are not regenerated.
 
 ## Performance
 
+**For what this costs inside a real query, see
+[taxibench.example](https://github.com/magmalake/taxibench.example)**: eight
+analytical queries over 79,478,796 NYC taxi trips, read through
+[iceberg-mojo](https://github.com/magmalake/iceberg.mojo) and through
+PyIceberg, with every answer diffed between the two before a timing is quoted.
+Profiling that suite is where `open_projected` and `needed_byte_ranges` came
+from — it showed a scan reading a whole 60 MiB file to decode four columns of
+nineteen, and that reading the other 47 MiB cost more than decompressing the
+13 it wanted.
+
+It is also where the decoder was measured against pyarrow like for like, on
+the same columns with neither side's filter reducible: **the decode itself is
+already about 8.5% cheaper per column.** The gap that mattered was never
+decode speed; it was bytes fetched.
+
+The rest of this section is the in-repo microbenchmark, which measures this
+library against one fixture rather than a whole query.
+
 `pixi run -e bench bench` against `pixi run bench-pyarrow`, single threaded,
 Apple M4, CRC verification off on both sides. Both timers cover the same
 thing — bytes in memory to Arrow arrays, and Arrow arrays to bytes — and
