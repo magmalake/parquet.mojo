@@ -19,6 +19,18 @@ from fingerprint import (
     table_fingerprint,
     table_values_fingerprint,
 )
+from carrow_check import (
+    StreamSource,
+    assert_preorder,
+    assert_same_array,
+    buffer_address,
+    child_array,
+    exported_pair,
+    make_struct_arena,
+    permuted_arena,
+    preorder_size,
+    set_word,
+)
 from oracle import canon_value, decimal_string, double_bits, hex_of, load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import (
@@ -34,8 +46,12 @@ from parquet import (
     AT_INT32,
     AT_INT64,
     AT_INT8,
+    AT_LARGE_BINARY,
+    AT_LARGE_LIST,
+    AT_LARGE_UTF8,
     AT_LIST,
     AT_MAP,
+    AT_NULL,
     AT_STRUCT,
     AT_TIME32,
     AT_TIME64,
@@ -58,10 +74,13 @@ from parquet import (
     TU_MICRO,
     TU_MILLI,
     TU_NANO,
+    TU_SECOND,
     ArrayArena,
     ArrayData,
     ArrowType,
     DefaultCodecs,
+    ImportedArray,
+    ImportedStream,
     ParquetReader,
     Predicate,
     ScalarValue,
@@ -70,8 +89,12 @@ from parquet import (
     WriterOptions,
     build_schema,
     export_c,
+    import_c,
+    parse_format,
+    array_i64,
     array_str,
 )
+from parquet.arrow import at_decimal, at_fixed, at_time, at_timestamp
 from parquet.page import PageWindow, chunk_start, read_column_chunk
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.writer import DICT_MAX_VALUES
@@ -2095,6 +2118,408 @@ def test_c_data_interface_release_is_idempotent() raises:
         var e = export_c(batch.arena, batch.roots[c])
         e.release()
         e.release()
+
+
+# ── Arrow C Data Interface, inbound ────────────────────────────────────────
+
+
+def _round_trip(arena: ArrayArena, root: Int, label: StringSlice) raises:
+    """Export one array, import it back, and compare both halves.
+
+    Values *and* layout: `assert_same_array` walks the two trees together, and
+    `assert_preorder` looks at the arena's own numbering, which the walk by
+    construction cannot.
+    """
+    var pair = exported_pair(arena, root)
+    var owned = ImportedArray(pair[0], pair[1])
+    var back = ArrayArena()
+    var got = import_c(back, pair[0], pair[1])
+    owned.release()
+    assert_same_array(arena, root, back, got, label)
+    assert_preorder(back, got, label)
+    assert_equal(len(back.nodes), preorder_size(arena, root))
+
+
+def test_c_data_import_round_trips_every_fixture_column() raises:
+    """Every column of every fixture, out through the exporter and back.
+
+    That is nulls, empty arrays, every primitive width, utf8 and binary, the
+    decimals and the temporal types, and the nested shapes — `nested` alone
+    covers list, large list, map and struct — because the fixtures were built
+    to cover them and the round trip inherits the coverage.
+    """
+    var checked = 0
+    for f in core_fixtures():
+        var r = _reader(f)
+        var t = r.read_table()
+        for b in range(len(t.batches)):
+            ref batch = t.batches[b]
+            for c in range(batch.num_columns()):
+                _round_trip(
+                    batch.arena,
+                    batch.roots[c],
+                    String(f, ".", batch.name(c)),
+                )
+                checked += 1
+    assert_true(
+        checked > 100, String("only ", checked, " columns round-tripped")
+    )
+
+
+def test_c_data_import_lays_the_arena_out_in_pre_order() raises:
+    """A map column is four nodes; imported, they are 0, 1, 2, 3 in DFS order.
+    """
+    var r = _reader("nested")
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var mi = -1
+    for i in range(batch.num_columns()):
+        if batch.name(i) == "m":
+            mi = i
+    assert_true(mi >= 0)
+    var pair = exported_pair(batch.arena, batch.roots[mi])
+    var owned = ImportedArray(pair[0], pair[1])
+    var back = ArrayArena()
+    var got = import_c(back, pair[0], pair[1])
+    owned.release()
+    assert_equal(got, 0)
+    assert_equal(len(back.nodes), 4)
+    assert_equal(back.nodes[0].type.format(), "+m")
+    assert_equal(back.nodes[1].type.format(), "+s")
+    assert_equal(back.nodes[1].children[0], 2)
+    assert_equal(back.nodes[1].children[1], 3)
+    assert_preorder(back, got, "nested.m")
+    # And a second import into the same arena appends after the first.
+    var pair2 = exported_pair(batch.arena, batch.roots[mi])
+    var owned2 = ImportedArray(pair2[0], pair2[1])
+    var got2 = import_c(back, pair2[0], pair2[1])
+    owned2.release()
+    assert_equal(got2, 4)
+    assert_preorder(back, got2, "nested.m again")
+
+
+def test_the_round_trip_check_catches_a_corrupted_buffer() raises:
+    """The negative control for the values half.
+
+    Three separate corruptions of an *exported* array — one values byte, one
+    offset, one validity bit — each of which the importer must carry faithfully
+    into its `ArrayData` and the comparator must then report. A round trip that
+    passed these would be proving nothing.
+    """
+    var r = _reader("primitives")
+    r.select_columns([String("i64"), String("s")])
+    var t = r.read_table()
+    ref batch = t.batches[0]
+
+    # One byte of the int64 values buffer.
+    var pair = exported_pair(batch.arena, batch.roots[0])
+    var values = buffer_address(pair[0], 1)
+    var vp = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=values)
+    vp[unsafe_offset=9] ^= 0x40
+    var owned = ImportedArray(pair[0], pair[1])
+    var back = ArrayArena()
+    var got = import_c(back, pair[0], pair[1])
+    owned.release()
+    with assert_raises(contains="values byte"):
+        assert_same_array(batch.arena, batch.roots[0], back, got, "i64")
+
+    # One validity bit of the same column.
+    var pair2 = exported_pair(batch.arena, batch.roots[0])
+    var validity = buffer_address(pair2[0], 0)
+    var bp = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=validity)
+    bp[unsafe_offset=0] ^= 0x01
+    var owned2 = ImportedArray(pair2[0], pair2[1])
+    var back2 = ArrayArena()
+    var got2 = import_c(back2, pair2[0], pair2[1])
+    owned2.release()
+    with assert_raises(contains="null_count"):
+        assert_same_array(batch.arena, batch.roots[0], back2, got2, "i64")
+
+    # One offset of the utf8 column, which moves a string boundary.
+    var pair3 = exported_pair(batch.arena, batch.roots[1])
+    var offs = buffer_address(pair3[0], 1)
+    var op = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=offs)
+    op[unsafe_offset=2] += 1
+    var owned3 = ImportedArray(pair3[0], pair3[1])
+    var back3 = ArrayArena()
+    var got3 = import_c(back3, pair3[0], pair3[1])
+    owned3.release()
+    with assert_raises(contains="offset"):
+        assert_same_array(batch.arena, batch.roots[1], back3, got3, "s")
+
+
+def test_the_layout_check_catches_a_permuted_arena() raises:
+    """The negative control for the layout half — the trap `fingerprint` records.
+
+    Renumber an imported arena back to front without touching a value: the
+    lockstep walk still passes, because it starts at the root and follows the
+    indices wherever they lead, and `assert_preorder` fails, because it is the
+    only half that looks at the numbers.
+    """
+    var r = _reader("nested")
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var pair = exported_pair(batch.arena, batch.roots[0])
+    var owned = ImportedArray(pair[0], pair[1])
+    var back = ArrayArena()
+    var got = import_c(back, pair[0], pair[1])
+    owned.release()
+    assert_true(len(back.nodes) > 1, "a flat array cannot show a permutation")
+    var moved = permuted_arena(back, got)
+    assert_same_array(back, got, moved[0], moved[1], "permuted")
+    with assert_raises(contains="in pre-order"):
+        assert_preorder(moved[0], moved[1], "permuted")
+
+
+def test_import_honours_a_producers_offset() raises:
+    """A producer's `offset` is a slice, and `ArrayData` has nowhere to put it.
+
+    pyarrow exports a sliced array as the whole buffer plus an offset, so an
+    importer that ignored the field would read the wrong elements — and one
+    that materialised the window but forgot the child would read the wrong
+    strings. Both are checked here by slicing an export by hand and comparing
+    against the elements the original holds at those positions.
+    """
+    var r = _reader("primitives")
+    r.select_columns([String("i64"), String("s")])
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var rows = batch.arena.nodes[batch.roots[0]].length
+    var want_i64 = array_i64(batch.column(0))
+    var want_str = array_str(batch.column(1))
+    for skip in [1, 3, 7]:
+        var pair = exported_pair(batch.arena, batch.roots[0])
+        set_word(pair[0], 2, Int64(skip))  # offset
+        set_word(pair[0], 0, Int64(rows - skip))  # length
+        set_word(pair[0], 1, -1)  # null_count: "not computed"
+        var owned = ImportedArray(pair[0], pair[1])
+        var back = ArrayArena()
+        var got = import_c(back, pair[0], pair[1])
+        owned.release()
+        assert_equal(back.nodes[got].length, rows - skip)
+        var have = array_i64(back.nodes[got])
+        for i in range(rows - skip):
+            assert_equal(have[1][i], want_i64[1][i + skip], String("valid ", i))
+            if have[1][i]:
+                assert_equal(have[0][i], want_i64[0][i + skip])
+
+        var pair2 = exported_pair(batch.arena, batch.roots[1])
+        set_word(pair2[0], 2, Int64(skip))
+        set_word(pair2[0], 0, Int64(rows - skip))
+        var owned2 = ImportedArray(pair2[0], pair2[1])
+        var back2 = ArrayArena()
+        var got2 = import_c(back2, pair2[0], pair2[1])
+        owned2.release()
+        assert_equal(back2.nodes[got2].offsets[0], 0)
+        var have2 = array_str(back2.nodes[got2])
+        for i in range(rows - skip):
+            assert_equal(have2[1][i], want_str[1][i + skip])
+            if have2[1][i]:
+                assert_equal(have2[0][i], want_str[0][i + skip])
+
+
+def test_import_rejects_a_wrong_buffer_count() raises:
+    """A malformed `n_buffers` raises, and says which format it disagreed with.
+    """
+    var r = _reader("primitives")
+    r.select_columns([String("s")])
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var pair = exported_pair(batch.arena, batch.roots[0])
+    set_word(pair[0], 3, 2)  # utf8 needs three
+    var owned = ImportedArray(pair[0], pair[1])
+    var back = ArrayArena()
+    with assert_raises(contains="u needs 3 buffers"):
+        _ = import_c(back, pair[0], pair[1])
+    owned.release()
+
+
+def test_import_rejects_a_short_child() raises:
+    """A list whose offsets run past its child is a truncated buffer, and the
+    one truncation the interface makes detectable: it carries no buffer sizes,
+    so a short `utf8` data buffer cannot be seen, but a short child array can.
+    """
+    var r = _reader("nested")
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var li = -1
+    for i in range(batch.num_columns()):
+        if batch.name(i) == "li":
+            li = i
+    assert_true(li >= 0)
+    var pair = exported_pair(batch.arena, batch.roots[li])
+    var child = child_array(pair[0], 0)
+    set_word(child, 0, 1)  # the child now claims a single element
+    var owned = ImportedArray(pair[0], pair[1])
+    var back = ArrayArena()
+    with assert_raises(contains="run past the end of its child"):
+        _ = import_c(back, pair[0], pair[1])
+    owned.release()
+
+    # And a struct whose child is shorter than the struct itself.
+    var si = -1
+    for i in range(batch.num_columns()):
+        if batch.name(i) == "st":
+            si = i
+    assert_true(si >= 0)
+    var pair2 = exported_pair(batch.arena, batch.roots[si])
+    set_word(child_array(pair2[0], 0), 0, 2)
+    var owned2 = ImportedArray(pair2[0], pair2[1])
+    var back2 = ArrayArena()
+    with assert_raises(contains="shorter than the struct"):
+        _ = import_c(back2, pair2[0], pair2[1])
+    owned2.release()
+
+
+def test_import_rejects_a_released_pair() raises:
+    """Importing after release is a use-after-free; the null callback catches it.
+    """
+    var r = _reader("primitives")
+    r.select_columns([String("i64")])
+    var t = r.read_table()
+    ref batch = t.batches[0]
+    var pair = exported_pair(batch.arena, batch.roots[0])
+    var owned = ImportedArray(pair[0], pair[1])
+    owned.release()
+    owned.release()  # idempotent
+    var back = ArrayArena()
+    with assert_raises(contains="released ArrowArray"):
+        _ = import_c(back, pair[0], pair[1])
+
+
+def test_import_parses_the_formats_we_write() raises:
+    """Every format string `ArrowType.format` emits parses back to itself."""
+    var types: List[ArrowType] = [
+        ArrowType(AT_NULL),
+        ArrowType(AT_BOOL),
+        ArrowType(AT_INT8),
+        ArrowType(AT_UINT8),
+        ArrowType(AT_INT16),
+        ArrowType(AT_UINT16),
+        ArrowType(AT_INT32),
+        ArrowType(AT_UINT32),
+        ArrowType(AT_INT64),
+        ArrowType(AT_UINT64),
+        ArrowType(AT_FLOAT16),
+        ArrowType(AT_FLOAT32),
+        ArrowType(AT_FLOAT64),
+        ArrowType(AT_UTF8),
+        ArrowType(AT_LARGE_UTF8),
+        ArrowType(AT_BINARY),
+        ArrowType(AT_LARGE_BINARY),
+        at_fixed(16),
+        at_decimal(38, 9),
+        ArrowType(AT_DATE32),
+        at_time(TU_SECOND),
+        at_time(TU_MILLI),
+        at_time(TU_MICRO),
+        at_time(TU_NANO),
+        at_timestamp(TU_MICRO, String("UTC")),
+        at_timestamp(TU_NANO, String()),
+        ArrowType(AT_LIST),
+        ArrowType(AT_LARGE_LIST),
+        ArrowType(AT_STRUCT),
+        ArrowType(AT_MAP),
+    ]
+    for want in types:
+        var got = parse_format(want.format())
+        assert_equal(got.format(), want.format())
+        assert_equal(String(got), String(want))
+    # A negative scale, which Arrow allows and our writer never emits.
+    assert_equal(parse_format("d:10,-2").scale, -2)
+    assert_equal(parse_format("d:10,2,128").precision, 10)
+
+
+def test_import_names_the_formats_it_will_not_read() raises:
+    """An unknown format is an error carrying the string, never a guess."""
+    var bad: List[String] = [
+        String("+w:3"),  # fixed size list
+        String("+ud:0,1"),  # dense union
+        String("+r"),  # run-end encoded
+        String("vu"),  # string view
+        String("tdm"),  # date64
+        String("tDs"),  # duration
+        String("tiM"),  # interval
+        String("d:10,2,256"),  # decimal256
+        String("q"),  # nothing at all
+        String(""),
+    ]
+    for f in bad:
+        with assert_raises(contains="parquet.carrow"):
+            _ = parse_format(f)
+        if f:
+            with assert_raises(contains=String(f)):
+                _ = parse_format(f)
+
+
+def test_import_batch_unwraps_a_struct() raises:
+    """A struct array becomes a `RecordBatch`, one column per field."""
+    var built = make_struct_arena(7, 500)
+    var pair = exported_pair(built[0], built[1])
+    var owned = ImportedArray(pair[0], pair[1])
+    var batch = owned.into_batch()
+    owned.release()
+    assert_equal(batch.num_columns(), 1)
+    assert_equal(batch.num_rows, 7)
+    assert_equal(batch.name(0), "n")
+    var got = batch.column_i64(0)
+    assert_equal(got[0][0], 500)
+    assert_equal(got[0][1], 501)
+    assert_false(got[1][2])  # every third is null
+
+
+def test_arrow_array_stream_iterates_to_the_end() raises:
+    """Three batches out of a real C producer, in order, then a clean end."""
+    var src = StreamSource(3, 4, -1)
+    var stream = ImportedStream(src.address())
+    assert_equal(stream.format(), "+s")
+    var seen = 0
+    var rows = 0
+    while True:
+        var got = stream.next()
+        if not got:
+            break
+        ref batch = got.value()
+        assert_equal(batch.num_columns(), 1)
+        assert_equal(batch.num_rows, 4 + seen)
+        var values = batch.column_i64(0)
+        assert_equal(values[0][0], Int64(100 * seen))
+        rows += batch.num_rows
+        seen += 1
+    assert_equal(seen, 3)
+    assert_equal(rows, 4 + 5 + 6)
+    # Past the end it stays finished rather than asking again.
+    assert_false(Bool(stream.next()))
+    stream.release()
+    stream.release()
+    src.free_stream_storage()
+
+
+def test_arrow_array_stream_reports_a_producer_error() raises:
+    """`get_next` returning non-zero is an error, not the end of the stream.
+
+    Conflating the two would turn a failed scan into a short one, which is the
+    kind of wrong answer that never gets noticed, so the message
+    `get_last_error` returns is carried into the raise.
+    """
+    var src = StreamSource(3, 4, 1)
+    var stream = ImportedStream(src.address())
+    var first = stream.next()
+    assert_true(Bool(first))
+    with assert_raises(contains="the producer stopped early"):
+        _ = stream.next()
+    stream.release()
+    src.free_stream_storage()
+
+
+def test_arrow_array_stream_releases_what_it_never_read() raises:
+    """A stream dropped half way frees the batches it never handed over."""
+    var src = StreamSource(4, 2, -1)
+    var stream = ImportedStream(src.address())
+    var first = stream.next()
+    assert_true(Bool(first))
+    stream.release()
+    src.free_stream_storage()
 
 
 # ── encodings, at the unit level ───────────────────────────────────────────

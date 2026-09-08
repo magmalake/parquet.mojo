@@ -10,6 +10,72 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+### Added
+- **The import half of the Arrow C Data Interface** (`parquet.carrow_import`).
+  `parquet.carrow` could only ever hand arrays *out*; nothing could read a C
+  `ArrowSchema`/`ArrowArray` back in, which meant no C or Rust producer could
+  hand Arrow data into this stack — not DuckDB, not Arrow Flight, not an ADBC
+  driver, and not LanceDB, whose analytical scan was blocked on exactly this.
+  - `import_c(arena, array, schema)` copies one foreign array and everything
+    under it into an `ArrayArena` and returns its root, in DFS **pre-order** —
+    the order the exporter walks on the way out, so `export → import → export`
+    reproduces the arena's shape and not merely its numbers.
+  - `import_batch_c` unwraps a `+s` root into a `RecordBatch`, one column per
+    field.
+  - `ImportedArray` and `ImportedStream` own what a producer moved to them and
+    implement the consumer's half of the release convention: the root is
+    released exactly once, children never on their own, and a released struct
+    is recognised by its null `release` pointer. `ImportedStream` drives
+    `ArrowArrayStream` — `get_schema`, then `get_next` until a released array
+    ends the stream, with `get_last_error` carried into the raise so a failed
+    scan is not mistaken for a short one — and releases each batch as soon as
+    it has been copied, so a long scan holds one batch of producer memory
+    rather than the whole stream.
+  - A producer's `offset` is honoured by materialising the window it names,
+    for validity bitmaps (re-packed bit by bit when the start is unaligned),
+    values, offsets, and recursively for the children a list's offsets point
+    into. `ArrayData` has no offset field, so this is the only faithful
+    reading of a sliced array.
+  - **Nothing about a producer is trusted.** `n_buffers` is checked against
+    the format string, `n_children` against the type, offsets for
+    monotonicity and against the length of the child they index into, and
+    metadata counts before they are used as loop bounds. Every format string
+    this library cannot name raises **carrying the string**: unions, run-end
+    encoding, list views, fixed-size lists, string views, `date64`,
+    durations, intervals, decimal256 and dictionary-encoded arrays. The
+    interface carries no buffer *sizes*, so a truncated `utf8` data buffer is
+    undetectable by construction; that limit is documented rather than
+    papered over.
+  - Importing **copies**, because `ArrayData` owns its buffers. On a
+    19-column, 65 536-row NYC-taxi batch (8.98 MB of Arrow buffers) that is
+    2.2 ms at p50 and 2.4 ms at p90 — about 4 GB/s, and 6.6% of what decoding
+    the same batch out of Parquet costs. A borrowing `ArrayData` would avoid
+    it but changes the type every other module reads, and the measurement
+    says it would be buying a rounding error.
+- `pixi run verify-c-import` — **pyarrow as the producer**.
+  `tools/produce_c_data.py` builds 63 cases, `_export_to_c`s them into ctypes
+  storage and hands them to `tools/carrow_import.mojo`: every primitive width,
+  utf8 and binary in both offset widths, `bool`, `null`, decimals, dates,
+  times, timestamps with and without a zone, the four nested shapes, empty and
+  all-null arrays, 24 slices at unaligned starts, a `RecordBatchReader` as an
+  `ArrowArrayStream`, and two malformed producers. Each array is checked both
+  on the type we parsed its format string into and by re-exporting it for
+  pyarrow to compare. Runs in the `pyarrow parity` CI job.
+- 14 tests in `tests/test_parquet.mojo` and the helpers in
+  `tests/carrow_check.mojo`, including a hand-written C `ArrowArrayStream`
+  producer. The round trip is compared on **values and arena layout
+  separately**: a walk from the root cannot see a consistently permuted arena
+  — the trap `tests/fingerprint.mojo` records — so `assert_preorder` checks
+  the arena's own numbering, and `permuted_arena` is the negative control that
+  shows the walk missing what the layout check catches. Three more negative
+  controls corrupt an exported values byte, validity bit and offset and assert
+  the comparison fails.
+
+### Changed
+- `parquet.carrow.n_buffers_for_type` splits the buffer count out of
+  `n_buffers_for`, so the export and the import's validation read it from one
+  place.
+
 ## [0.8.0] - 2026-09-07
 
 A projected scan reads only the bytes it needs. On the eight-query

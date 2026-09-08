@@ -197,8 +197,9 @@ jobs:
         run: pixi run -e bench lint-bench
 
   parity:
-    # The two cross-language checks: pyarrow importing our Arrow C Data
-    # Interface export, and pyarrow reading files our writer produced.
+    # The three cross-language checks: pyarrow importing our Arrow C Data
+    # Interface export, pyarrow *producing* arrays and a stream that we import,
+    # and pyarrow reading files our writer produced.
     name: pyarrow parity / ubuntu-latest
     runs-on: ubuntu-latest
     steps:
@@ -240,6 +241,12 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           pixi run verify-c
+
+      - name: Arrow C Data Interface out of pyarrow
+        working-directory: parquet.mojo
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          pixi run verify-c-import
 
       - name: pyarrow reads what our writer writes
         working-directory: parquet.mojo

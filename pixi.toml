@@ -51,6 +51,12 @@ fixtures = { cmd = "bash tools/gen_fixtures.sh" }
 # Build the Arrow C Data Interface shared library and import it into pyarrow.
 carrow-lib = { cmd = "mkdir -p build && mojo build --emit shared-lib tools/carrow_export.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/libpqcarrow$SHLIB_EXT" }
 verify-c = { cmd = "bash tools/verify_c_data.sh", depends-on = ["carrow-lib"] }
+# The same interface inbound: pyarrow builds the arrays, `_export_to_c` hands
+# them over, and tools/carrow_import.mojo imports them. The producer is one we
+# did not write, which is the whole point — an importer checked only against
+# our own exporter proves the two agree and nothing else.
+carrow-import-lib = { cmd = "mkdir -p build && mojo build --emit shared-lib tools/carrow_import.mojo -I src -I ../threads.mojo/src -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src -o build/libpqcimport$SHLIB_EXT" }
+verify-c-import = { cmd = "bash tools/verify_c_import.sh", depends-on = ["carrow-import-lib"] }
 # Write every fixture back out through our writer and have pyarrow read it.
 verify-written = { cmd = "bash tools/verify_written.sh" }
 # pyarrow's numbers for the same files, single threaded and threaded, for the
