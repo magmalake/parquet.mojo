@@ -1,6 +1,6 @@
 """Human- and JSON-readable rendering of decoded Arrow arrays, for the CLI."""
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DATE32,

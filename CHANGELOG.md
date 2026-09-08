@@ -10,6 +10,38 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+### Changed
+- **The Arrow layer moved to
+  [arrow-mlake.mojo](https://github.com/magmalake/arrow-mlake.mojo)**, and this
+  library now depends on it. `ArrayData`, `ArrayArena`, `ArrowType`, the `AT_*`
+  tags, the bitmap and unaligned-load helpers, both directions of the C Data
+  Interface and `RecordBatch` all left `src/parquet`. The Arrow memory layout
+  is not Parquet's; it lived here only because this is where it was first
+  needed, and it moved out when `lancedb.mojo` needed the same C Data Interface
+  and taking `parquet-mojo` for it would have turned a binding with no tin
+  dependencies at all into one with nine, three of them compression codecs and
+  one a Thrift implementation it would never execute.
+  - **No consumer source has to change.** `parquet.arrow`, `parquet.carrow` and
+    `parquet.carrow_import` are re-export shims, and `RecordBatch` and the
+    `array_*` kernels are re-exported from `parquet` and `parquet.reader`
+    alike, so `from parquet.arrow import ArrayData` and
+    `from parquet.reader import RecordBatch` both still resolve to the same
+    types. iceberg-mojo 0.7.2 builds against this unchanged, and its 203 tests
+    pass.
+  - A consumer that takes `parquet-mojo` as a tin gets `arrow-mlake-mojo` as a
+    run dependency. A consumer that puts sources on the include path must add
+    **`-I ../arrow-mlake.mojo/src`**; that is the one thing this change asks
+    for.
+  - `pixi run verify-c-import` and `tools/carrow_import.mojo` /
+    `tools/produce_c_data.py` moved too — the pyarrow-as-producer gate belongs
+    with the importer it gates. `verify-c` (pyarrow reading *our* export) stays
+    here, because what it exercises is the Parquet decoder feeding the export.
+  - Six unit tests went with the code: the format-string round trip, the
+    formats we refuse, the struct-to-`RecordBatch` unwrap and the three
+    `ArrowArrayStream` tests. What stays is the integration half — every column
+    of every Parquet fixture exported and imported back — which is coverage of
+    the decoder as much as of the interface. 101 tests here, 34 there.
+
 ### Added
 - **The import half of the Arrow C Data Interface** (`parquet.carrow_import`).
   `parquet.carrow` could only ever hand arrays *out*; nothing could read a C

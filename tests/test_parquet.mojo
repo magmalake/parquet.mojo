@@ -20,13 +20,11 @@ from fingerprint import (
     table_values_fingerprint,
 )
 from carrow_check import (
-    StreamSource,
     assert_preorder,
     assert_same_array,
     buffer_address,
     child_array,
     exported_pair,
-    make_struct_arena,
     permuted_arena,
     preorder_size,
     set_word,
@@ -80,7 +78,6 @@ from parquet import (
     ArrowType,
     DefaultCodecs,
     ImportedArray,
-    ImportedStream,
     ParquetReader,
     Predicate,
     ScalarValue,
@@ -90,11 +87,9 @@ from parquet import (
     build_schema,
     export_c,
     import_c,
-    parse_format,
     array_i64,
     array_str,
 )
-from parquet.arrow import at_decimal, at_fixed, at_time, at_timestamp
 from parquet.page import PageWindow, chunk_start, read_column_chunk
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.writer import DICT_MAX_VALUES
@@ -2385,141 +2380,6 @@ def test_import_rejects_a_released_pair() raises:
     var back = ArrayArena()
     with assert_raises(contains="released ArrowArray"):
         _ = import_c(back, pair[0], pair[1])
-
-
-def test_import_parses_the_formats_we_write() raises:
-    """Every format string `ArrowType.format` emits parses back to itself."""
-    var types: List[ArrowType] = [
-        ArrowType(AT_NULL),
-        ArrowType(AT_BOOL),
-        ArrowType(AT_INT8),
-        ArrowType(AT_UINT8),
-        ArrowType(AT_INT16),
-        ArrowType(AT_UINT16),
-        ArrowType(AT_INT32),
-        ArrowType(AT_UINT32),
-        ArrowType(AT_INT64),
-        ArrowType(AT_UINT64),
-        ArrowType(AT_FLOAT16),
-        ArrowType(AT_FLOAT32),
-        ArrowType(AT_FLOAT64),
-        ArrowType(AT_UTF8),
-        ArrowType(AT_LARGE_UTF8),
-        ArrowType(AT_BINARY),
-        ArrowType(AT_LARGE_BINARY),
-        at_fixed(16),
-        at_decimal(38, 9),
-        ArrowType(AT_DATE32),
-        at_time(TU_SECOND),
-        at_time(TU_MILLI),
-        at_time(TU_MICRO),
-        at_time(TU_NANO),
-        at_timestamp(TU_MICRO, String("UTC")),
-        at_timestamp(TU_NANO, String()),
-        ArrowType(AT_LIST),
-        ArrowType(AT_LARGE_LIST),
-        ArrowType(AT_STRUCT),
-        ArrowType(AT_MAP),
-    ]
-    for want in types:
-        var got = parse_format(want.format())
-        assert_equal(got.format(), want.format())
-        assert_equal(String(got), String(want))
-    # A negative scale, which Arrow allows and our writer never emits.
-    assert_equal(parse_format("d:10,-2").scale, -2)
-    assert_equal(parse_format("d:10,2,128").precision, 10)
-
-
-def test_import_names_the_formats_it_will_not_read() raises:
-    """An unknown format is an error carrying the string, never a guess."""
-    var bad: List[String] = [
-        String("+w:3"),  # fixed size list
-        String("+ud:0,1"),  # dense union
-        String("+r"),  # run-end encoded
-        String("vu"),  # string view
-        String("tdm"),  # date64
-        String("tDs"),  # duration
-        String("tiM"),  # interval
-        String("d:10,2,256"),  # decimal256
-        String("q"),  # nothing at all
-        String(""),
-    ]
-    for f in bad:
-        with assert_raises(contains="parquet.carrow"):
-            _ = parse_format(f)
-        if f:
-            with assert_raises(contains=String(f)):
-                _ = parse_format(f)
-
-
-def test_import_batch_unwraps_a_struct() raises:
-    """A struct array becomes a `RecordBatch`, one column per field."""
-    var built = make_struct_arena(7, 500)
-    var pair = exported_pair(built[0], built[1])
-    var owned = ImportedArray(pair[0], pair[1])
-    var batch = owned.into_batch()
-    owned.release()
-    assert_equal(batch.num_columns(), 1)
-    assert_equal(batch.num_rows, 7)
-    assert_equal(batch.name(0), "n")
-    var got = batch.column_i64(0)
-    assert_equal(got[0][0], 500)
-    assert_equal(got[0][1], 501)
-    assert_false(got[1][2])  # every third is null
-
-
-def test_arrow_array_stream_iterates_to_the_end() raises:
-    """Three batches out of a real C producer, in order, then a clean end."""
-    var src = StreamSource(3, 4, -1)
-    var stream = ImportedStream(src.address())
-    assert_equal(stream.format(), "+s")
-    var seen = 0
-    var rows = 0
-    while True:
-        var got = stream.next()
-        if not got:
-            break
-        ref batch = got.value()
-        assert_equal(batch.num_columns(), 1)
-        assert_equal(batch.num_rows, 4 + seen)
-        var values = batch.column_i64(0)
-        assert_equal(values[0][0], Int64(100 * seen))
-        rows += batch.num_rows
-        seen += 1
-    assert_equal(seen, 3)
-    assert_equal(rows, 4 + 5 + 6)
-    # Past the end it stays finished rather than asking again.
-    assert_false(Bool(stream.next()))
-    stream.release()
-    stream.release()
-    src.free_stream_storage()
-
-
-def test_arrow_array_stream_reports_a_producer_error() raises:
-    """`get_next` returning non-zero is an error, not the end of the stream.
-
-    Conflating the two would turn a failed scan into a short one, which is the
-    kind of wrong answer that never gets noticed, so the message
-    `get_last_error` returns is carried into the raise.
-    """
-    var src = StreamSource(3, 4, 1)
-    var stream = ImportedStream(src.address())
-    var first = stream.next()
-    assert_true(Bool(first))
-    with assert_raises(contains="the producer stopped early"):
-        _ = stream.next()
-    stream.release()
-    src.free_stream_storage()
-
-
-def test_arrow_array_stream_releases_what_it_never_read() raises:
-    """A stream dropped half way frees the batches it never handed over."""
-    var src = StreamSource(4, 2, -1)
-    var stream = ImportedStream(src.address())
-    var first = stream.next()
-    assert_true(Bool(first))
-    stream.release()
-    src.free_stream_storage()
 
 
 # ── encodings, at the unit level ───────────────────────────────────────────

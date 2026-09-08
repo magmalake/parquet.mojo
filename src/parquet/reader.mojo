@@ -18,29 +18,35 @@ Projection is by name, by dotted leaf path, or — for Iceberg — by Parquet
 from their statistics against simple `column op literal` predicates.
 """
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
-    AT_UINT16,
-    AT_UINT32,
-    AT_UINT64,
-    AT_UINT8,
-    AT_FLOAT16,
-    AT_FLOAT32,
-    AT_FLOAT64,
     AT_MAP,
     AT_UTF8,
     ArrayArena,
     ArrayData,
     ArrowType,
     bit_get,
-    load_f32,
-    load_f64,
     load_i32,
     load_i64,
 )
+
+# `RecordBatch` and the `array_*` kernels are Arrow, not Parquet, and live in
+# arrow-mlake.mojo. They are re-exported from here — rather than only from
+# `parquet` — because `from parquet.reader import RecordBatch` is an import
+# path consumers already write, iceberg-mojo among them.
+from arrow_mlake.batch import (
+    RecordBatch,
+    array_bool,
+    array_bool_into,
+    array_f64,
+    array_f64_into,
+    array_i64,
+    array_i64_into,
+    array_str,
+    array_str_into,
+)
 from parquet.assemble import LeafSlice, build_field, first_leaf
-from parquet.carrow import ExportedArray, export_c
 from parquet.codec import CodecSet, DefaultCodecs
 from parquet.encoding import MAX_ARROW_VAR_BYTES, PK_VAR
 from parquet.page import (
@@ -59,7 +65,7 @@ from parquet.stats import (
     decode_statistic,
     decode_stats,
 )
-from std.memory import bitcast, unsafe_memcpy
+from std.memory import unsafe_memcpy
 from std.os.path import getsize
 from threads import num_cpus, parallel_for
 from thrift import (
@@ -265,183 +271,6 @@ def _intersect_ranges(
         else:
             j += 1
     return out^
-
-
-struct RecordBatch(Copyable, Defaultable, Movable):
-    """A contiguous run of rows as Arrow arrays, one per selected column."""
-
-    var arena: ArrayArena
-    var roots: List[Int]
-    var num_rows: Int
-
-    def __init__(out self):
-        self.arena = ArrayArena()
-        self.roots = List[Int]()
-        self.num_rows = 0
-
-    def __init__(out self, *, copy: Self):
-        self.arena = copy.arena.copy()
-        self.roots = copy.roots.copy()
-        self.num_rows = copy.num_rows
-
-    def __init__(out self, *, deinit move: Self):
-        self.arena = move.arena^
-        self.roots = move.roots^
-        self.num_rows = move.num_rows
-
-    def num_columns(self) -> Int:
-        return len(self.roots)
-
-    def column(ref self, i: Int) -> ref[self.arena.nodes[0]] ArrayData:
-        return self.arena.nodes[self.roots[i]]
-
-    def child(
-        ref self, node: Int, k: Int
-    ) -> ref[self.arena.nodes[0]] ArrayData:
-        return self.arena.nodes[self.arena.nodes[node].children[k]]
-
-    def name(self, i: Int) -> String:
-        return self.arena.nodes[self.roots[i]].name.copy()
-
-    def type(self, i: Int) -> ArrowType:
-        return self.arena.nodes[self.roots[i]].type.copy()
-
-    def export_c(self, i: Int) raises -> ExportedArray:
-        """Column `i` over the Arrow C Data Interface. The result owns copies
-        of every buffer, so it outlives this batch."""
-        return export_c(self.arena, self.roots[i])
-
-    def column_i64(self, i: Int) raises -> Tuple[List[Int64], List[Bool]]:
-        return array_i64(self.column(i))
-
-    def column_f64(self, i: Int) raises -> Tuple[List[Float64], List[Bool]]:
-        return array_f64(self.column(i))
-
-    def column_bool(self, i: Int) raises -> Tuple[List[Bool], List[Bool]]:
-        return array_bool(self.column(i))
-
-    def column_str(self, i: Int) raises -> Tuple[List[String], List[Bool]]:
-        return array_str(self.column(i))
-
-
-def _append_validity(a: ArrayData, mut out: List[Bool]):
-    for i in range(a.length):
-        out.append(bit_get(Span(a.validity), i))
-
-
-def array_i64_into(
-    a: ArrayData, mut vals: List[Int64], mut valid: List[Bool]
-) raises:
-    """Widen any integer, date, time or timestamp array to `Int64`."""
-    var w = a.type.fixed_width()
-    if w == 0 or a.type.id == AT_FLOAT32 or a.type.id == AT_FLOAT64:
-        raise Error(
-            String(
-                "parquet: column of type ", String(a.type), " is not an integer"
-            )
-        )
-    var signed = not (
-        a.type.id == AT_UINT8
-        or a.type.id == AT_UINT16
-        or a.type.id == AT_UINT32
-        or a.type.id == AT_UINT64
-    )
-    for i in range(a.length):
-        var u: UInt64 = 0
-        for k in range(w):
-            u |= UInt64(a.values[i * w + k]) << UInt64(8 * k)
-        if signed and w < 8:
-            var sign_bit = UInt64(1) << UInt64(8 * w - 1)
-            if (u & sign_bit) != 0:
-                u |= ~((UInt64(1) << UInt64(8 * w)) - 1)
-        vals.append(bitcast[DType.int64](u))
-    _append_validity(a, valid)
-
-
-def array_f64_into(
-    a: ArrayData, mut vals: List[Float64], mut valid: List[Bool]
-) raises:
-    if a.type.id == AT_FLOAT64:
-        for i in range(a.length):
-            vals.append(load_f64(Span(a.values), i))
-    elif a.type.id == AT_FLOAT32:
-        for i in range(a.length):
-            vals.append(Float64(load_f32(Span(a.values), i)))
-    elif a.type.id == AT_FLOAT16:
-        for i in range(a.length):
-            var bits = UInt16(a.values[i * 2]) | (
-                UInt16(a.values[i * 2 + 1]) << 8
-            )
-            vals.append(Float64(bitcast[DType.float16](bits)))
-    else:
-        raise Error(
-            String(
-                "parquet: column of type ",
-                String(a.type),
-                " is not floating point",
-            )
-        )
-    _append_validity(a, valid)
-
-
-def array_bool_into(
-    a: ArrayData, mut vals: List[Bool], mut valid: List[Bool]
-) raises:
-    if a.type.id != AT_BOOL:
-        raise Error(
-            String(
-                "parquet: column of type ", String(a.type), " is not boolean"
-            )
-        )
-    for i in range(a.length):
-        vals.append(bit_get(Span(a.values), i))
-    _append_validity(a, valid)
-
-
-def array_str_into(
-    a: ArrayData, mut vals: List[String], mut valid: List[Bool]
-) raises:
-    if a.type.id != AT_UTF8 and a.type.id != AT_BINARY:
-        raise Error(
-            String(
-                "parquet: column of type ",
-                String(a.type),
-                " is not a byte array",
-            )
-        )
-    for i in range(a.length):
-        var lo = Int(a.offsets[i])
-        var hi = Int(a.offsets[i + 1])
-        vals.append(String(StringSlice(unsafe_from_utf8=Span(a.values)[lo:hi])))
-    _append_validity(a, valid)
-
-
-def array_i64(a: ArrayData) raises -> Tuple[List[Int64], List[Bool]]:
-    var vals = List[Int64]()
-    var valid = List[Bool]()
-    array_i64_into(a, vals, valid)
-    return (vals^, valid^)
-
-
-def array_f64(a: ArrayData) raises -> Tuple[List[Float64], List[Bool]]:
-    var vals = List[Float64]()
-    var valid = List[Bool]()
-    array_f64_into(a, vals, valid)
-    return (vals^, valid^)
-
-
-def array_bool(a: ArrayData) raises -> Tuple[List[Bool], List[Bool]]:
-    var vals = List[Bool]()
-    var valid = List[Bool]()
-    array_bool_into(a, vals, valid)
-    return (vals^, valid^)
-
-
-def array_str(a: ArrayData) raises -> Tuple[List[String], List[Bool]]:
-    var vals = List[String]()
-    var valid = List[Bool]()
-    array_str_into(a, vals, valid)
-    return (vals^, valid^)
 
 
 comptime FileBytes = Span[UInt8, ImmUntrackedOrigin]

@@ -3,6 +3,7 @@ version = "0.8.0"
 description = "Native pure-Mojo Apache Parquet reader and writer — every encoding, Arrow output over the C Data Interface"
 tags = ["parquet", "arrow", "iceberg", "data-lake", "columnar", "magmalake"]
 tins = [
+    "arrow-mlake-mojo",
     "thrift-mojo",
     "hashes-mojo",
     "snappy-mojo",

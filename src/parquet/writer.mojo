@@ -26,7 +26,7 @@ metadata. Decimals go out as `FIXED_LEN_BYTE_ARRAY(16)`, which is legal for
 every precision Arrow can hold.
 """
 
-from parquet.arrow import (
+from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DATE32,

@@ -23,6 +23,11 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          repository: magmalake/arrow-mlake.mojo
+          path: arrow-mlake.mojo
+
+      - uses: actions/checkout@v4
+        with:
           repository: magmalake/threads.mojo
           path: threads.mojo
 
@@ -101,6 +106,10 @@ jobs:
           path: parquet.mojo
       - uses: actions/checkout@v4
         with:
+          repository: magmalake/arrow-mlake.mojo
+          path: arrow-mlake.mojo
+      - uses: actions/checkout@v4
+        with:
           repository: magmalake/threads.mojo
           path: threads.mojo
       - uses: actions/checkout@v4
@@ -163,6 +172,10 @@ jobs:
           path: parquet.mojo
       - uses: actions/checkout@v4
         with:
+          repository: magmalake/arrow-mlake.mojo
+          path: arrow-mlake.mojo
+      - uses: actions/checkout@v4
+        with:
           repository: magmalake/threads.mojo
           path: threads.mojo
       - uses: actions/checkout@v4
@@ -197,15 +210,20 @@ jobs:
         run: pixi run -e bench lint-bench
 
   parity:
-    # The three cross-language checks: pyarrow importing our Arrow C Data
-    # Interface export, pyarrow *producing* arrays and a stream that we import,
-    # and pyarrow reading files our writer produced.
+    # The two cross-language checks: pyarrow importing our Arrow C Data
+    # Interface export, and pyarrow reading files our writer produced. The
+    # third — pyarrow *producing* arrays that we import — went to
+    # arrow-mlake.mojo with the import side itself.
     name: pyarrow parity / ubuntu-latest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           path: parquet.mojo
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/arrow-mlake.mojo
+          path: arrow-mlake.mojo
       - uses: actions/checkout@v4
         with:
           repository: magmalake/threads.mojo
@@ -241,12 +259,6 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           pixi run verify-c
-
-      - name: Arrow C Data Interface out of pyarrow
-        working-directory: parquet.mojo
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          pixi run verify-c-import
 
       - name: pyarrow reads what our writer writes
         working-directory: parquet.mojo
