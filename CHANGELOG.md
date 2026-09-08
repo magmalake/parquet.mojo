@@ -10,6 +10,21 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-08
+
+The Arrow layer is no longer here. `ArrayData`, `ArrayArena`, `RecordBatch` and
+both directions of the C Data Interface now live in
+[arrow-mlake-mojo](https://mojoshelf.org/tins/arrow-mlake-mojo), which this tin
+depends on; `parquet.arrow`, `parquet.carrow` and `parquet.carrow_import` are
+re-export shims, so **no import path a consumer writes today changes**. That was
+verified by running iceberg-mojo's full 203-test suite against this release with
+no source edits at all.
+
+Consumers building from **source paths** need one addition —
+`-I ../arrow-mlake.mojo/src` — because a `-I` list has to name every package it
+resolves. Consumers taking the published tin need nothing: it arrives as a run
+dependency.
+
 ### Fixed
 - **`mojo format` works again, and CI now gates on it.** Thirteen of this
   repo's files could not be formatted at all: the formatter aborted with
