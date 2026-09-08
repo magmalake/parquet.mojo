@@ -41,6 +41,9 @@ for i in range(len(ids[0])):
   filters** for equality.
 * **Exports Arrow** over the C Data Interface, with a real `release` callback —
   `pyarrow.Array._import_from_c` takes the result directly.
+* **Imports Arrow** over the same interface, including `ArrowArrayStream` — a
+  scan out of DuckDB, an ADBC driver, LanceDB or pyarrow arrives as an
+  `ArrayData` or a `RecordBatch`.
 * **Writes Parquet** back out — `PLAIN` and `RLE_DICTIONARY`, all the codecs,
   statistics, field ids and a page index — and pyarrow reads what it writes.
 
@@ -162,6 +165,43 @@ Extension types travel in the schema's `metadata` block as
 
 `ExportedArray` releases itself when it goes out of scope unless you call
 `into_raw()` first, and `release()` is idempotent.
+
+### Arrow C Data Interface — the input contract
+
+```mojo
+var arena = ArrayArena()
+var root = import_c(arena, array_addr, schema_addr)   # borrows the pair
+var batch = ImportedArray(array_addr, schema_addr).into_batch()  # owns it
+
+var stream = ImportedStream(stream_addr)              # ArrowArrayStream
+while True:
+    var got = stream.next()
+    if not got:
+        break
+    ...                                               # got.value() is a RecordBatch
+```
+
+`import_c` copies, because an `ArrayData` owns its buffers; on a 19-column,
+65 536-row NYC-taxi batch — 8.98 MB of Arrow buffers — that is **2.2 ms**
+(p50; p90 2.4 ms), about 4 GB/s and 6.6% of what decoding the same batch out
+of Parquet costs. A producer's `offset` is honoured by materialising the
+window, so a sliced array imports as the rows it names and not the buffer it
+sits in.
+
+Ownership follows the interface: `import_c` borrows and releases nothing,
+`ImportedArray` owns the pair and releases the two roots exactly once, and
+`ImportedStream` owns the stream, its schema and every array `get_next` hands
+over — each released as soon as its batch has been copied, so a long scan
+holds one batch of producer memory rather than the whole stream.
+
+A format string this library cannot name is an **error carrying the string**,
+never a guess: unions, run-end encoding, list views, fixed-size lists, string
+views, `date64`, durations, intervals, decimal256 and dictionary-encoded
+arrays all raise. `n_buffers` is checked against the format, `n_children`
+against the type, and offsets both for monotonicity and against the length of
+the child they index into. The interface carries no buffer *sizes*, so a
+truncated `utf8` data buffer is undetectable by construction — that limit is
+stated rather than papered over.
 
 ### `ParquetSchema`
 
@@ -286,7 +326,9 @@ file still reads.
 from parquet import (
     ParquetReader, DefaultCodecs, CodecSet,     # the reader
     Table, RecordBatch, ArrayData, ArrowType,   # what it returns
-    export_c, ExportedArray,                    # Arrow C Data Interface
+    export_c, ExportedArray,                    # Arrow C Data Interface, out
+    import_c, import_batch_c, ImportedArray,    # …and in
+    ImportedStream,                             # ArrowArrayStream
     ParquetSchema, build_schema, LeafColumn,    # schema and field ids
     TypedStats, ScalarValue, decode_stats,      # lower/upper bounds
     Predicate, OP_EQ, OP_LT, OP_LE, OP_GT, OP_GE, OP_NE,
@@ -401,9 +443,16 @@ Beyond value parity the suite covers:
   and that `nostats.parquet` has neither;
 - bloom filters: all 200 keys of each of three columns must be reported
   present, and at least 400 of 500 absent keys must be ruled out;
-- the C Data Interface: format strings, flags, buffer counts, offsets and
-  values for flat, nested and extension columns, and that `release` is
-  idempotent;
+- the C Data Interface, outbound: format strings, flags, buffer counts,
+  offsets and values for flat, nested and extension columns, and that
+  `release` is idempotent;
+- the C Data Interface, inbound: every column of every fixture exported and
+  imported back and compared on both values *and* arena layout, a producer's
+  `offset` honoured at three unaligned starts, a wrong `n_buffers`, a child
+  shorter than the list that indexes it, a released pair, every format string
+  we write parsed back to itself and ten we refuse named in the error — plus
+  an `ArrowArrayStream` driven by a hand-written C producer to the end, and
+  one that fails mid-scan;
 - unit tests for bit widths, ULEB128, zigzag, hybrid RLE runs, legacy
   `BIT_PACKED`, PLAIN, dictionary gather, `BYTE_STREAM_SPLIT` and
   `DELTA_BINARY_PACKED` headers;
@@ -428,6 +477,21 @@ pyarrow calls our `release` callback.
 physical layouts, `INT96` timestamps, `UUID` and `Json` extension types,
 `halffloat`, lists, lists of lists, maps, structs, lists of structs, an
 all-null file and a legacy list file — import into pyarrow and compare equal.
+
+### The C Data Interface inbound, verified against pyarrow
+
+`pixi run verify-c-import` is the same idea pointed the other way, and it is
+the check that matters for the importer: `tools/produce_c_data.py` has
+**pyarrow** build the arrays and `_export_to_c` hand them over, so the
+producer is one we did not write. **63 cases** — every primitive width, utf8
+and binary in both offset widths, `bool`, `null`, decimals, dates, times and
+timestamps with and without a zone, list, large list, struct, map, list of
+struct, struct of list, empty and all-null arrays, and 24 *slices* at
+unaligned starts — are each checked twice: once on the type we parsed the
+format string into, and once by re-exporting and asking pyarrow whether it
+got back what it sent. Two malformed producers are checked too. Breaking the
+importer's `offset` handling fails 22 of them; mapping `ttu` to the wrong
+storage width fails another.
 
 ### Fixtures
 
@@ -746,6 +810,7 @@ result against the *original* pyarrow oracle, value by value.
 | `pixi run stress-tsan-control` | what a ThreadSanitizer finding here means (see `tests/tsan_control.mojo`) |
 | `pixi run cli schema f.parquet` | build and run the CLI |
 | `pixi run verify-c` | import the C Data Interface export into pyarrow |
+| `pixi run verify-c-import` | have pyarrow produce arrays and a stream, and import them |
 | `pixi run verify-written` | write every fixture back out and have pyarrow read it |
 | `pixi run fixtures` | regenerate the fixtures and their oracles |
 

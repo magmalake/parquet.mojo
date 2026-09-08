@@ -31,6 +31,10 @@ var e = export_c(batch.arena, batch.roots[0])
 print(e.array, e.schema)   # two addresses, ready for _import_from_c
 e.into_raw()               # hand ownership to the consumer
 ```
+
+`parquet.carrow_import` is the other direction — a foreign `ArrowSchema` and
+`ArrowArray` read back into an `ArrayData`, and `ArrowArrayStream` iterated —
+and it implements the consumer's half of the same release convention.
 """
 
 from std.memory.alloc import unsafe_alloc
@@ -84,9 +88,7 @@ struct CArrowArray(Copyable, Movable):
     var private_data: Int
 
 
-def release_array(
-    p: Pointer[CArrowArray, MutUntrackedOrigin]
-) abi("C") -> None:
+def release_array(p: Pointer[CArrowArray, MutUntrackedOrigin]) abi("C") -> None:
     """Free the whole exported array tree. `private_data` is the block."""
     var block = p[].private_data
     p[].release = 0
@@ -123,8 +125,12 @@ def release_child_schema(
     p[].release = 0
 
 
-def n_buffers_for(a: ArrayData) -> Int:
-    var i = a.type.id
+def n_buffers_for_type(i: Int) -> Int:
+    """How many buffers an `ArrowArray` of this type id must carry.
+
+    The export writes this many and `parquet.carrow_import` rejects a producer
+    that sends any other number, so the count is stated once rather than twice.
+    """
     if i == AT_NULL:
         return 0
     if i == AT_STRUCT:
@@ -139,6 +145,10 @@ def n_buffers_for(a: ArrayData) -> Int:
     ):
         return 3
     return 2
+
+
+def n_buffers_for(a: ArrayData) -> Int:
+    return n_buffers_for_type(a.type.id)
 
 
 def _align8(n: Int) -> Int:
@@ -185,14 +195,10 @@ struct _Block(Movable):
         return Int(self.base) + at
 
     def bytes_at(self, addr: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
-        return Pointer[UInt8, MutUntrackedOrigin](
-            unsafe_from_address=addr
-        )
+        return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
 
     def words_at(self, addr: Int) -> Pointer[Int64, MutUntrackedOrigin]:
-        return Pointer[Int64, MutUntrackedOrigin](
-            unsafe_from_address=addr
-        )
+        return Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
 
     def put_bytes(mut self, data: Span[UInt8, _]) raises -> Int:
         var at = self.take(len(data) if len(data) else 1)
