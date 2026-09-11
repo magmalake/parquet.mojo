@@ -27,7 +27,7 @@ from parquet.encoding import (
     physical_kind,
     physical_width,
 )
-from parquet.ext_full import AllCodecs
+from parquet_full import AllCodecs
 from parquet.page import (
     _decode_values,
     _read_levels,

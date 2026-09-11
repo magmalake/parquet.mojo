@@ -16,7 +16,7 @@ from oracle import load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import ParquetReader, ParquetWriter, WriterOptions
 from thrift import CompressionCodec
-from parquet.ext_full import AllCodecs
+from parquet_full import AllCodecs
 from std.testing import TestSuite, assert_equal, assert_true
 
 

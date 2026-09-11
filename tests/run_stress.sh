@@ -46,7 +46,7 @@ cd "$root"
 mkdir -p build
 
 marker="build/.stress-timed-out"
-includes="-I src -I tests -I ../arrow-mlake.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../avro.mojo/src"
+includes="-I src -I tests -I ../arrow-mlake.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../avro.mojo/src"
 
 # run_with_timeout SECONDS COMMAND... — returns the command's status, or fails
 # with the marker file present if the watchdog had to kill it.

@@ -50,8 +50,16 @@ for i in range(len(ids[0])):
 ## Install
 
 ```sh
-pixi shelf add parquet-mojo
+pixi shelf add parquet-mojo        # UNCOMPRESSED, SNAPPY, GZIP — no FFI
+pixi shelf add parquet-full-mojo   # …plus ZSTD, BROTLI, LZ4
 ```
+
+**Two tins, one repository.** `parquet-mojo` is the reader and writer, and
+links no third-party C at all. `parquet-full-mojo` adds the four codecs that
+need one — it lives in [`full/`](full) and depends on `parquet-mojo`, so
+adding it gives you both and `from parquet import ParquetReader` is unchanged.
+Take the full tin unless you control the files you read: **ZSTD is what most
+Parquet in the wild uses**, Iceberg included.
 
 Working with a coding agent? `npx skills add mojoshelf/mojoshelf --skill mojoshelf-consume --yes` teaches it to find and install tins itself — it installs the `shelf` CLI too.
 
@@ -313,22 +321,27 @@ metadata, which this reader does not parse — see [Gaps](#gaps)).
 
 `ParquetReader` is parametrised on a `CodecSet`:
 
-| codec | `DefaultCodecs` | `parquet.ext_full.AllCodecs` |
+| codec | `DefaultCodecs` | `parquet_full.AllCodecs` |
 |---|---|---|
 | `UNCOMPRESSED` | ✅ | ✅ |
 | `SNAPPY` | ✅ (snappy.mojo, pure Mojo) | ✅ |
-| `GZIP` | ✅ (avro.mojo's inflate; gzip, zlib and bare DEFLATE framing) | ✅ |
+| `GZIP` | ✅ (deflate.mojo's inflate; gzip, zlib and bare DEFLATE framing) | ✅ |
 | `ZSTD` | ❌ | ✅ (zstd.mojo → libzstd) |
 | `BROTLI` | ❌ | ✅ (brotli.mojo → libbrotli) |
 | `LZ4_RAW` | ❌ | ✅ (lz4.mojo → liblz4) |
 | `LZ4` (Hadoop-framed, deprecated) | ❌ | ✅ |
 
-Between the two sets, that is every codec the Parquet spec defines.
+Between the two sets, that is every codec the Parquet spec defines. The
+divide is also the packaging divide: `DefaultCodecs` is this tin,
+`AllCodecs` is `parquet-full-mojo`, so a consumer that never needs ZSTD never
+builds libzstd, libbrotli or liblz4 — or the three cmake shims that dlopen
+them.
 
 ```mojo
 from parquet import ParquetReader
-# -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src
-from parquet.ext_full import AllCodecs
+# needs parquet-full-mojo; from source paths:
+# -I ../parquet.mojo/full/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src
+from parquet_full import AllCodecs
 
 var r = ParquetReader[AllCodecs].open("part-0.parquet")
 ```
@@ -353,7 +366,7 @@ from parquet import (
     Predicate, OP_EQ, OP_LT, OP_LE, OP_GT, OP_GE, OP_NE,
 )
 from parquet.bloom import BloomFilter, read_bloom_filter
-from parquet.ext_full import AllCodecs         # optional ZSTD / LZ4
+from parquet_full import AllCodecs         # optional ZSTD / LZ4
 ```
 
 The four things Iceberg specifically wants:
@@ -791,7 +804,7 @@ var r = ParquetReader.open("in.parquet")
 var t = r.read_table()
 
 var opts = WriterOptions()
-opts.codec = CompressionCodec.ZSTD.value   # with parquet.ext_full.AllCodecs
+opts.codec = CompressionCodec.ZSTD.value   # with parquet_full.AllCodecs
 opts.row_group_size = 100_000
 var w = ParquetWriter[AllCodecs](opts^)
 w.add_metadata("iceberg.schema", schema_json)

@@ -19,7 +19,7 @@ one per codec, is in the corpus too.
 
 from fixtures_list import core_fixtures
 from parquet import ParquetReader, ParquetWriter, WriterOptions
-from parquet.ext_full import AllCodecs
+from parquet_full import AllCodecs
 from std.os.path import exists
 from std.sys import argv
 
