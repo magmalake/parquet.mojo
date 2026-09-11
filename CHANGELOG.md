@@ -10,20 +10,31 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
-## [parquet-full-mojo 0.1.1] - 2026-09-11
+## [0.11.1] - 2026-09-11
 
-`parquet-full-mojo` 0.1.0 was published by a `shelf` older than the one that
-knows about subdirectory tins, so the registry recorded no subdirectory for it
-and `pixi shelf add parquet-full-mojo` failed with "the package
-'parquet-full-mojo' is not provided by the project located at
-git+…/parquet.mojo". 0.1.1 is the same code, published by `shelf` 0.5.0, which
-sends where the manifest sits.
+Packaging only; no code change. Fixes `pixi shelf add parquet-full-mojo`,
+which could not install at all.
 
-0.1.0 resolves for nobody and should not be used. A direct git dependency
-naming `subdirectory = "full"` was unaffected either way.
+Two publishing rules for a repository with more than one tin, both learned the
+hard way here:
 
-`parquet-mojo` 0.11.0 is unaffected — it publishes from the repository root,
-where there is no subdirectory to record.
+**Every tin in the repo publishes at the same commit.** `full/` reaches the
+root as `parquet-mojo = { path = ".." }`, which pixi resolves to
+`git+…/parquet.mojo?rev=<the commit full was published at>`. When the registry
+pins `parquet-mojo` at a *different* commit, a consumer gets two source records
+for one package and the solve fails with `encountered duplicate records for
+parquet-mojo-0.11.0-h60d57d3_0_source.conda`. 0.11.1 and parquet-full-mojo
+0.1.2 publish together from one commit, so the two revs agree.
+
+**An in-repo path dependency is not a registry tin.** `parquet-mojo` is gone
+from `full/shelf.toml`'s `tins` list — listing it made `shelf add` pin it
+separately, which is the same collision from the other direction. `zstd.mojo`
+does not list its in-repo shim either; this is that convention.
+
+Also: parquet-full-mojo **0.1.0 and 0.1.1 should not be used.** 0.1.0 was
+published by a `shelf` that did not send the subdirectory and resolves for
+nobody; 0.1.1 recorded the subdirectory but still collided with the root
+package's rev.
 
 
 ## [0.11.0] - 2026-09-11
