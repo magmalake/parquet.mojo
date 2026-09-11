@@ -10,6 +10,22 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [parquet-full-mojo 0.1.1] - 2026-09-11
+
+`parquet-full-mojo` 0.1.0 was published by a `shelf` older than the one that
+knows about subdirectory tins, so the registry recorded no subdirectory for it
+and `pixi shelf add parquet-full-mojo` failed with "the package
+'parquet-full-mojo' is not provided by the project located at
+git+…/parquet.mojo". 0.1.1 is the same code, published by `shelf` 0.5.0, which
+sends where the manifest sits.
+
+0.1.0 resolves for nobody and should not be used. A direct git dependency
+naming `subdirectory = "full"` was unaffected either way.
+
+`parquet-mojo` 0.11.0 is unaffected — it publishes from the repository root,
+where there is no subdirectory to record.
+
+
 ## [0.11.0] - 2026-09-11
 
 Two dependency changes, both about what reading a Parquet file should oblige
