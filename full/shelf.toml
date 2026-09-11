@@ -1,10 +1,12 @@
 name = "parquet-full-mojo"
-version = "0.1.1"
+version = "0.1.2"
 description = "Every Parquet codec the spec defines — adds ZSTD, BROTLI and LZ4 to parquet-mojo, via libzstd/libbrotli/liblz4"
 tags = ["parquet", "codec", "zstd", "brotli", "lz4", "compression", "magmalake"]
-# other tins this one depends on; omit if none
+# Other tins this one depends on. parquet-mojo is deliberately absent: it is
+# the root package of this same repository, reached by `path = ".."`, so the
+# registry must not pin it separately — that would be a second source record
+# for one package. Same reason zstd.mojo does not list its in-repo shim.
 tins = [
-    "parquet-mojo",
     "snappy-mojo",
     "thrift-mojo",
     "zstd-mojo",
