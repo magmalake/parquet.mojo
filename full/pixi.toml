@@ -15,7 +15,7 @@
 # the repo's workspace, the same shape zstd.mojo/shim uses.
 [package]
 name = "parquet-full-mojo"
-version = "0.1.0"
+version = "0.1.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }

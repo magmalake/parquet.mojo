@@ -1,5 +1,5 @@
 name = "parquet-full-mojo"
-version = "0.1.0"
+version = "0.1.1"
 description = "Every Parquet codec the spec defines — adds ZSTD, BROTLI and LZ4 to parquet-mojo, via libzstd/libbrotli/liblz4"
 tags = ["parquet", "codec", "zstd", "brotli", "lz4", "compression", "magmalake"]
 # other tins this one depends on; omit if none
