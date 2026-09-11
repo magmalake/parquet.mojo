@@ -10,6 +10,57 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-11
+
+Two dependency changes, both about what reading a Parquet file should oblige
+you to build. Neither touches a Parquet API, codec behaviour or file output.
+
+### Apache Avro is gone from the dependency list
+
+The raw DEFLATE ([RFC 1951](https://www.rfc-editor.org/rfc/rfc1951)) behind the
+`GZIP` codec had lived in `avro.mojo` since Avro's `deflate` block codec needed
+it first, so every consumer of this tin resolved `avro-mojo` for one `inflate`.
+It now has its own tin, [deflate.mojo](https://github.com/magmalake/deflate.mojo)
+— still pure Mojo, still no FFI.
+
+- `avro-mojo` is gone from `[package.host-dependencies]` and
+  `[package.run-dependencies]`; `deflate-mojo` takes its place.
+- Building from **source paths** swaps `-I ../avro.mojo/src` for
+  `-I ../deflate.mojo/src`. The test suite keeps `-I ../avro.mojo/src`, because
+  `tests/oracle.mojo` parses the oracle JSON with `avro.json`; nothing under
+  `src/` does.
+
+### The FFI codecs are a separate tin (breaking)
+
+`ZSTD`, `BROTLI`, `LZ4_RAW` and the legacy Hadoop-framed `LZ4` — and with them
+libzstd, libbrotli, liblz4 and the three cmake shims that dlopen them — are now
+**`parquet-full-mojo`**, published from [`full/`](full) of this same repository.
+`parquet-mojo` reads and writes Parquet with `UNCOMPRESSED`, `SNAPPY` and
+`GZIP`, and links no third-party C at all.
+
+`CodecSet` already made the codecs a compile-time choice; this carries that
+choice up into the package graph, so a consumer who never needs ZSTD never
+resolves or builds the C libraries either.
+
+- **`parquet.ext_full` is now the `parquet_full` package.** One line:
+
+  ```mojo
+  from parquet_full import AllCodecs    # was: from parquet.ext_full import AllCodecs
+  ```
+
+- **`pixi shelf add parquet-mojo` no longer brings the FFI codecs.** A reader
+  that meets one of them raises and names `AllCodecs`, as it always has for a
+  `DefaultCodecs` reader. **If you read Parquet you did not write, you almost
+  certainly want `pixi shelf add parquet-full-mojo`** — ZSTD is the common
+  case, Iceberg's default included.
+- Building from **source paths** needs `-I full/src` (or
+  `-I ../parquet.mojo/full/src`) for `parquet_full`.
+
+Both tins live on one commit and move together: `full/` depends on the root as
+`parquet-mojo = { path = ".." }`, so there is no re-pinning between them and no
+second repository, CI matrix or release. This needs mojoshelf's subdirectory
+support (mojoshelf/mojoshelf#18).
+
 ## [0.9.1] - 2026-09-08
 
 Builds on September nightlies again. 0.9.0 shipped with `nightly` and `gpu`

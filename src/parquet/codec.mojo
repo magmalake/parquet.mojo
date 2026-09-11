@@ -8,16 +8,16 @@ everything that needs no FFI:
 |---|---|
 | `UNCOMPRESSED` | — |
 | `SNAPPY` | `snappy.mojo`, pure Mojo |
-| `GZIP` | `avro.mojo`'s pure-Mojo `deflate.inflate`, with the gzip wrapper parsed here |
+| `GZIP` | `deflate.mojo`, pure Mojo, with the gzip wrapper parsed here |
 
 `ZSTD`, `BROTLI`, `LZ4_RAW` and the legacy Hadoop-framed `LZ4` need `zstd.mojo`,
 `brotli.mojo` and `lz4.mojo`, which dlopen libzstd, libbrotli and liblz4, so
-they live in `parquet.ext_full` and its `AllCodecs`:
+they live in `parquet_full` and its `AllCodecs`:
 
 ```mojo
 from parquet import ParquetReader
 # -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src
-from parquet.ext_full import AllCodecs
+from parquet_full import AllCodecs
 
 var r = ParquetReader[AllCodecs].open("part-0.parquet")
 ```
@@ -27,7 +27,7 @@ Between the two sets that is every codec the Parquet spec defines. A reader on
 it and pointing at `AllCodecs`; every other column of that file still reads.
 """
 
-from avro.deflate import deflate, inflate, inflate_at
+from deflate import deflate, inflate, inflate_at
 from hashes import crc32
 from snappy import (
     compress as snappy_compress,
@@ -145,7 +145,7 @@ def unsupported_codec(codec: Int32) -> Error:
             "parquet: page codec ",
             codec_name(codec),
             (
-                " is not available — use parquet.ext_full.AllCodecs for"
+                " is not available — use parquet_full.AllCodecs for"
                 " ZSTD/BROTLI/LZ4 (needs -I ../zstd.mojo/src"
                 " -I ../brotli.mojo/src -I ../lz4.mojo/src)"
             ),

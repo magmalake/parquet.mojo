@@ -11,7 +11,7 @@ print(t.num_rows, "rows")
 
 The reader is parametrised on a `CodecSet` (see `parquet.codec`); the default
 covers `UNCOMPRESSED`, `SNAPPY` and `GZIP` with no FFI, and
-`parquet.ext_full.AllCodecs` adds `ZSTD` and `LZ4`.
+`parquet_full.AllCodecs` adds `ZSTD` and `LZ4`.
 
 Projection is by name, by dotted leaf path, or — for Iceberg — by Parquet
 **field id**. Row groups can be chosen explicitly, or pruned automatically

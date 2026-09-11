@@ -18,7 +18,7 @@ from std.os.path import exists
 from std.os import listdir
 from std.builtin.sort import sort
 from parquet import ParquetReader
-from parquet.ext_full import AllCodecs
+from parquet_full import AllCodecs
 
 
 # Reading the footer is not enough: a file can have a valid schema and fail in

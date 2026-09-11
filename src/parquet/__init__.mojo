@@ -16,8 +16,8 @@ Interface — is `arrow-mlake.mojo`, and is re-exported here so that
 `from parquet.arrow import ArrayData` and `from parquet import RecordBatch`
 keep resolving. Metadata comes from `thrift.mojo`, page CRC32s from
 `hashes.mojo`, Snappy from `snappy.mojo` and the DEFLATE half of GZIP from
-`avro.mojo` — all pure Mojo and all consumed by source path. `ZSTD` and `LZ4`
-need `parquet.ext_full`, which pulls in the two FFI tins.
+`deflate.mojo` — all pure Mojo and all consumed by source path. `ZSTD` and
+`LZ4` need `parquet_full`, which pulls in the two FFI tins.
 """
 
 from arrow_mlake.arrow import (
