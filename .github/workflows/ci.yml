@@ -26,6 +26,13 @@ jobs:
           repository: magmalake/arrow-mlake.mojo
           path: arrow-mlake.mojo
 
+      # arrow-mlake builds its C Data Interface export in a memory region, so
+      # the tin has to be on the include path wherever arrow-mlake is.
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/memory-region.mojo
+          path: memory-region.mojo
+
       - uses: actions/checkout@v4
         with:
           repository: magmalake/threads.mojo
@@ -129,6 +136,13 @@ jobs:
         with:
           repository: magmalake/arrow-mlake.mojo
           path: arrow-mlake.mojo
+
+      # arrow-mlake builds its C Data Interface export in a memory region, so
+      # the tin has to be on the include path wherever arrow-mlake is.
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/memory-region.mojo
+          path: memory-region.mojo
       - uses: actions/checkout@v4
         with:
           repository: magmalake/threads.mojo
@@ -200,6 +214,13 @@ jobs:
         with:
           repository: magmalake/arrow-mlake.mojo
           path: arrow-mlake.mojo
+
+      # arrow-mlake builds its C Data Interface export in a memory region, so
+      # the tin has to be on the include path wherever arrow-mlake is.
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/memory-region.mojo
+          path: memory-region.mojo
       - uses: actions/checkout@v4
         with:
           repository: magmalake/threads.mojo
@@ -252,6 +273,13 @@ jobs:
         with:
           repository: magmalake/arrow-mlake.mojo
           path: arrow-mlake.mojo
+
+      # arrow-mlake builds its C Data Interface export in a memory region, so
+      # the tin has to be on the include path wherever arrow-mlake is.
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/memory-region.mojo
+          path: memory-region.mojo
       - uses: actions/checkout@v4
         with:
           repository: magmalake/threads.mojo
