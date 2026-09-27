@@ -1,6 +1,6 @@
 """The optional codec set: ZSTD, BROTLI, LZ4_RAW and Hadoop-framed LZ4.
 
-`pixi run -e codecs test-codecs` (nightly) or `-e codecs-stable` (Mojo 1.0.0).
+`pixi run -e codecs test-codecs` (nightly) or `-e codecs-stable` (Mojo 1.1.0).
 These need `zstd.mojo`, `brotli.mojo` and `lz4.mojo` checked out next door and
 their shims installed, which the `codecs` environment does.
 """
