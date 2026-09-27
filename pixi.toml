@@ -213,7 +213,7 @@ SHLIB_EXT = ".so"
 # tasks still use `-I ../x.mojo/src` because they also run on nightly, which
 # refuses that package — see the note at the top of this file.
 [feature.bench.dependencies]
-bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "e12117679ea7d55c16a7250958340fa096e49eed" }
+bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "373e3903e724b79a47d5f5921e690ef95d31b09f" }
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "6362f467e63b8422cf4f70d72931429fb2f21342" }
 threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "af4f6a014288a915ec4f0d2a44a910ee05605ad7" }
