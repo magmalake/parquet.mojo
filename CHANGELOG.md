@@ -10,6 +10,19 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-09-26
+
+Released together with parquet-full-mojo 0.1.3, from the same commit.
+
+### Changed
+
+- Built with Mojo 1.1.0. `mojo-compiler` is pinned `==1.1.0` for the package
+  build and required `>=1.1.0,<2` at run time, and the `nightly` environment
+  tracks Mojo 1.2.0.dev. The published 0.11.1 was built with 1.0.0, whose
+  precompiled `.mojoc` a 1.1.0 compiler refuses. `full/` is ported too.
+- The codec tins re-locked to current revisions; `zstd-mojo` had been pinned
+  at its first commit.
+
 ## [0.11.1] - 2026-09-11
 
 Packaging only; no code change. Fixes `pixi shelf add parquet-full-mojo`,
