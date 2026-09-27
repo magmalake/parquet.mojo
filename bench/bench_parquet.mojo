@@ -52,13 +52,12 @@ def bench_read_big(mut b: Benchmark) raises:
     var data = _read_file(String(FIXTURES, "big.parquet"))
     b.throughput(Metric.elements(), _rows_in(data))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -67,13 +66,12 @@ def bench_read_prune(mut b: Benchmark) raises:
     var data = _read_file(String(FIXTURES, "prune.parquet"))
     b.throughput(Metric.elements(), _rows_in(data))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -82,13 +80,12 @@ def bench_read_encodings(mut b: Benchmark) raises:
     var data = _read_file(String(FIXTURES, "encodings.parquet"))
     b.throughput(Metric.elements(), _rows_in(data))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -97,13 +94,12 @@ def bench_read_v2pages(mut b: Benchmark) raises:
     var data = _read_file(String(FIXTURES, "v2pages.parquet"))
     b.throughput(Metric.elements(), _rows_in(data))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -112,13 +108,12 @@ def bench_read_wide(mut b: Benchmark) raises:
     var data = _read_file(WIDE)
     b.throughput(Metric.elements(), _rows_in(data))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -150,14 +145,13 @@ def _bench_read_workers(
     var data = _read_file(String(path))
     b.throughput(Metric.elements(), _rows_in(data))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data, imm workers}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         r.num_workers = workers
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -167,8 +161,7 @@ def _bench_read_one_row_group(mut b: Benchmark, workers: Int) raises:
     var data = _read_file(String(FIXTURES, "big.parquet"))
     b.throughput(Metric.elements(), 25000)
 
-    @parameter
-    def call() raises:
+    def call() raises {imm workers, imm data}:
         var r = ParquetReader[DefaultCodecs].from_span(Span(data))
         r.verify_crc = False
         r.num_workers = workers
@@ -176,7 +169,7 @@ def _bench_read_one_row_group(mut b: Benchmark, workers: Int) raises:
         r.select_row_groups(only^)
         keep(r.read_table().num_rows)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -241,8 +234,7 @@ def bench_write_wide(mut b: Benchmark) raises:
     var table = r.read_table()
     b.throughput(Metric.elements(), table.num_rows)
 
-    @parameter
-    def call() raises:
+    def call() raises {imm table}:
         var opts = WriterOptions()
         opts.codec = CompressionCodec.UNCOMPRESSED.value
         var w = ParquetWriter[DefaultCodecs](opts^)
@@ -250,7 +242,7 @@ def bench_write_wide(mut b: Benchmark) raises:
             w.write_batch(batch.arena, batch.roots)
         keep(w^.finish())
 
-    b.iter[call]()
+    b.iter(call)
     keep(table)
     keep(data)
 
@@ -262,8 +254,7 @@ def bench_write_big(mut b: Benchmark) raises:
     var table = r.read_table()
     b.throughput(Metric.elements(), table.num_rows)
 
-    @parameter
-    def call() raises:
+    def call() raises {imm table}:
         var opts = WriterOptions()
         opts.codec = CompressionCodec.UNCOMPRESSED.value
         var w = ParquetWriter[DefaultCodecs](opts^)
@@ -271,7 +262,7 @@ def bench_write_big(mut b: Benchmark) raises:
             w.write_batch(batch.arena, batch.roots)
         keep(w^.finish())
 
-    b.iter[call]()
+    b.iter(call)
     keep(table)
     keep(data)
 
