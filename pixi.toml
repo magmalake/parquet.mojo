@@ -100,7 +100,10 @@ encodings = { cmd = "mkdir -p build/encodings && mojo build tools/encoding_corpu
 # The projected-scan profile: one file, a handful of its columns, per-stage
 # times with the bytes and the bandwidth beside them. Lives here rather than
 # next to `profile` because the files worth pointing it at are ZSTD.
-# Example: `pixi run -e codecs profile-scan <file.parquet> --select a,b`.
+# This task only builds; run the binary in the same environment:
+#   pixi run -e codecs-stable profile-scan
+#   pixi run -e codecs-stable ./build/profile-scan <file.parquet> --select a,b
+# Stable only: the codec tins arrive precompiled by 1.1.0 and nightly refuses them.
 profile-scan = { cmd = "mkdir -p build && mojo build bench/profile_scan.mojo -I src -I ../arrow-mlake.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -I full/src -o build/profile-scan" }
 # The `full/` package and the files `lint`/`lint-tools` can only
 # text-mode-fallback on (they import zstd/lz4/brotli): resolved fully here,
