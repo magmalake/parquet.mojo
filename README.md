@@ -549,6 +549,8 @@ decode speed; it was bytes fetched.
 
 The rest of this section is the in-repo microbenchmark, which measures this
 library against one fixture rather than a whole query.
+To measure a change of your own before and after, see
+[CONTRIBUTING.md](CONTRIBUTING.md#measuring-performance).
 
 `pixi run -e bench bench` against `pixi run bench-pyarrow`, single threaded,
 Apple M4, CRC verification off on both sides. Both timers cover the same
