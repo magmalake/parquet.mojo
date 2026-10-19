@@ -10,6 +10,19 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-19
+
+Released together with parquet-full-mojo 0.1.4, from the same commit.
+
+### Fixed
+
+- `pixi shelf add parquet-full-mojo` (and so `iceberg-mojo`) failed to solve
+  with "encountered duplicate records for lz4-shim-…_source.conda": the
+  package dependencies pinned zstd, lz4, brotli, snappy, thrift, hashes,
+  arrow-mlake and deflate at commits from before their 1.1.0 releases, while
+  the registry adds the published commits. Every sibling is now pinned at the
+  rev the registry published. No source changes.
+
 ## [0.11.2] - 2026-09-26
 
 Released together with parquet-full-mojo 0.1.3, from the same commit.
