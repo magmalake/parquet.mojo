@@ -165,7 +165,7 @@ THREADS_COMPAT = "../threads.mojo/compat"
 THREADS_COMPAT = "../threads.mojo/compat"
 
 [feature.nightly.dependencies]
-modular = ">=26.7.0.dev2026092005,<28"
+modular = ">=26.7.0.dev2026101905,<28"
 
 # `mojo format` only parses — it never builds against a sibling — so the
 # formatter can run on a newer compiler than the build environments can. It has
@@ -175,7 +175,7 @@ modular = ">=26.7.0.dev2026092005,<28"
 # unchanged. Keeping it its own environment is what stops a formatter fix from
 # moving the compiler that has to agree with threads.mojo.
 [feature.fmt.dependencies]
-modular = ">=26.7.0.dev2026092005,<28"
+modular = ">=26.7.0.dev2026101905,<28"
 
 # The environment takes `no-default-feature`, so the task has to live here to
 # be reachable from it.
@@ -245,7 +245,7 @@ lint-bench = { cmd = "mojolint --lsp -I src -I ../arrow-mlake.mojo/src -I ../mem
 # The `-I` list is the one the other nightly tasks use, plus
 # `-I experiments/gpu_gather` so the spike's own modules resolve.
 [feature.gpu.dependencies]
-modular = ">=26.7.0.dev2026092005,<28"
+modular = ">=26.7.0.dev2026101905,<28"
 
 [feature.gpu.tasks]
 # Whether this machine has a Metal device the Mojo GPU stack can drive at all.
