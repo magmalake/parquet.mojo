@@ -30,28 +30,28 @@ name = "parquet_full"
 extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 # The root package of this same repository, at the commit being built. A path
 # inside the repo resolves for every consumer, and the two tins never need
 # re-pinning against each other.
 parquet-mojo = { path = ".." }
 # Imported directly by src/parquet_full: every sibling a package uses has to be
 # declared, not inherited through parquet-mojo.
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "400d19ef158827e52dd07be1f701e1579a52b0e9" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "b4a887b437cccb9565c5defc72f9d2dc23752103" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "8b0e448c842c713b65a6ad5b86ec2193cc12d48b" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
 # The reason this tin exists: three dlopen'd C libraries.
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "eca182e1127792cbe6d58b434736df8f11f813f9" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "6b882077b8260aaf9a483a2e0359e22365f8b165" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "0ee1427aef04f459ca98e6f088f634ed3381ad16" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "c468fa2378d999753968288f3de33d904d5bb701" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "5e0b29831ec292daac2ef8226d28a959288b66ae" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "0ba0e088d382d28036006968bcb015eaccacdd6e" }
 
 [package.build-dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.1.0,<2"
+mojo-compiler = ">=1.2.0,<2"
 parquet-mojo = { path = ".." }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "400d19ef158827e52dd07be1f701e1579a52b0e9" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "b4a887b437cccb9565c5defc72f9d2dc23752103" }
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "eca182e1127792cbe6d58b434736df8f11f813f9" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "6b882077b8260aaf9a483a2e0359e22365f8b165" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "0ee1427aef04f459ca98e6f088f634ed3381ad16" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "8b0e448c842c713b65a6ad5b86ec2193cc12d48b" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "c468fa2378d999753968288f3de33d904d5bb701" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "5e0b29831ec292daac2ef8226d28a959288b66ae" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "0ba0e088d382d28036006968bcb015eaccacdd6e" }
