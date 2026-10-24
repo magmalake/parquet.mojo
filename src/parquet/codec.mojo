@@ -292,25 +292,31 @@ struct DefaultCodecs(CodecSet):
         ref[scratch_origin] scratch: List[UInt8],
     ) raises -> Span[UInt8, origin_of(page_origin, scratch_origin)].Immutable:
         comptime O = origin_of(origin_of(page_origin, scratch_origin))
-        if codec == CompressionCodec.UNCOMPRESSED.value:
-            return page_span[O](data)
-        if codec == CompressionCodec.SNAPPY.value:
-            # The block's own varint header, not the page header's number:
-            # `decompress_into` needs the length the stream itself declares.
-            var n = snappy_uncompressed_length(data)
-            var wrote = snappy_decompress_into(data, sized_scratch(scratch, n))
-            return page_span[O](Span(scratch)[:wrote])
-        if codec == CompressionCodec.GZIP.value:
-            gunzip_into(data, scratch)
-            return page_span[O](Span(scratch))
-        raise unsupported_codec(codec)
+        match codec:
+            case == CompressionCodec.UNCOMPRESSED.value:
+                return page_span[O](data)
+            case == CompressionCodec.SNAPPY.value:
+                # The block's own varint header, not the page header's number:
+                # `decompress_into` needs the length the stream itself declares.
+                var n = snappy_uncompressed_length(data)
+                var wrote = snappy_decompress_into(
+                    data, sized_scratch(scratch, n)
+                )
+                return page_span[O](Span(scratch)[:wrote])
+            case == CompressionCodec.GZIP.value:
+                gunzip_into(data, scratch)
+                return page_span[O](Span(scratch))
+            case _:
+                raise unsupported_codec(codec)
 
     @staticmethod
     def compress(codec: Int32, data: Span[UInt8, _]) raises -> List[UInt8]:
-        if codec == CompressionCodec.UNCOMPRESSED.value:
-            return copy_of(data)
-        if codec == CompressionCodec.SNAPPY.value:
-            return snappy_compress(data)
-        if codec == CompressionCodec.GZIP.value:
-            return gzip_wrap(data)
-        raise unsupported_codec(codec)
+        match codec:
+            case == CompressionCodec.UNCOMPRESSED.value:
+                return copy_of(data)
+            case == CompressionCodec.SNAPPY.value:
+                return snappy_compress(data)
+            case == CompressionCodec.GZIP.value:
+                return gzip_wrap(data)
+            case _:
+                raise unsupported_codec(codec)

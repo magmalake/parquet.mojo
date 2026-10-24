@@ -9,7 +9,7 @@ platforms = ["osx-arm64", "linux-64"]
 
 # Sibling magmalake tins are consumed by *source path* (`-I ../x.mojo/src`),
 # never as built `.mojopkg`: pixi-build-mojo emits a package compiled with
-# mojo-compiler 1.1.0 and the nightly compiler refuses to load it. CI checks
+# mojo-compiler 1.2.0 and the nightly compiler refuses to load it. CI checks
 # each sibling out next to this repository, at that repository's `main`.
 #
 # arrow-mlake.mojo holds the Arrow layer — `ArrayData`, `ArrayArena`,
@@ -53,7 +53,7 @@ check = { depends-on = ["test", "cli", "lint", "lint-tools"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -I ../arrow-mlake.mojo/src -I ../memory-region.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -o build/parquet-mojo" }
 profile = { cmd = "mkdir -p build && mojo build bench/profile_parquet.mojo -I src -I ../arrow-mlake.mojo/src -I ../memory-region.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -o build/parquet-profile && ./build/parquet-profile" }
 fmt = { cmd = "mojo format src tests bench" }
-# `mojo format` has no check mode in 1.1.0 — it rejects `--check` outright — so
+# `mojo format` has no check mode in 1.2.0 — it rejects `--check` outright — so
 # the check is: format, then assert the tree did not move. It rewrites the files
 # as a side effect, which is what CI wants and is harmless locally; run it with
 # your own work committed or stashed.
@@ -88,7 +88,7 @@ stress-asan = { cmd = "tests/run_stress.sh asan" }
 stress-tsan-control = { cmd = "mkdir -p build && mojo build --sanitize thread tests/tsan_control.mojo -I ../threads.mojo/src -I $THREADS_COMPAT -o build/tsan-control && { ./build/tsan-control || echo 'control: the allocating mode reported and aborted, which is the point — see the header of tests/tsan_control.mojo'; }" }
 
 # The ZSTD / LZ4 codecs are FFI tins, so they live in their own environments:
-# `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.1.0).
+# `pixi run -e codecs test-codecs` (nightly) and `-e codecs-stable` (1.2.0).
 [feature.codecs.tasks]
 conformance = { cmd = "mkdir -p build && mojo build tools/conformance.mojo -I src -I ../arrow-mlake.mojo/src -I ../memory-region.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -I full/src -o build/parquet-conformance && ./build/parquet-conformance" }
 test-codecs = { cmd = "mkdir -p build && mojo build tests/test_codecs.mojo -I src -I tests -I ../arrow-mlake.mojo/src -I ../memory-region.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../avro.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -I full/src -o build/parquet-codecs-test && ./build/parquet-codecs-test" }
@@ -103,7 +103,7 @@ encodings = { cmd = "mkdir -p build/encodings && mojo build tools/encoding_corpu
 # This task only builds; run the binary in the same environment:
 #   pixi run -e codecs-stable profile-scan
 #   pixi run -e codecs-stable ./build/profile-scan <file.parquet> --select a,b
-# Stable only: the codec tins arrive precompiled by 1.1.0 and nightly refuses them.
+# Stable only: the codec tins arrive precompiled by 1.2.0 and nightly refuses them.
 profile-scan = { cmd = "mkdir -p build && mojo build bench/profile_scan.mojo -I src -I ../arrow-mlake.mojo/src -I ../memory-region.mojo/src -I ../threads.mojo/src -I $THREADS_COMPAT -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -I full/src -o build/profile-scan" }
 # The `full/` package and the files `lint`/`lint-tools` can only
 # text-mode-fallback on (they import zstd/lz4/brotli): resolved fully here,
@@ -127,31 +127,31 @@ name = "parquet"
 extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
-mojo-compiler = "==1.1.0"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "43c6da47c6cf86b8e3134adc49609f87aaa21c47" }
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "b4a887b437cccb9565c5defc72f9d2dc23752103" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "875a5581aa35f1dd61c7879f16166be7bfb136f1" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "400d19ef158827e52dd07be1f701e1579a52b0e9" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "4dd67b6c53780ab9d4c8ce6333b434ce178969cd" }
+mojo-compiler = "==1.2.0"
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "b476296692a55bd3a835124584e50b3b5d32e2e6" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7a7701d1a7145140e8b1702f1452dd257baaf8d4" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "8b0e448c842c713b65a6ad5b86ec2193cc12d48b" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "3b6b06d0be3189e92ceeccedd376a1d8fbca70cb" }
 
 [package.build-dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.1.0,<2"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "43c6da47c6cf86b8e3134adc49609f87aaa21c47" }
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "b4a887b437cccb9565c5defc72f9d2dc23752103" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "875a5581aa35f1dd61c7879f16166be7bfb136f1" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "400d19ef158827e52dd07be1f701e1579a52b0e9" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "4dd67b6c53780ab9d4c8ce6333b434ce178969cd" }
+mojo-compiler = ">=1.2.0,<2"
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "b476296692a55bd3a835124584e50b3b5d32e2e6" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7a7701d1a7145140e8b1702f1452dd257baaf8d4" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "8b0e448c842c713b65a6ad5b86ec2193cc12d48b" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "3b6b06d0be3189e92ceeccedd376a1d8fbca70cb" }
 
 # threads.mojo keeps the declarations that supported toolchains spell
 # differently in `compat/`, and single-sources everything else. Since 0.6.0
 # that is one directory rather than two: the split existed for the spelling of
 # `std.atomic.Atomic`'s parameter, which Mojo 1.0.0 took as a `DType`, and
-# 1.1.0 and nightly agree. The `-I` stays set per feature rather than written
+# 1.2.0 and nightly agree. The `-I` stays set per feature rather than written
 # into each task, so re-splitting it costs nothing here; `gpu` needs its own
 # because `gpu = ["gpu"]` inherits from neither of the two below. `fmt` takes
 # `no-default-feature` and only parses, so it needs nothing.
@@ -165,7 +165,7 @@ THREADS_COMPAT = "../threads.mojo/compat"
 THREADS_COMPAT = "../threads.mojo/compat"
 
 [feature.nightly.dependencies]
-modular = ">=26.7.0.dev2026101905,<28"
+modular = ">=26.8.0.dev2026102305,<28"
 
 # `mojo format` only parses — it never builds against a sibling — so the
 # formatter can run on a newer compiler than the build environments can. It has
@@ -175,7 +175,7 @@ modular = ">=26.7.0.dev2026101905,<28"
 # unchanged. Keeping it its own environment is what stops a formatter fix from
 # moving the compiler that has to agree with threads.mojo.
 [feature.fmt.dependencies]
-modular = ">=26.7.0.dev2026101905,<28"
+modular = ">=26.8.0.dev2026102305,<28"
 
 # The environment takes `no-default-feature`, so the task has to live here to
 # be reachable from it.
@@ -184,20 +184,20 @@ fmt = { cmd = "mojo format src tests bench" }
 format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- src tests bench" }
 
 [feature.stable.dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 
 # ── optional codecs ─────────────────────────────────────────────────────────
 # ZSTD, BROTLI and LZ4 are FFI tins; these git source dependencies are what put
 # libzstd / libbrotli / liblz4 and their dlopen shims into the environment. The
 # Mojo code still comes from `-I ../zstd.mojo/src -I ../brotli.mojo/src -I full/src
-# -I ../lz4.mojo/src` because the shipped packages are built with stable 1.1.0
+# -I ../lz4.mojo/src` because the shipped packages are built with stable 1.2.0
 # and nightly cannot load them. Path dependencies would break `pixi install`
 # for a bare clone, since pixi solves every environment even when it installs
 # one.
 [feature.codecs.dependencies]
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "c468fa2378d999753968288f3de33d904d5bb701" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "5e0b29831ec292daac2ef8226d28a959288b66ae" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "0ba0e088d382d28036006968bcb015eaccacdd6e" }
 
 [target.osx-arm64.activation.env]
 SHLIB_EXT = ".dylib"
@@ -209,20 +209,20 @@ SHLIB_EXT = ".so"
 # their own feature, so the tin stays out of the environments that run tests.
 # -I $CONDA_PREFIX/lib/mojo is what puts its precompiled package on the import
 # path. Stable only: a precompiled Mojo package is stamped with the compiler
-# version that built it and refused by any other, and tins build with 1.1.0.
+# version that built it and refused by any other, and tins build with 1.2.0.
 # Benchmarks consume the sibling tins as *tins*, not as source paths. They can,
 # because this environment is stable-only: the package pixi-build-mojo emits is
-# built with mojo-compiler 1.1.0 and loads fine here. The test, cli and profile
+# built with mojo-compiler 1.2.0 and loads fine here. The test, cli and profile
 # tasks still use `-I ../x.mojo/src` because they also run on nightly, which
 # refuses that package — see the note at the top of this file.
 [feature.bench.dependencies]
-bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "373e3903e724b79a47d5f5921e690ef95d31b09f" }
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "43c6da47c6cf86b8e3134adc49609f87aaa21c47" }
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "b4a887b437cccb9565c5defc72f9d2dc23752103" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "875a5581aa35f1dd61c7879f16166be7bfb136f1" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "400d19ef158827e52dd07be1f701e1579a52b0e9" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "4dd67b6c53780ab9d4c8ce6333b434ce178969cd" }
+bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "7b6c423bbd9f31d3f126ca00e74994e08d64fe65" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "b476296692a55bd3a835124584e50b3b5d32e2e6" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7a7701d1a7145140e8b1702f1452dd257baaf8d4" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "8b0e448c842c713b65a6ad5b86ec2193cc12d48b" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "3b6b06d0be3189e92ceeccedd376a1d8fbca70cb" }
 
 [feature.bench.tasks]
 bench = "mkdir -p build && mojo build -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo -o build/bench-parquet && ./build/bench-parquet"
@@ -245,7 +245,7 @@ lint-bench = { cmd = "mojolint --lsp -I src -I ../arrow-mlake.mojo/src -I ../mem
 # The `-I` list is the one the other nightly tasks use, plus
 # `-I experiments/gpu_gather` so the spike's own modules resolve.
 [feature.gpu.dependencies]
-modular = ">=26.7.0.dev2026101905,<28"
+modular = ">=26.8.0.dev2026102305,<28"
 
 [feature.gpu.tasks]
 # Whether this machine has a Metal device the Mojo GPU stack can drive at all.
@@ -279,4 +279,4 @@ fmt = { features = ["fmt"], no-default-feature = true }
 # Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi
 # source dependency pinned at the revision mojoshelf published, and builds
 # the `mojolint` executable into every environment next to mojo-lsp-server.
-lint-mojo = { git = "https://github.com/magmalake/lint.mojo.git", rev = "5682b29cedd8d7cd768543ef26ab930732232b79" }
+lint-mojo = { git = "https://github.com/magmalake/lint.mojo.git", rev = "4a635f9a0ca0b7b639cd3823534cf0b36ff63985" }
