@@ -245,25 +245,26 @@ def main() raises:
     var i = 2
     while i < len(args):
         var a = String(args[i])
-        if a == "--columns" and i + 1 < len(args):
-            columns = _split(String(args[i + 1]), ",")
-            i += 1
-        elif a == "--field-ids" and i + 1 < len(args):
-            for part in _split(String(args[i + 1]), ","):
-                field_ids.append(Int32(Int(part)))
-            i += 1
-        elif a == "--limit" and i + 1 < len(args):
-            limit = Int(String(args[i + 1]))
-            i += 1
-        elif a == "--json":
-            as_json = True
-        elif a == "--no-crc":
-            crc = False
-        elif a == "--help" or a == "-h":
-            print(USAGE)
-            return
-        else:
-            path = a
+        match a:
+            case "--columns" if i + 1 < len(args):
+                columns = _split(String(args[i + 1]), ",")
+                i += 1
+            case "--field-ids" if i + 1 < len(args):
+                for part in _split(String(args[i + 1]), ","):
+                    field_ids.append(Int32(Int(part)))
+                i += 1
+            case "--limit" if i + 1 < len(args):
+                limit = Int(String(args[i + 1]))
+                i += 1
+            case "--json":
+                as_json = True
+            case "--no-crc":
+                crc = False
+            case "--help" | "-h":
+                print(USAGE)
+                return
+            case _:
+                path = a
         i += 1
     if not path:
         print(USAGE)
