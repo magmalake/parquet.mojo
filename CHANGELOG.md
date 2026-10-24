@@ -10,6 +10,16 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-10-24
+
+Released together with parquet-full-mojo 0.1.5, from the same commit.
+
+### Changed
+
+- Built with Mojo 1.2.0, against the layer-1 tins' 1.2.0
+  releases. The published 0.11.3 was built with 1.1.0, whose
+  precompiled `.mojoc` a 1.2.0 compiler refuses.
+
 ## [0.11.3] - 2026-10-19
 
 Released together with parquet-full-mojo 0.1.4, from the same commit.
