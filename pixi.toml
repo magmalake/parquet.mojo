@@ -128,7 +128,7 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.2.0"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "3addb7d0e5b92352be9734382fc37c6037a9f635" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "b476296692a55bd3a835124584e50b3b5d32e2e6" }
 threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7a7701d1a7145140e8b1702f1452dd257baaf8d4" }
@@ -140,7 +140,7 @@ mojo-compiler = "==1.2.0"
 
 [package.run-dependencies]
 mojo-compiler = ">=1.2.0,<2"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "3addb7d0e5b92352be9734382fc37c6037a9f635" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "b476296692a55bd3a835124584e50b3b5d32e2e6" }
 threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7a7701d1a7145140e8b1702f1452dd257baaf8d4" }
@@ -217,7 +217,7 @@ SHLIB_EXT = ".so"
 # refuses that package — see the note at the top of this file.
 [feature.bench.dependencies]
 bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "7b6c423bbd9f31d3f126ca00e74994e08d64fe65" }
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "3addb7d0e5b92352be9734382fc37c6037a9f635" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "b476296692a55bd3a835124584e50b3b5d32e2e6" }
 threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "fa96c233d299180799916f3aba1c6e4c05231ebc" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "7a7701d1a7145140e8b1702f1452dd257baaf8d4" }
