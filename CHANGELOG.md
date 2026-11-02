@@ -10,6 +10,16 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-11-02
+
+Released together with parquet-full-mojo 0.1.6, from the same commit.
+
+### Changed
+
+- Built against arrow-mlake-mojo 0.2.1, the version the registry serves.
+  0.11.4 pinned arrow-mlake 0.1.2, so a consumer resolving parquet-mojo and
+  arrow-mlake-mojo from the registry got two arrow-mlake records.
+
 ## [0.11.4] - 2026-10-24
 
 Released together with parquet-full-mojo 0.1.5, from the same commit.
