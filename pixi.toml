@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "parquet.mojo"
-version = "0.11.5"
+version = "0.11.6"
 description = "Native pure-Mojo Apache Parquet — footer, pages, every encoding, and Arrow output over the C Data Interface."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -114,7 +114,7 @@ lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../arrow-mlake.mojo/src
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
 [package]
 name = "parquet-mojo"
-version = "0.11.5"
+version = "0.11.6"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -195,9 +195,9 @@ mojo-compiler = "==1.2.0"
 # for a bare clone, since pixi solves every environment even when it installs
 # one.
 [feature.codecs.dependencies]
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "53655623ca8585fd5b36b1239842913ec308ae69" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "64502eeeabed37515cd479bc421fc2920504cac5" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "aa6d14985baf82ad4b934f14136b95a291b55faf" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "76190bb31012cd2d2f6712c4e1724a66474215db" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "23cd6e54967d7e41573371507228ca5c958ca685" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "dcbf840d22e3deaf24c587d12d28570a9a882b7f" }
 
 [target.osx-arm64.activation.env]
 SHLIB_EXT = ".dylib"

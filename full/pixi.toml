@@ -15,7 +15,7 @@
 # the repo's workspace, the same shape zstd.mojo/shim uses.
 [package]
 name = "parquet-full-mojo"
-version = "0.1.6"
+version = "0.1.7"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -40,9 +40,9 @@ parquet-mojo = { path = ".." }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "b8172ed0a4ef13911cc225d46e26676a5b8f1ccd" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "21cdbce67d22d72e88e88a60e2f168b05b4ef9fa" }
 # The reason this tin exists: three dlopen'd C libraries.
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "53655623ca8585fd5b36b1239842913ec308ae69" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "64502eeeabed37515cd479bc421fc2920504cac5" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "aa6d14985baf82ad4b934f14136b95a291b55faf" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "76190bb31012cd2d2f6712c4e1724a66474215db" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "23cd6e54967d7e41573371507228ca5c958ca685" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "dcbf840d22e3deaf24c587d12d28570a9a882b7f" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.2.0"
@@ -52,6 +52,6 @@ mojo-compiler = ">=1.2.0,<2"
 parquet-mojo = { path = ".." }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "b8172ed0a4ef13911cc225d46e26676a5b8f1ccd" }
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "21cdbce67d22d72e88e88a60e2f168b05b4ef9fa" }
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "53655623ca8585fd5b36b1239842913ec308ae69" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "64502eeeabed37515cd479bc421fc2920504cac5" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "aa6d14985baf82ad4b934f14136b95a291b55faf" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "76190bb31012cd2d2f6712c4e1724a66474215db" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "23cd6e54967d7e41573371507228ca5c958ca685" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "dcbf840d22e3deaf24c587d12d28570a9a882b7f" }
