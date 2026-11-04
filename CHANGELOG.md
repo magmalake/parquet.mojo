@@ -10,6 +10,15 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-11-03
+
+Released together with parquet-full-mojo 0.1.8, from the same commit.
+
+### Changed
+
+- Built against deflate-mojo 0.1.3 (gzip, RFC 1952), the version the
+  registry serves.
+
 ## [0.11.6] - 2026-11-03
 
 Released together with parquet-full-mojo 0.1.7, from the same commit.
