@@ -10,6 +10,17 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-11-03
+
+Released together with parquet-full-mojo 0.1.7, from the same commit.
+
+### Changed
+
+- parquet-full-mojo is built against zstd-mojo 0.1.5, lz4-mojo 0.1.4 and
+  brotli-mojo 0.1.4, the releases whose shims are found without
+  `CONDA_PREFIX` and raise an Error instead of aborting when missing. The
+  codecs environment pins the same revisions.
+
 ## [0.11.5] - 2026-11-02
 
 Released together with parquet-full-mojo 0.1.6, from the same commit.
