@@ -71,7 +71,7 @@ environments:
       - conda: https://conda.modular.com/max-nightly/noarch/mojo-python-1.2.0-release.conda
       - conda_source: arrow-mlake-mojo[e80fb6b3] @ git+https://github.com/magmalake/arrow-mlake.mojo?rev=178aae6e0da0dbe105f9cb02632a51cfd35b9dda#178aae6e0da0dbe105f9cb02632a51cfd35b9dda
       - conda_source: bench-mojo[493a7e8e] @ git+https://github.com/magmalake/bench.mojo?rev=7b6c423bbd9f31d3f126ca00e74994e08d64fe65#7b6c423bbd9f31d3f126ca00e74994e08d64fe65
-      - conda_source: deflate-mojo[03acc2ee] @ git+https://github.com/magmalake/deflate.mojo?rev=6639b18c58fad0e009f4224ec9f792cd919398b4#6639b18c58fad0e009f4224ec9f792cd919398b4
+      - conda_source: deflate-mojo[8c9b167b] @ git+https://github.com/magmalake/deflate.mojo?rev=c3dfb87f5b09fb2559449dcb8b748629da4908af#c3dfb87f5b09fb2559449dcb8b748629da4908af
       - conda_source: hashes-mojo[0ddf52c3] @ git+https://github.com/magmalake/hashes.mojo?rev=395aca597f9410bd0511df44d972f14b10a8b01d#395aca597f9410bd0511df44d972f14b10a8b01d
       - conda_source: lint-mojo[ebc26d72] @ git+https://github.com/magmalake/lint.mojo?rev=5799cd56eca15ad142a9c8ba300ad45c5eca96f4#5799cd56eca15ad142a9c8ba300ad45c5eca96f4
       - conda_source: memory-region-mojo[1c09a9a2] @ git+https://github.com/magmalake/memory-region.mojo?rev=40068c4f95ea659e9b78aa91ced45420b07e3e6e#40068c4f95ea659e9b78aa91ced45420b07e3e6e
@@ -126,7 +126,7 @@ environments:
       - conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-compiler-1.2.0-release.conda
       - conda_source: arrow-mlake-mojo[4f60d45a] @ git+https://github.com/magmalake/arrow-mlake.mojo?rev=178aae6e0da0dbe105f9cb02632a51cfd35b9dda#178aae6e0da0dbe105f9cb02632a51cfd35b9dda
       - conda_source: bench-mojo[5a0281e3] @ git+https://github.com/magmalake/bench.mojo?rev=7b6c423bbd9f31d3f126ca00e74994e08d64fe65#7b6c423bbd9f31d3f126ca00e74994e08d64fe65
-      - conda_source: deflate-mojo[ef0cce6a] @ git+https://github.com/magmalake/deflate.mojo?rev=6639b18c58fad0e009f4224ec9f792cd919398b4#6639b18c58fad0e009f4224ec9f792cd919398b4
+      - conda_source: deflate-mojo[b95a607a] @ git+https://github.com/magmalake/deflate.mojo?rev=c3dfb87f5b09fb2559449dcb8b748629da4908af#c3dfb87f5b09fb2559449dcb8b748629da4908af
       - conda_source: hashes-mojo[c1f6ced1] @ git+https://github.com/magmalake/hashes.mojo?rev=395aca597f9410bd0511df44d972f14b10a8b01d#395aca597f9410bd0511df44d972f14b10a8b01d
       - conda_source: lint-mojo[5229264a] @ git+https://github.com/magmalake/lint.mojo?rev=5799cd56eca15ad142a9c8ba300ad45c5eca96f4#5799cd56eca15ad142a9c8ba300ad45c5eca96f4
       - conda_source: memory-region-mojo[96b83907] @ git+https://github.com/magmalake/memory-region.mojo?rev=40068c4f95ea659e9b78aa91ced45420b07e3e6e#40068c4f95ea659e9b78aa91ced45420b07e3e6e
@@ -15459,8 +15459,8 @@ packages:
   - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libbrotlidec-1.2.1-h5295a6a_0.conda
   - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libbrotlienc-1.2.1-h2ddc9cb_0.conda
   - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcxx-23.1.4-h55c6f16_2.conda
-- conda_source: deflate-mojo[03acc2ee] @ git+https://github.com/magmalake/deflate.mojo?rev=6639b18c58fad0e009f4224ec9f792cd919398b4#6639b18c58fad0e009f4224ec9f792cd919398b4
-  version: 0.1.3
+- conda_source: deflate-mojo[8c9b167b] @ git+https://github.com/magmalake/deflate.mojo?rev=c3dfb87f5b09fb2559449dcb8b748629da4908af#c3dfb87f5b09fb2559449dcb8b748629da4908af
+  version: 0.2.0
   build: hb0f4dca_0
   subdir: linux-64
   variants:
@@ -15517,8 +15517,8 @@ packages:
   - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
   - conda: https://conda.modular.com/max-nightly/linux-64/mojo-compiler-1.2.0-release.conda
   - conda: https://conda.modular.com/max-nightly/noarch/mojo-python-1.2.0-release.conda
-- conda_source: deflate-mojo[ef0cce6a] @ git+https://github.com/magmalake/deflate.mojo?rev=6639b18c58fad0e009f4224ec9f792cd919398b4#6639b18c58fad0e009f4224ec9f792cd919398b4
-  version: 0.1.3
+- conda_source: deflate-mojo[b95a607a] @ git+https://github.com/magmalake/deflate.mojo?rev=c3dfb87f5b09fb2559449dcb8b748629da4908af#c3dfb87f5b09fb2559449dcb8b748629da4908af
+  version: 0.2.0
   build: h60d57d3_0
   subdir: osx-arm64
   variants:

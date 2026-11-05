@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "parquet.mojo"
-version = "0.12.0"
+version = "0.12.1"
 description = "Native pure-Mojo Apache Parquet — footer, pages, every encoding, and Arrow output over the C Data Interface."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -114,7 +114,7 @@ lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../arrow-mlake.mojo/src
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
 [package]
 name = "parquet-mojo"
-version = "0.12.0"
+version = "0.12.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -133,7 +133,7 @@ threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e7
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "21cdbce67d22d72e88e88a60e2f168b05b4ef9fa" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "395aca597f9410bd0511df44d972f14b10a8b01d" }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "b8172ed0a4ef13911cc225d46e26676a5b8f1ccd" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "6639b18c58fad0e009f4224ec9f792cd919398b4" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "c3dfb87f5b09fb2559449dcb8b748629da4908af" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.2.0"
@@ -145,7 +145,7 @@ threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e7
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "21cdbce67d22d72e88e88a60e2f168b05b4ef9fa" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "395aca597f9410bd0511df44d972f14b10a8b01d" }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "b8172ed0a4ef13911cc225d46e26676a5b8f1ccd" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "6639b18c58fad0e009f4224ec9f792cd919398b4" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "c3dfb87f5b09fb2559449dcb8b748629da4908af" }
 
 # threads.mojo keeps the declarations that supported toolchains spell
 # differently in `compat/`, and single-sources everything else. Since 0.6.0
@@ -222,7 +222,7 @@ threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e7
 thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "21cdbce67d22d72e88e88a60e2f168b05b4ef9fa" }
 hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "395aca597f9410bd0511df44d972f14b10a8b01d" }
 snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "b8172ed0a4ef13911cc225d46e26676a5b8f1ccd" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "6639b18c58fad0e009f4224ec9f792cd919398b4" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "c3dfb87f5b09fb2559449dcb8b748629da4908af" }
 
 [feature.bench.tasks]
 bench = "mkdir -p build && mojo build -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo -o build/bench-parquet && ./build/bench-parquet"
