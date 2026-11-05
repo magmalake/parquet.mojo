@@ -592,7 +592,9 @@ skips them. The pyarrow comparison is a local check too.
 Every number in both tables is one core on both sides, which is what makes
 them comparable: the reads leave `ParquetReader.num_workers` at its default of
 1, and pyarrow is pinned with `set_cpu_count(1)`, `set_io_thread_count(1)` and
-`use_threads=False`. Writing is single threaded on both sides either way.
+`use_threads=False`. The writes leave `WriterOptions.num_workers` at 1 too;
+`bench_write_big_w4` / `bench_write_wide_w4` are the same writes on four
+threads.
 
 A read *can* now use more than one core — see [More than one
 core](#more-than-one-core) — and `tools/bench_pyarrow.py` grew a second leg
@@ -816,14 +818,44 @@ var bytes = w^.finish()
 ```
 
 `WriterOptions` carries `codec`, `row_group_size`, `data_page_size`,
-`use_dictionary`, `write_statistics`, `write_page_index` and `created_by`.
+`use_dictionary`, `write_statistics`, `write_page_index`, `created_by` and
+`num_workers`.
+
+**Streaming.** The writer does not have to hold the file. `write_batch_to`
+hands each row group to a `ByteSink` as soon as it is encoded, and
+`finish_to` writes the page indexes and footer and returns a `WrittenFile`:
+the `FileMetaData` it wrote — every chunk's sizes, value counts, statistics
+and offsets — and the file size, so nothing has to be read back out of the
+bytes. `ListSink` collects in memory, `FileSink` writes a local file, and
+anything with `write_bytes(Span)` will do. `finish()` is `finish_to` into a
+`ListSink`.
+
+```mojo
+var sink = FileSink("out.parquet")
+for b in t.batches:
+    w.write_batch_to(b.arena, b.roots, sink)
+var written = w^.finish_to(sink)   # written.metadata, written.file_size
+sink.close()
+```
+
+**More than one core.** `num_workers` encodes a row group's pages on that
+many threads (`0` = one per core; `1`, the default, the calling thread). It
+is one budget, as on the reader: a per-column plan — the dictionary and the
+page breaks — and then every page of every column, each one `parallel_for`,
+never one inside another. Each page is a pure function of its column and its
+plan and the pages are laid out in file order afterwards, so the file is
+byte-identical at any setting; `test_parallel_write_is_byte_identical`
+checks every fixture at 2, 4 and every-core workers under four option sets.
+Because the unit is the page, a single wide column spreads too: a GH Archive
+batch of 50,000 rows whose JSON column is 180 MB encodes in 81 ms on four
+threads against 200 ms on one (ZSTD, M4).
 
 What it writes:
 
 | | |
 |---|---|
 | metadata | Parquet 2.6 `FileMetaData`, `created_by`, key/value metadata |
-| pages | v1 data pages, split at record boundaries by `data_page_size`; a dictionary page when the dictionary pays for itself |
+| pages | v1 data pages, split at record boundaries by `data_page_size` — a `PLAIN` byte-array page by the bytes it holds, other pages at their type's width a value; a dictionary page when the dictionary pays for itself |
 | values | `PLAIN` and `RLE_DICTIONARY` (the dictionary is dropped for a column where it would be bigger than the data) |
 | levels | `RLE`, with the 4-byte length prefix a v1 page wants |
 | types | every type the reader maps, written back to the physical type it came from; decimals as `FIXED_LEN_BYTE_ARRAY(16)`, which is legal at any precision Arrow can hold |

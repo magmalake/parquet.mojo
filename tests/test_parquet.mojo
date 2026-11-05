@@ -77,13 +77,17 @@ from parquet import (
     ArrayData,
     ArrowType,
     DefaultCodecs,
+    ByteSink,
+    FileSink,
     ImportedArray,
+    ListSink,
     ParquetReader,
+    ParquetWriter,
     Predicate,
     ScalarValue,
-    ParquetWriter,
     Table,
     WriterOptions,
+    bit_get,
     build_schema,
     export_c,
     import_c,
@@ -122,6 +126,7 @@ from parquet.schema import (
     LeafColumn,
 )
 from std.memory import bitcast
+from std.os import remove
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -2865,6 +2870,270 @@ def test_write_round_trip_options() raises:
     var nostats = WriterOptions()
     nostats.write_statistics = False
     assert_true(_round_trip("logical", List[String](), nostats^) > 160)
+
+
+# ── the streaming writer, and the threaded one ─────────────────────────────
+
+
+def _write_fixture(
+    name: StringSlice, var options: WriterOptions
+) raises -> List[UInt8]:
+    """A fixture read and written back out with `options`, in memory."""
+    var r = _reader(name)
+    var t = r.read_table()
+    var w = ParquetWriter(options^)
+    w.add_metadata("parquet.mojo", "byte identity")
+    for b in t.batches:
+        w.write_batch(b.arena, b.roots)
+    return w^.finish()
+
+
+struct _CountingSink(ByteSink, Movable):
+    """A `ListSink` that also records how big each hand-over was."""
+
+    var bytes: List[UInt8]
+    var calls: List[Int]
+
+    def __init__(out self):
+        self.bytes = List[UInt8]()
+        self.calls = List[Int]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.bytes = move.bytes^
+        self.calls = move.calls^
+
+    def write_bytes(mut self, data: Span[UInt8, _]) raises:
+        self.calls.append(len(data))
+        self.bytes.extend(data)
+
+
+def _same_bytes(a: List[UInt8], b: List[UInt8], what: String) raises:
+    assert_equal(len(a), len(b), what + ": length")
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            assert_equal(Int(a[i]), Int(b[i]), String(what, ": byte ", i))
+
+
+def test_streaming_writer_matches_finish() raises:
+    """`write_batch_to` + `finish_to` produce exactly what `write_batch` +
+    `finish` do, hand over each row group as it is encoded, and return the
+    footer that a reader then parses back out of the bytes."""
+    for f in core_fixtures():
+        var opts = WriterOptions()
+        # Several row groups everywhere; `big` gets bigger ones, or its
+        # 100,000 rows would be 2,000 row groups and most of the test time.
+        var rg_size = 20_000 if f == "big" else 50
+        opts.row_group_size = rg_size
+        var whole = _write_fixture(f, opts.copy())
+
+        var r = _reader(f)
+        var t = r.read_table()
+        var w = ParquetWriter(opts^)
+        w.add_metadata("parquet.mojo", "byte identity")
+        var sink = _CountingSink()
+        var groups = 0
+        for b in t.batches:
+            var before = len(sink.calls)
+            w.write_batch_to(b.arena, b.roots, sink)
+            # Nothing is held back once a batch has been written.
+            assert_equal(w.pending_bytes, 0, String(f, ": pending"))
+            assert_equal(w.position(), len(sink.bytes), String(f, ": pos"))
+            assert_true(len(sink.calls) > before, String(f, ": no flush"))
+            groups += (b.num_rows + rg_size - 1) // rg_size if b.num_rows else 1
+        var written = w^.finish_to(sink)
+        _same_bytes(sink.bytes, whole, String(f))
+        assert_equal(written.file_size, len(whole), String(f, ": size"))
+        assert_equal(
+            len(written.metadata.row_groups), groups, String(f, ": groups")
+        )
+
+        # The returned footer is the one in the file.
+        var back = ParquetReader(sink.bytes.copy())
+        assert_equal(
+            Int(written.metadata.num_rows), back.num_rows(), String(f, ": rows")
+        )
+        for g in range(back.num_row_groups()):
+            for c in range(len(back.meta.row_groups[g].columns)):
+                ref want = back.meta.row_groups[g].columns[c]
+                ref got = written.metadata.row_groups[g].columns[c]
+                ref wm = want.meta_data.value()
+                ref gm = got.meta_data.value()
+                var at = String(f, " rg ", g, " col ", c)
+                assert_equal(gm.num_values, wm.num_values, at)
+                assert_equal(
+                    gm.total_compressed_size, wm.total_compressed_size, at
+                )
+                assert_equal(gm.data_page_offset, wm.data_page_offset, at)
+                assert_equal(
+                    got.offset_index_offset.value(),
+                    want.offset_index_offset.value(),
+                    at,
+                )
+                assert_equal(
+                    Bool(gm.statistics), Bool(wm.statistics), at + " stats"
+                )
+                if wm.statistics:
+                    ref ws = wm.statistics.value()
+                    ref gs = gm.statistics.value()
+                    assert_equal(
+                        gs.null_count.value(), ws.null_count.value(), at
+                    )
+                    assert_equal(Bool(gs.min_value), Bool(ws.min_value), at)
+                    if ws.min_value:
+                        _same_bytes(
+                            gs.min_value.value(), ws.min_value.value(), at
+                        )
+                        _same_bytes(
+                            gs.max_value.value(), ws.max_value.value(), at
+                        )
+
+
+def test_flush_to_hands_over_what_is_ready() raises:
+    """`write_batch` then `flush_to` is the same stream, flushed in steps."""
+    var opts = WriterOptions()
+    opts.row_group_size = 40
+    var whole = _write_fixture("nested", opts.copy())
+    var r = _reader("nested")
+    var t = r.read_table()
+    var w = ParquetWriter(opts^)
+    w.add_metadata("parquet.mojo", "byte identity")
+    var sink = ListSink()
+    for b in t.batches:
+        w.write_batch(b.arena, b.roots)
+        assert_true(w.pending_bytes > 0)
+        w.flush_to(sink)
+        assert_equal(w.pending_bytes, 0)
+    # A second flush with nothing pending writes nothing.
+    var n = len(sink.bytes)
+    w.flush_to(sink)
+    assert_equal(len(sink.bytes), n)
+    _ = w^.finish_to(sink)
+    _same_bytes(sink.bytes, whole, "nested, flushed in steps")
+
+
+def test_file_sink_writes_the_same_file() raises:
+    var opts = WriterOptions()
+    opts.row_group_size = 64
+    var whole = _write_fixture("primitives", opts.copy())
+    var path = String("build/test-file-sink.parquet")
+    var r = _reader("primitives")
+    var t = r.read_table()
+    var w = ParquetWriter(opts^)
+    w.add_metadata("parquet.mojo", "byte identity")
+    var sink = FileSink(path)
+    for b in t.batches:
+        w.write_batch_to(b.arena, b.roots, sink)
+    var written = w^.finish_to(sink)
+    sink.close()
+    assert_equal(written.file_size, len(whole))
+    var fh = open(path, "r")
+    var on_disk = fh.read_bytes()
+    fh.close()
+    _same_bytes(on_disk, whole, "FileSink")
+    remove(path)
+
+
+def test_parallel_write_is_byte_identical() raises:
+    """Every fixture, under several option sets, at 2, 4 and every-core
+    workers, comes out byte for byte the same as on one thread."""
+    var shapes = List[WriterOptions]()
+    shapes.append(WriterOptions())
+    var plain = WriterOptions()
+    plain.use_dictionary = False
+    plain.codec = CompressionCodec.UNCOMPRESSED.value
+    shapes.append(plain^)
+    var paged = WriterOptions()
+    paged.row_group_size = 37
+    paged.data_page_size = 64
+    shapes.append(paged^)
+    var gzip = WriterOptions()
+    gzip.codec = CompressionCodec.GZIP.value
+    gzip.data_page_size = 512
+    gzip.write_page_index = False
+    shapes.append(gzip^)
+    var compared = 0
+    for f in core_fixtures():
+        for s in range(len(shapes)):
+            if f == "big" and s == 2:
+                # 37-row groups would make 2,700 of them, each its own pair of
+                # fan-outs; `big` is covered by the other shapes.
+                continue
+            var serial = _write_fixture(f, shapes[s].copy())
+            for workers in [2, 4, 0]:
+                var o = shapes[s].copy()
+                o.num_workers = workers
+                var threaded = _write_fixture(f, o^)
+                _same_bytes(
+                    threaded,
+                    serial,
+                    String(f, " shape ", s, " at ", workers, " workers"),
+                )
+                compared += 1
+    assert_true(compared > 40, String("only ", compared, " comparisons"))
+
+
+def _big_strings(n: Int, width: Int) raises -> ArrayArena:
+    """`n` distinct strings of `width` bytes, every seventh one null."""
+    var a = ArrayData(ArrowType(AT_UTF8), String("s"))
+    a.nullable = True
+    a.length = n
+    a.offsets.append(0)
+    for i in range(n):
+        if i % 8 == 0:
+            a.validity.append(0)
+        if i % 7 == 3:
+            a.null_count += 1
+        else:
+            a.validity[i // 8] |= UInt8(1) << UInt8(i % 8)
+            var tag = String(i)
+            for k in range(width):
+                var tb = tag.as_bytes()
+                a.values.append(tb[k % len(tb)] if k < len(tb) else UInt8(97))
+        a.offsets.append(Int32(len(a.values)))
+    var arena = ArrayArena()
+    _ = arena.add(a^)
+    return arena^
+
+
+def test_plain_strings_are_paged_by_their_bytes() raises:
+    """A PLAIN `BYTE_ARRAY` chunk is split into pages by the bytes PLAIN
+    writes, not by eight bytes a value: 2,000 values of 1 KB against a 64 KB
+    target is ~27 pages, not one. And the pages are what makes a single wide
+    column encode on several threads, so check that too."""
+    var arena = _big_strings(2000, 1024)
+    var roots: List[Int] = [0]
+    var opts = WriterOptions()
+    opts.use_dictionary = False
+    opts.data_page_size = 64 * 1024
+    var serial = List[UInt8]()
+    for workers in [1, 4]:
+        var o = opts.copy()
+        o.num_workers = workers
+        var w = ParquetWriter(o^)
+        w.write_batch(arena, roots)
+        var bytes = w^.finish()
+        if workers == 1:
+            serial = bytes.copy()
+        else:
+            _same_bytes(bytes, serial, "wide strings at 4 workers")
+    var back = ParquetReader(serial^)
+    var pages = len(back.offset_index(0, 0).value().page_locations)
+    # 1,714 non-null values of 1,028 PLAIN bytes each is 1.76 MB: 27 pages.
+    assert_true(pages >= 25 and pages <= 29, String(pages, " pages"))
+    var t = back.read_table()
+    ref got = t.batches[0].arena.nodes[t.batches[0].roots[0]]
+    ref want = arena.nodes[0]
+    assert_equal(got.length, want.length)
+    assert_equal(got.null_count, want.null_count)
+    for i in range(want.length):
+        var valid = bit_get(Span(want.validity), i)
+        assert_equal(bit_get(Span(got.validity), i), valid)
+        if valid:
+            assert_equal(
+                got.offsets[i + 1] - got.offsets[i],
+                want.offsets[i + 1] - want.offsets[i],
+            )
+    _same_bytes(got.values, want.values, "wide string values")
 
 
 def test_single_entry_dictionary() raises:

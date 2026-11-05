@@ -110,11 +110,15 @@ from parquet.schema import (
     build_schema,
 )
 from parquet.writer import (
+    ByteSink,
+    FileSink,
+    ListSink,
     ParquetWriter,
     WLeaf,
     WNode,
     WriteSchema,
     WriterOptions,
+    WrittenFile,
     build_write_schema,
 )
 from parquet.stats import (

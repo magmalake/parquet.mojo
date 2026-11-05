@@ -10,6 +10,48 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+### Added
+
+- A streaming writer (magmalake/parquet.mojo#58). `ParquetWriter` holds
+  finished row groups only until they are handed to a `ByteSink`:
+  `write_batch_to(arena, roots, sink)` hands each row group over as soon as
+  it is encoded, `flush_to(sink)` hands over what is ready, and
+  `finish_to(sink)` writes the page indexes and footer. `ListSink` collects
+  in memory and `FileSink` writes a local file; anything with
+  `write_bytes(Span)` will do. `finish()` is `finish_to` into a `ListSink`
+  and returns the same bytes it always did.
+- `finish_to` returns a `WrittenFile`: the `FileMetaData` the footer was
+  serialised from — row counts, every chunk's sizes, value counts, null
+  counts, statistics and offsets — and the file's size, so a caller (an
+  Iceberg `data_file`) needs not read the footer back out of the bytes.
+- `WriterOptions.num_workers`: the pages of a row group are encoded on
+  that many threads (`0` = one per core, `1`, the default, = the calling
+  thread). It is one budget, as on the reader: a per-column plan and then
+  every page of every column, each one `parallel_for`, never nested. The
+  output is byte-identical at every setting. One GH Archive batch (50,000
+  rows, a 180 MB JSON column, ZSTD) encodes in 81 ms on four threads
+  against 200 ms on one (M4).
+
+### Changed
+
+- A `BYTE_ARRAY` column chunk written `PLAIN` is split into data pages by
+  the bytes PLAIN writes for it (four length bytes and the value), as
+  `data_page_size` always said, rather than at eight bytes a value. A
+  column of 3 KB strings used to come out as one page for the whole chunk —
+  180 MB for the census's JSON column — which no reader could skip into and
+  no thread pool could split. Small pages compress less well: that JSON
+  column is 20% bigger under ZSTD at the 1 MB default and 4% bigger at
+  4 MB pages. Dictionary-encoded and fixed-width chunks page as before.
+- A compressed page no longer keeps the codec's worst-case buffer:
+  zstd.mojo zero-fills `ZSTD_compressBound` bytes and returns a list that
+  still owns them, which held about a row group's uncompressed size again
+  until the file was finished. Writing one 50,000-row GH Archive batch
+  under ZSTD peaks at 463 MB instead of 828 MB (the batch itself is
+  198 MB). The shredded values of a byte-array column are sized once
+  rather than grown by doubling.
+- The writer no longer has a public `out` buffer; `position()` is where
+  the file has got to, flushed or not.
+
 ## [0.11.7] - 2026-11-03
 
 Released together with parquet-full-mojo 0.1.8, from the same commit.

@@ -227,16 +227,17 @@ def bench_read_big_w10(mut b: Benchmark) raises:
 # bytes and nothing else.
 
 
-def bench_write_wide(mut b: Benchmark) raises:
-    var data = _read_file(WIDE)
+def _bench_write(mut b: Benchmark, path: StringSlice, workers: Int) raises:
+    var data = _read_file(path)
     var r = ParquetReader[DefaultCodecs].from_span(Span(data))
     r.verify_crc = False
     var table = r.read_table()
     b.throughput(Metric.elements(), table.num_rows)
 
-    def call() raises {imm table}:
+    def call() raises {imm table, workers}:
         var opts = WriterOptions()
         opts.codec = CompressionCodec.UNCOMPRESSED.value
+        opts.num_workers = workers
         var w = ParquetWriter[DefaultCodecs](opts^)
         for batch in table.batches:
             w.write_batch(batch.arena, batch.roots)
@@ -245,26 +246,26 @@ def bench_write_wide(mut b: Benchmark) raises:
     b.iter(call)
     keep(table)
     keep(data)
+
+
+def bench_write_wide(mut b: Benchmark) raises:
+    _bench_write(b, WIDE, 1)
 
 
 def bench_write_big(mut b: Benchmark) raises:
-    var data = _read_file(String(FIXTURES, "big.parquet"))
-    var r = ParquetReader[DefaultCodecs].from_span(Span(data))
-    r.verify_crc = False
-    var table = r.read_table()
-    b.throughput(Metric.elements(), table.num_rows)
+    _bench_write(b, String(FIXTURES, "big.parquet"), 1)
 
-    def call() raises {imm table}:
-        var opts = WriterOptions()
-        opts.codec = CompressionCodec.UNCOMPRESSED.value
-        var w = ParquetWriter[DefaultCodecs](opts^)
-        for batch in table.batches:
-            w.write_batch(batch.arena, batch.roots)
-        keep(w^.finish())
 
-    b.iter(call)
-    keep(table)
-    keep(data)
+# The same writes with the pages of each row group encoded on four threads
+# (`WriterOptions.num_workers`); the bytes are the ones the serial runs write.
+
+
+def bench_write_wide_w4(mut b: Benchmark) raises:
+    _bench_write(b, WIDE, 4)
+
+
+def bench_write_big_w4(mut b: Benchmark) raises:
+    _bench_write(b, String(FIXTURES, "big.parquet"), 4)
 
 
 def _print_shape() raises:
@@ -277,7 +278,7 @@ def _print_shape() raises:
         String(FIXTURES, "v2pages.parquet"),
         String(WIDE),
     ]
-    print("parquet.mojo benchmarks (the `_wN` ladders use N reader threads)")
+    print("parquet.mojo benchmarks (the `_wN` ladders use N threads)")
     for i in range(len(names)):
         # A missing file is reported, not raised: the wide fixture is
         # generated rather than committed, and `--skip bench_read_wide
