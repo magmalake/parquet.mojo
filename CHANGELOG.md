@@ -10,6 +10,10 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-04
+
+Released together with parquet-full-mojo 0.1.9, from the same commit.
+
 ### Added
 
 - A streaming writer (magmalake/parquet.mojo#58). `ParquetWriter` holds
