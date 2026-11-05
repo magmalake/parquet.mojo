@@ -18,6 +18,23 @@ for b in t.batches:
 var bytes = w^.finish()
 ```
 
+A file does not have to be held whole: `write_batch_to` hands each row group to
+a `ByteSink` as soon as it is encoded, and `finish_to` writes the page indexes
+and footer and returns the `FileMetaData` it wrote, so the caller has every
+chunk's sizes and statistics without reading the file back.
+
+```mojo
+var sink = FileSink("out.parquet")
+var w = ParquetWriter(WriterOptions())
+for b in t.batches:
+    w.write_batch_to(b.arena, b.roots, sink)
+var written = w^.finish_to(sink)   # written.metadata, written.file_size
+sink.close()
+```
+
+`WriterOptions.num_workers` encodes the pages of a row group on that many
+threads; the bytes are the same at any setting.
+
 What it writes: Parquet 2.6 metadata with v1 data pages, `PLAIN` and
 `RLE_DICTIONARY` values, `RLE` levels, three-level lists, `key_value` maps,
 structs, field ids, per-chunk statistics with the sort order each logical type
@@ -74,6 +91,7 @@ from parquet.rle_encode import encode_hybrid, encode_levels, write_uleb128
 from parquet.stats import compare_bytes
 from std.memory import bitcast
 from std.sys import size_of
+from threads import num_cpus, parallel_for
 from thrift import (
     BoundaryOrder,
     ColumnChunk,
@@ -135,6 +153,15 @@ struct WriterOptions(Copyable, Defaultable, Movable):
     var write_statistics: Bool
     var write_page_index: Bool
     var created_by: String
+    var num_workers: Int
+    """Threads that encode a row group: `1` (the default) encodes on the
+    calling thread, `0` means one per core.
+
+    One budget, as on the reader: a row group is encoded in two fan-outs one
+    after the other — the per-column plan, then every page of every column —
+    each a single `parallel_for` of at most this many threads, never one
+    nested in another. The output is byte-identical at every setting.
+    """
 
     def __init__(out self):
         self.codec = CompressionCodec.SNAPPY.value
@@ -144,6 +171,7 @@ struct WriterOptions(Copyable, Defaultable, Movable):
         self.write_statistics = True
         self.write_page_index = True
         self.created_by = String(CREATED_BY)
+        self.num_workers = 1
 
     def __init__(out self, *, copy: Self):
         self.codec = copy.codec
@@ -153,6 +181,7 @@ struct WriterOptions(Copyable, Defaultable, Movable):
         self.write_statistics = copy.write_statistics
         self.write_page_index = copy.write_page_index
         self.created_by = copy.created_by.copy()
+        self.num_workers = copy.num_workers
 
     def __init__(out self, *, deinit move: Self):
         self.codec = move.codec
@@ -162,6 +191,7 @@ struct WriterOptions(Copyable, Defaultable, Movable):
         self.write_statistics = move.write_statistics
         self.write_page_index = move.write_page_index
         self.created_by = move.created_by^
+        self.num_workers = move.num_workers
 
 
 struct WNode(Copyable, Defaultable, Movable):
@@ -731,6 +761,15 @@ def shred_flat(
     if var_len:
         var off = a.offsets.unsafe_ptr()
         var vbase = len(cols[leaf_i].values.bytes)
+        # Size both buffers once. The run's bytes are an upper bound on what
+        # its present values hold, and growing a 180 MB column by doubling
+        # would have the old and the new buffer alive at once.
+        cols[leaf_i].values.bytes.reserve(
+            vbase + Int(off.unsafe_load(r1)) - Int(off.unsafe_load(r0))
+        )
+        cols[leaf_i].values.offsets.reserve(
+            len(cols[leaf_i].values.offsets) + present
+        )
         if present == n:
             var lo = Int(off.unsafe_load(r0))
             var hi = Int(off.unsafe_load(r1))
@@ -1360,16 +1399,534 @@ struct DictBuilder(Defaultable, Movable):
         return idx
 
 
+# ── where the bytes go ─────────────────────────────────────────────────────
+
+
+trait ByteSink:
+    """Somewhere a `ParquetWriter` can hand finished bytes to, in file order.
+
+    The writer never seeks: every call appends to what the previous call
+    wrote, so a file, a socket, a multipart upload or a `List` all fit.
+    """
+
+    def write_bytes(mut self, data: Span[UInt8, _]) raises:
+        """Append `data` to the output."""
+        ...
+
+
+struct ListSink(ByteSink, Defaultable, Movable):
+    """Collects the output in memory. What `ParquetWriter.finish` uses."""
+
+    var bytes: List[UInt8]
+
+    def __init__(out self):
+        self.bytes = List[UInt8]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.bytes = move.bytes^
+
+    def write_bytes(mut self, data: Span[UInt8, _]) raises:
+        self.bytes.extend(data)
+
+
+struct FileSink(ByteSink, Movable):
+    """Writes the output to a local file as it is produced."""
+
+    var handle: FileHandle
+
+    def __init__(out self, path: StringSlice) raises:
+        self.handle = open(String(path), "w")
+
+    def __init__(out self, *, deinit move: Self):
+        self.handle = move.handle^
+
+    def write_bytes(mut self, data: Span[UInt8, _]) raises:
+        self.handle.write_bytes(data)
+
+    def close(mut self) raises:
+        self.handle.close()
+
+
+struct WrittenFile(Movable):
+    """What `ParquetWriter.finish_to` wrote: the footer and the file's size.
+
+    `metadata` is the `FileMetaData` the footer was serialised from — row
+    counts, every column chunk's sizes, value counts, statistics and page
+    offsets — so a caller that needs them (an Iceberg `data_file`, say) can
+    take them from here rather than parsing the bytes it just wrote.
+    """
+
+    var metadata: FileMetaData
+    var file_size: Int
+
+    def __init__(out self, var metadata: FileMetaData, file_size: Int):
+        self.metadata = metadata^
+        self.file_size = file_size
+
+    def __init__(out self, *, deinit move: Self):
+        self.metadata = move.metadata^
+        self.file_size = move.file_size
+
+
+# ── encoding a row group: plan, pages, assembly ────────────────────────────
+#
+# A column chunk is encoded in three steps, and the split is what lets the
+# work run on several threads without changing a byte of the output:
+#
+#   1. *plan* (`_plan_chunk`, one per leaf): build the dictionary or give up on
+#      it, and decide where every data page starts and ends. Everything that
+#      depends on what came before in the chunk is decided here.
+#   2. *pages* (`_encode_page`, one per page, and one for the dictionary): the
+#      levels and values of one page, compressed, behind their header, plus
+#      that page's bounds. A page reads only its own slice of the leaf and the
+#      plan, so pages are independent of each other and of other leaves.
+#   3. *assembly* (`ParquetWriter._assemble_chunk`, serial, in file order): lay
+#      the pages end to end, give each its offset, and fold the page bounds
+#      into the chunk's statistics in page order.
+#
+# With `num_workers = 1` the first two steps are plain loops on the calling
+# thread; with more, each is one `parallel_for` over the same task list. The
+# functions are the same and so are their inputs, and assembly does not
+# depend on which worker finished first — which is the whole argument for the
+# threaded output being byte-identical to the serial one, and
+# `test_parallel_write_is_byte_identical` checks it.
+
+
+struct _PagePlan(Copyable, Defaultable, Movable):
+    """One data page: which slots, which values, and its first row."""
+
+    var s0: Int
+    var s1: Int
+    var v0: Int
+    """The first value (not slot) of the page."""
+    var nv: Int
+    """How many values (non-null slots at the leaf's max definition level)."""
+    var first_row: Int64
+
+    def __init__(out self):
+        self.s0 = 0
+        self.s1 = 0
+        self.v0 = 0
+        self.nv = 0
+        self.first_row = 0
+
+    def __init__(out self, *, copy: Self):
+        self.s0 = copy.s0
+        self.s1 = copy.s1
+        self.v0 = copy.v0
+        self.nv = copy.nv
+        self.first_row = copy.first_row
+
+    def __init__(out self, *, deinit move: Self):
+        self.s0 = move.s0
+        self.s1 = move.s1
+        self.v0 = move.v0
+        self.nv = move.nv
+        self.first_row = move.first_row
+
+
+struct _ChunkPlan(Defaultable, Movable):
+    """Step 1's answer for one leaf."""
+
+    var use_dict: Bool
+    var indices: List[UInt16]
+    var dict: PhysBuffer
+    var pages: List[_PagePlan]
+
+    def __init__(out self):
+        self.use_dict = False
+        self.indices = List[UInt16]()
+        self.dict = PhysBuffer()
+        self.pages = List[_PagePlan]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.use_dict = move.use_dict
+        self.indices = move.indices^
+        self.dict = move.dict^
+        self.pages = move.pages^
+
+
+struct _EncodedPage(Defaultable, Movable):
+    """Step 2's answer for one page: its header and its compressed body,
+    kept apart so that neither is copied before it reaches the sink."""
+
+    var header: List[UInt8]
+    var body: List[UInt8]
+    var uncompressed: Int
+    """The body's size before compression, header excluded."""
+    var lo: List[UInt8]
+    var hi: List[UInt8]
+    var has_bounds: Bool
+
+    def __init__(out self):
+        self.header = List[UInt8]()
+        self.body = List[UInt8]()
+        self.uncompressed = 0
+        self.lo = List[UInt8]()
+        self.hi = List[UInt8]()
+        self.has_bounds = False
+
+    def __init__(out self, *, deinit move: Self):
+        self.header = move.header^
+        self.body = move.body^
+        self.uncompressed = move.uncompressed
+        self.lo = move.lo^
+        self.hi = move.hi^
+        self.has_bounds = move.has_bounds
+
+    def size(self) -> Int:
+        """Header and body: the page's `compressed_page_size` in an index."""
+        return len(self.header) + len(self.body)
+
+    def set(mut self, var header: PageHeader, var body: List[UInt8]) raises:
+        var w = TCompactProtocolWriter()
+        header.write(w)
+        self.header = w^.take()
+        # A codec sizes its output for the worst case and gives back a list
+        # that still owns all of it — zstd.mojo zero-fills `ZSTD_compressBound`
+        # bytes, so the slack is resident, not just reserved. A row group's
+        # pages all wait for assembly, so keeping that slack would hold about
+        # the uncompressed size of the row group again; keep the bytes only.
+        if body.capacity() > len(body) + len(body) // 8 + 4096:
+            var tight = List[UInt8](capacity=len(body))
+            tight.extend(Span(body))
+            self.body = tight^
+        else:
+            self.body = body^
+
+
+@always_inline
+def _present(leaf: WLeaf, buf: LeafBuffer, slot: Int) -> Bool:
+    """Does `slot` carry a value, rather than a null or an empty list?"""
+    return leaf.max_def == 0 or Int(buf.defs[slot]) == leaf.max_def
+
+
+def _plan_chunk(
+    leaf: WLeaf, buf: LeafBuffer, options: WriterOptions
+) raises -> _ChunkPlan:
+    """Step 1: the dictionary, if it pays for itself, and the page breaks."""
+    var plan = _ChunkPlan()
+    var n_slots = len(buf.defs)
+    var n_values = buf.values.count
+
+    # Dictionary, if it pays for itself. The build stops at
+    # `dict_value_cap` distinct values — the point where a dictionary is no
+    # longer smaller than PLAIN — rather than indexing half the chunk and
+    # throwing the answer away.
+    var use_dict = (
+        options.use_dictionary and buf.values.kind != PK_BOOL and n_values > 0
+    )
+    if use_dict:
+        var cap = dict_value_cap(n_values)
+        var builder = DictBuilder(buf.values.kind, buf.values.width, cap)
+        plan.indices.resize(n_values, 0)
+        var out_idx = plan.indices.unsafe_ptr()
+        var kw = builder.key_width
+        var src = buf.values.bytes.unsafe_ptr()
+        for i in range(n_values):
+            var k: Int
+            if kw == 8:
+                k = builder.index_of_key(
+                    src.unsafe_offset(i * 8)
+                    .unsafe_bitcast[UInt64]()
+                    .unsafe_load[alignment=1](0)
+                )
+            elif kw == 4:
+                k = builder.index_of_key(
+                    UInt64(
+                        src.unsafe_offset(i * 4)
+                        .unsafe_bitcast[UInt32]()
+                        .unsafe_load[alignment=1](0)
+                    )
+                )
+            else:
+                k = builder.index_of(buf.values.value_span(i))
+            if k > cap:
+                use_dict = False
+                break
+            out_idx.unsafe_store(i, UInt16(k))
+        if use_dict:
+            swap(plan.dict, builder.values)
+        else:
+            plan.indices = List[UInt16]()
+    plan.use_dict = use_dict
+
+    # Data pages, split at record boundaries by target page size. A flat
+    # column has one slot per record, so its record starts are the slot
+    # numbers and the list never has to be built.
+    #
+    # A slot is costed at the type's width (8 when it has none), except in a
+    # `BYTE_ARRAY` chunk written `PLAIN`, where it is costed at what PLAIN
+    # actually writes for it: four length bytes and the value. Without that,
+    # a column of 3 KB strings was costed at 8 bytes a value and came out as
+    # one page of the whole chunk — 180 MB in one page for a JSON column —
+    # which no reader can skip into and no writer can compress in parallel.
+    var flat = leaf.max_rep == 0
+    var starts = List[Int]()
+    var n_records = n_slots
+    if not flat:
+        for i in range(n_slots):
+            if buf.reps[i] == 0:
+                starts.append(i)
+        starts.append(n_slots)
+        n_records = len(starts) - 1
+    var value_width = leaf.type_length if leaf.type_length > 0 else 8
+    var by_bytes = buf.values.kind == PK_VAR and not use_dict
+    var off = buf.values.offsets.unsafe_ptr()
+    var rec = 0
+    var first_row: Int64 = 0
+    var value_cursor = 0
+    var cost_cursor = 0
+    # `cost_cursor` is the next value the `by_bytes` costing has not counted.
+    while rec < n_records:
+        var rec_end = rec
+        var bytes_so_far = 0
+        while rec_end < n_records:
+            var a = rec_end if flat else starts[rec_end]
+            var b = rec_end + 1 if flat else starts[rec_end + 1]
+            if by_bytes:
+                for s in range(a, b):
+                    if _present(leaf, buf, s):
+                        bytes_so_far += (
+                            4
+                            + Int(off.unsafe_load(cost_cursor + 1))
+                            - Int(off.unsafe_load(cost_cursor))
+                        )
+                        cost_cursor += 1
+            else:
+                bytes_so_far += (b - a) * value_width
+            rec_end += 1
+            if bytes_so_far >= options.data_page_size:
+                break
+        var p = _PagePlan()
+        p.s0 = rec if flat else starts[rec]
+        p.s1 = rec_end if flat else starts[rec_end]
+        p.v0 = value_cursor
+        p.nv = p.s1 - p.s0
+        if leaf.max_def > 0:
+            p.nv = 0
+            var dp = buf.defs.unsafe_ptr()
+            for i in range(p.s0, p.s1):
+                if Int(dp.unsafe_load(i)) == leaf.max_def:
+                    p.nv += 1
+        p.first_row = first_row
+        value_cursor += p.nv
+        first_row += Int64(rec_end - rec)
+        rec = rec_end
+        plan.pages.append(p^)
+    return plan^
+
+
+def _encode_dict_page[
+    Codecs: CodecSet
+](leaf: WLeaf, plan: _ChunkPlan, options: WriterOptions) raises -> _EncodedPage:
+    """Step 2 for the dictionary page."""
+    var out = _EncodedPage()
+    var body = _plain_bytes(leaf, plan.dict)
+    var compressed = Codecs.compress(options.codec, Span(body))
+    var ph = PageHeader()
+    ph.type_ = PageType.DICTIONARY_PAGE
+    ph.uncompressed_page_size = Int32(len(body))
+    ph.compressed_page_size = Int32(len(compressed))
+    var dh = DictionaryPageHeader()
+    dh.num_values = Int32(plan.dict.count)
+    dh.encoding = Encoding.PLAIN
+    ph.dictionary_page_header = dh^
+    out.set(ph^, compressed^)
+    out.uncompressed = len(body)
+    return out^
+
+
+def _encode_page[
+    Codecs: CodecSet
+](
+    leaf: WLeaf,
+    buf: LeafBuffer,
+    plan: _ChunkPlan,
+    page: Int,
+    options: WriterOptions,
+) raises -> _EncodedPage:
+    """Step 2 for one data page: levels, values, compression, bounds."""
+    ref p = plan.pages[page]
+    var out = _EncodedPage()
+    var body = List[UInt8]()
+    if leaf.max_rep > 0:
+        body.extend(
+            Span(
+                encode_levels(
+                    Span(buf.reps)[p.s0 : p.s1], _bit_width(leaf.max_rep)
+                )
+            )
+        )
+    if leaf.max_def > 0:
+        body.extend(
+            Span(
+                encode_levels(
+                    Span(buf.defs)[p.s0 : p.s1], _bit_width(leaf.max_def)
+                )
+            )
+        )
+    if plan.use_dict:
+        var width = _bit_width(plan.dict.count - 1)
+        body.append(UInt8(width))
+        body.extend(
+            Span(encode_hybrid(Span(plan.indices)[p.v0 : p.v0 + p.nv], width))
+        )
+    else:
+        _plain_into(body, leaf, buf.values, p.v0, p.nv)
+    var compressed = Codecs.compress(options.codec, Span(body))
+    var ph = PageHeader()
+    ph.type_ = PageType.DATA_PAGE
+    ph.uncompressed_page_size = Int32(len(body))
+    ph.compressed_page_size = Int32(len(compressed))
+    var dph = DataPageHeader()
+    dph.num_values = Int32(p.s1 - p.s0)
+    dph.encoding = Encoding(
+        Encoding.RLE_DICTIONARY.value if plan.use_dict else Encoding.PLAIN.value
+    )
+    dph.definition_level_encoding = Encoding.RLE
+    dph.repetition_level_encoding = Encoding.RLE
+    ph.data_page_header = dph^
+    out.set(ph^, compressed^)
+    out.uncompressed = len(body)
+    if options.write_statistics or options.write_page_index:
+        var bounds = min_max(leaf, buf.values, p.v0, p.nv)
+        out.lo = bounds[0].copy()
+        out.hi = bounds[1].copy()
+        out.has_bounds = bounds[2]
+    return out^
+
+
+struct _EncodeCtx(Movable):
+    """Everything steps 1 and 2 of one row group read, and where they write.
+
+    Task `k` of step 1 writes `plans[k]`; task `k` of step 2 writes
+    `pages[k]`. No two tasks share an output slot, and what they read — the
+    leaves, the shredded buffers, the plans once step 1 has joined — is not
+    written while they run. A task cannot raise across a thread, so a failure
+    lands in its own error cell and is re-raised in task order after the
+    join, which makes the error a bad batch gives independent of the worker
+    count.
+    """
+
+    var leaves: List[WLeaf]
+    var bufs: List[LeafBuffer]
+    var options: WriterOptions
+    var plans: List[_ChunkPlan]
+    var plan_errors: List[String]
+    var task_leaf: List[Int]
+    var task_page: List[Int]
+    """`-1` for a leaf's dictionary page."""
+    var leaf_first_task: List[Int]
+    """Where each leaf's pages start in the step 2 lists; one past the end at
+    `len(leaves)`."""
+    var pages: List[_EncodedPage]
+    var page_errors: List[String]
+
+    def __init__(
+        out self,
+        var leaves: List[WLeaf],
+        var bufs: List[LeafBuffer],
+        var options: WriterOptions,
+    ):
+        var n = len(leaves)
+        self.leaves = leaves^
+        self.bufs = bufs^
+        self.options = options^
+        self.plans = List[_ChunkPlan]()
+        for _ in range(n):
+            self.plans.append(_ChunkPlan())
+        self.plan_errors = List[String](length=n, fill=String())
+        self.task_leaf = List[Int]()
+        self.task_page = List[Int]()
+        self.leaf_first_task = List[Int]()
+        self.pages = List[_EncodedPage]()
+        self.page_errors = List[String]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.leaves = move.leaves^
+        self.bufs = move.bufs^
+        self.options = move.options^
+        self.plans = move.plans^
+        self.plan_errors = move.plan_errors^
+        self.task_leaf = move.task_leaf^
+        self.task_page = move.task_page^
+        self.leaf_first_task = move.leaf_first_task^
+        self.pages = move.pages^
+        self.page_errors = move.page_errors^
+
+    def queue_pages(mut self):
+        """Lay out step 2's tasks from step 1's plans: leaf-major, each
+        leaf's dictionary first and then its pages, which is file order."""
+        for i in range(len(self.leaves)):
+            self.leaf_first_task.append(len(self.task_leaf))
+            if self.plans[i].use_dict:
+                self.task_leaf.append(i)
+                self.task_page.append(-1)
+            for p in range(len(self.plans[i].pages)):
+                self.task_leaf.append(i)
+                self.task_page.append(p)
+        self.leaf_first_task.append(len(self.task_leaf))
+        var n = len(self.task_leaf)
+        for _ in range(n):
+            self.pages.append(_EncodedPage())
+        self.page_errors = List[String](length=n, fill=String())
+
+
+def _plan_task(k: Int, mut ctx: _EncodeCtx) -> None:
+    try:
+        ctx.plans[k] = _plan_chunk(ctx.leaves[k], ctx.bufs[k], ctx.options)
+    except e:
+        ctx.plan_errors[k] = String(e)
+
+
+def _page_task[Codecs: CodecSet](k: Int, mut ctx: _EncodeCtx) -> None:
+    var leaf = ctx.task_leaf[k]
+    var page = ctx.task_page[k]
+    try:
+        if page < 0:
+            ctx.pages[k] = _encode_dict_page[Codecs](
+                ctx.leaves[leaf], ctx.plans[leaf], ctx.options
+            )
+        else:
+            ctx.pages[k] = _encode_page[Codecs](
+                ctx.leaves[leaf],
+                ctx.bufs[leaf],
+                ctx.plans[leaf],
+                page,
+                ctx.options,
+            )
+    except e:
+        ctx.page_errors[k] = String(e)
+
+
+def _first_error(errors: List[String]) raises:
+    for k in range(len(errors)):
+        if errors[k]:
+            raise Error(errors[k])
+
+
 # ── the writer ─────────────────────────────────────────────────────────────
 
 
 struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
     """Writes Arrow arrays out as Parquet. One `write_batch` per record batch.
+
+    Finished row groups wait in the writer until they are handed to a
+    `ByteSink`: `flush_to` hands over what is ready, `write_batch_to` does it
+    after every row group, and `finish_to` writes the rest and the footer.
+    `finish` is the in-memory spelling of the same thing. A writer that is
+    flushed as it goes holds at most one row group's encoded bytes, rather
+    than the whole file.
     """
 
     var options: WriterOptions
     var schema: WriteSchema
-    var out: List[UInt8]
+    var pending: List[List[UInt8]]
+    """Encoded bytes not yet handed to a sink, in file order."""
+    var pending_bytes: Int
+    var flushed: Int
+    """Bytes already handed to a sink. With `pending_bytes`, the position."""
     var row_groups: List[RowGroup]
     var offset_indexes: List[List[OffsetIndex]]
     var column_indexes: List[List[ColumnIndex]]
@@ -1380,7 +1937,9 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
     def __init__(out self, var options: WriterOptions):
         self.options = options^
         self.schema = WriteSchema()
-        self.out = List[UInt8]()
+        self.pending = List[List[UInt8]]()
+        self.pending_bytes = 0
+        self.flushed = 0
         self.row_groups = List[RowGroup]()
         self.offset_indexes = List[List[OffsetIndex]]()
         self.column_indexes = List[List[ColumnIndex]]()
@@ -1391,7 +1950,9 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
     def __init__(out self, *, deinit move: Self):
         self.options = move.options^
         self.schema = move.schema^
-        self.out = move.out^
+        self.pending = move.pending^
+        self.pending_bytes = move.pending_bytes
+        self.flushed = move.flushed
         self.row_groups = move.row_groups^
         self.offset_indexes = move.offset_indexes^
         self.column_indexes = move.column_indexes^
@@ -1405,13 +1966,49 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         e.value = String(value)
         self.kv.append(e^)
 
-    def write_batch(mut self, arena: ArrayArena, roots: List[Int]) raises:
-        """Write one record batch, split into row groups of `row_group_size`."""
+    def position(self) -> Int:
+        """Bytes of the file produced so far, flushed or not."""
+        return self.flushed + self.pending_bytes
+
+    def _push(mut self, var bytes: List[UInt8]):
+        self.pending_bytes += len(bytes)
+        self.pending.append(bytes^)
+
+    def _push_page(mut self, mut page: _EncodedPage):
+        """Queue a page's header and body, moving rather than copying them."""
+        var header = List[UInt8]()
+        var body = List[UInt8]()
+        swap(header, page.header)
+        swap(body, page.body)
+        self._push(header^)
+        self._push(body^)
+
+    def _resolved_workers(self) -> Int:
+        """`num_workers` with `0` spelt out as the core count."""
+        var w = self.options.num_workers
+        if w == 0:
+            w = num_cpus()
+        if w < 1:
+            w = 1
+        return w
+
+    def flush_to[S: ByteSink](mut self, mut sink: S) raises:
+        """Hand every finished byte to `sink` and stop holding it."""
+        for k in range(len(self.pending)):
+            sink.write_bytes(Span(self.pending[k]))
+        self.flushed += self.pending_bytes
+        self.pending = List[List[UInt8]]()
+        self.pending_bytes = 0
+
+    def _start(mut self, arena: ArrayArena, roots: List[Int]) raises -> Int:
+        """Check the batch, start the file on the first one; its row count."""
         if len(roots) == 0:
             raise Error("parquet.writer: a batch needs at least one column")
         if not self._started:
             self.schema = build_write_schema(arena, roots)
-            self.out.extend(StringSlice("PAR1").as_bytes())
+            var magic = List[UInt8]()
+            magic.extend(StringSlice("PAR1").as_bytes())
+            self._push(magic^)
             self._started = True
         var rows = arena.nodes[roots[0]].length
         for r in roots:
@@ -1426,6 +2023,15 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
                         rows,
                     )
                 )
+        return rows
+
+    def write_batch(mut self, arena: ArrayArena, roots: List[Int]) raises:
+        """Write one record batch, split into row groups of `row_group_size`.
+
+        The encoded row groups stay in the writer until `flush_to`,
+        `finish_to` or `finish`; `write_batch_to` flushes as it goes.
+        """
+        var rows = self._start(arena, roots)
         if rows == 0:
             # Still emit one (empty) row group, so the file keeps its columns.
             self._write_row_group(arena, roots, 0, 0)
@@ -1436,6 +2042,25 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
             if end > rows:
                 end = rows
             self._write_row_group(arena, roots, start, end)
+            start = end
+
+    def write_batch_to[
+        S: ByteSink
+    ](mut self, arena: ArrayArena, roots: List[Int], mut sink: S) raises:
+        """`write_batch`, handing each row group to `sink` as soon as it is
+        encoded, so the writer never holds more than one of them."""
+        var rows = self._start(arena, roots)
+        if rows == 0:
+            self._write_row_group(arena, roots, 0, 0)
+            self.flush_to(sink)
+            return
+        var start = 0
+        while start < rows:
+            var end = start + self.options.row_group_size
+            if end > rows:
+                end = rows
+            self._write_row_group(arena, roots, start, end)
+            self.flush_to(sink)
             start = end
 
     def _write_row_group(
@@ -1469,17 +2094,43 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
                     0,
                     cols,
                 )
+
+        # Steps 1 and 2, each a loop here or one fan-out across threads.
+        var ctx = _EncodeCtx(
+            self.schema.leaves.copy(), cols^, self.options.copy()
+        )
+        var workers = self._resolved_workers()
+        if workers == 1:
+            for k in range(n_leaves):
+                _plan_task(k, ctx)
+        else:
+            parallel_for[_plan_task](n_leaves, ctx, num_workers=workers)
+        _first_error(ctx.plan_errors)
+        ctx.queue_pages()
+        var n_tasks = len(ctx.task_leaf)
+        if workers == 1:
+            for k in range(n_tasks):
+                _page_task[Self.Codecs](k, ctx)
+        else:
+            parallel_for[_page_task[Self.Codecs]](
+                n_tasks, ctx, num_workers=workers
+            )
+        _first_error(ctx.page_errors)
+        # The shredded values are not needed past here; let them go before
+        # the encoded pages are laid out.
+        ctx.bufs = List[LeafBuffer]()
+
+        # Step 3, in file order.
         var rg = RowGroup()
         rg.num_rows = Int64(r1 - r0)
-        rg.file_offset = Int64(len(self.out))
+        rg.file_offset = Int64(self.position())
         var total_size: Int64 = 0
         var offs = List[OffsetIndex]()
         var cidx = List[ColumnIndex]()
         for i in range(n_leaves):
-            var got = self._write_chunk(i, cols[i])
-            var chunk = got[0].copy()
-            total_size += chunk.meta_data.value().total_uncompressed_size
-            rg.columns.append(chunk^)
+            var got = self._assemble_chunk(i, ctx)
+            total_size += got[0].meta_data.value().total_uncompressed_size
+            rg.columns.append(got[0].copy())
             offs.append(got[1].copy())
             cidx.append(got[2].copy())
         rg.total_byte_size = total_size
@@ -1489,208 +2140,84 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         self.column_indexes.append(cidx^)
         self.num_rows += Int64(r1 - r0)
 
-    def _write_chunk(
-        mut self, leaf_index: Int, buf: LeafBuffer
+    def _assemble_chunk(
+        mut self, leaf_index: Int, mut ctx: _EncodeCtx
     ) raises -> Tuple[ColumnChunk, OffsetIndex, ColumnIndex]:
-        ref leaf = self.schema.leaves[leaf_index]
+        """Step 3 for one leaf: its pages end to end, and their metadata."""
+        ref leaf = ctx.leaves[leaf_index]
+        ref plan = ctx.plans[leaf_index]
         var codec = self.options.codec
-        var chunk_start = len(self.out)
-        var n_slots = len(buf.defs)
-        var n_values = buf.values.count
+        var chunk_start = self.position()
+        var n_slots = 0
+        var n_values = 0
+        for p in range(len(plan.pages)):
+            n_slots += plan.pages[p].s1 - plan.pages[p].s0
+            n_values += plan.pages[p].nv
         var null_count = n_slots - n_values
-        var want_bounds = (
-            self.options.write_statistics or self.options.write_page_index
-        )
-
-        # Dictionary, if it pays for itself. The build stops at
-        # `dict_value_cap` distinct values — the point where a dictionary is no
-        # longer smaller than PLAIN — rather than indexing half the chunk and
-        # throwing the answer away.
-        var use_dict = (
-            self.options.use_dictionary
-            and buf.values.kind != PK_BOOL
-            and n_values > 0
-        )
-        var indices = List[UInt16]()
-        var dict = PhysBuffer()
-        var dict_offset: Int64 = 0
-        var dict_uncompressed: Int64 = 0
-        var dict_compressed: Int64 = 0
-        if use_dict:
-            var cap = dict_value_cap(n_values)
-            var builder = DictBuilder(buf.values.kind, buf.values.width, cap)
-            indices.resize(n_values, 0)
-            var out_idx = indices.unsafe_ptr()
-            var kw = builder.key_width
-            var src = buf.values.bytes.unsafe_ptr()
-            for i in range(n_values):
-                var k: Int
-                if kw == 8:
-                    k = builder.index_of_key(
-                        src.unsafe_offset(i * 8)
-                        .unsafe_bitcast[UInt64]()
-                        .unsafe_load[alignment=1](0)
-                    )
-                elif kw == 4:
-                    k = builder.index_of_key(
-                        UInt64(
-                            src.unsafe_offset(i * 4)
-                            .unsafe_bitcast[UInt32]()
-                            .unsafe_load[alignment=1](0)
-                        )
-                    )
-                else:
-                    k = builder.index_of(buf.values.value_span(i))
-                if k > cap:
-                    use_dict = False
-                    break
-                out_idx.unsafe_store(i, UInt16(k))
-            if use_dict:
-                dict = builder.values.copy()
-            else:
-                indices.clear()
-        var encoding = (
-            Encoding.RLE_DICTIONARY.value if use_dict else Encoding.PLAIN.value
-        )
+        var task = ctx.leaf_first_task[leaf_index]
+        var stop = ctx.leaf_first_task[leaf_index + 1]
 
         var encodings = List[Encoding]()
         encodings.append(Encoding.RLE)
-        encodings.append(Encoding(encoding))
-        if use_dict:
+        encodings.append(
+            Encoding(
+                Encoding.RLE_DICTIONARY.value if plan.use_dict else Encoding.PLAIN.value
+            )
+        )
+        var dict_offset: Int64 = 0
+        var dict_uncompressed: Int64 = 0
+        var dict_compressed: Int64 = 0
+        if plan.use_dict:
             encodings.append(Encoding.PLAIN)
-            var body = _plain_bytes(leaf, dict)
-            dict_offset = Int64(len(self.out))
-            var compressed = Self.Codecs.compress(codec, Span(body))
-            var ph = PageHeader()
-            ph.type_ = PageType.DICTIONARY_PAGE
-            ph.uncompressed_page_size = Int32(len(body))
-            ph.compressed_page_size = Int32(len(compressed))
-            var dh = DictionaryPageHeader()
-            dh.num_values = Int32(dict.count)
-            dh.encoding = Encoding.PLAIN
-            ph.dictionary_page_header = dh^
-            var hlen = _write_page(self.out, ph^, Span(compressed))
-            dict_uncompressed = Int64(len(body))
-            dict_compressed = Int64(hlen + len(compressed))
+            dict_offset = Int64(self.position())
+            dict_uncompressed = Int64(ctx.pages[task].uncompressed)
+            dict_compressed = Int64(ctx.pages[task].size())
+            self._push_page(ctx.pages[task])
+            task += 1
 
-        # Data pages, split at record boundaries by target page size. A flat
-        # column has one slot per record, so its record starts are the slot
-        # numbers and the list never has to be built.
-        var data_offset = Int64(len(self.out))
-        var flat = leaf.max_rep == 0
-        var starts = List[Int]()
-        var n_records = n_slots
-        if not flat:
-            for i in range(n_slots):
-                if buf.reps[i] == 0:
-                    starts.append(i)
-            starts.append(n_slots)
-            n_records = len(starts) - 1
+        var data_offset = Int64(self.position())
         var oi = OffsetIndex()
         var ci = ColumnIndex()
         var page_nulls = List[Int64]()
         var total_uncompressed: Int64 = 0
         var total_compressed: Int64 = 0
-        var value_width = leaf.type_length if leaf.type_length > 0 else 8
-        var rec = 0
-        var first_row: Int64 = 0
-        var value_cursor = 0
-        var def_width = _bit_width(leaf.max_def)
-        var rep_width = _bit_width(leaf.max_rep)
         var chunk_lo = List[UInt8]()
         var chunk_hi = List[UInt8]()
         var have_chunk_bounds = False
-        while rec < n_records:
-            var rec_end = rec
-            var bytes_so_far = 0
-            while rec_end < n_records:
-                var slots = 1 if flat else starts[rec_end + 1] - starts[rec_end]
-                bytes_so_far += slots * value_width
-                rec_end += 1
-                if bytes_so_far >= self.options.data_page_size:
-                    break
-            var s0 = rec if flat else starts[rec]
-            var s1 = rec_end if flat else starts[rec_end]
-            var page_values = s1 - s0
-            if leaf.max_def > 0:
-                page_values = 0
-                var dp = buf.defs.unsafe_ptr()
-                for i in range(s0, s1):
-                    if Int(dp.unsafe_load(i)) == leaf.max_def:
-                        page_values += 1
-            var body = List[UInt8]()
-            if leaf.max_rep > 0:
-                body.extend(
-                    Span(encode_levels(Span(buf.reps)[s0:s1], rep_width))
-                )
-            if leaf.max_def > 0:
-                body.extend(
-                    Span(encode_levels(Span(buf.defs)[s0:s1], def_width))
-                )
-            if use_dict:
-                var width = _bit_width(dict.count - 1)
-                body.append(UInt8(width))
-                body.extend(
-                    Span(
-                        encode_hybrid(
-                            Span(indices)[
-                                value_cursor : value_cursor + page_values
-                            ],
-                            width,
-                        )
-                    )
-                )
-            else:
-                _plain_into(body, leaf, buf.values, value_cursor, page_values)
-            value_cursor += page_values
-            var compressed = Self.Codecs.compress(codec, Span(body))
-            var ph = PageHeader()
-            ph.type_ = PageType.DATA_PAGE
-            ph.uncompressed_page_size = Int32(len(body))
-            ph.compressed_page_size = Int32(len(compressed))
-            var dph = DataPageHeader()
-            dph.num_values = Int32(s1 - s0)
-            dph.encoding = Encoding(encoding)
-            dph.definition_level_encoding = Encoding.RLE
-            dph.repetition_level_encoding = Encoding.RLE
-            ph.data_page_header = dph^
-            var page_at = Int64(len(self.out))
-            var header_len = _write_page(self.out, ph^, Span(compressed))
+        var page = 0
+        while task < stop:
+            ref pp = plan.pages[page]
+            ref ep = ctx.pages[task]
             var loc = PageLocation()
-            loc.offset = page_at
-            loc.compressed_page_size = Int32(header_len + len(compressed))
-            loc.first_row_index = first_row
+            loc.offset = Int64(self.position())
+            loc.compressed_page_size = Int32(ep.size())
+            loc.first_row_index = pp.first_row
             oi.page_locations.append(loc^)
-            var has_bounds = False
-            var page_lo = List[UInt8]()
-            var page_hi = List[UInt8]()
-            if want_bounds:
-                var bounds = min_max(
-                    leaf, buf.values, value_cursor - page_values, page_values
-                )
-                page_lo = bounds[0].copy()
-                page_hi = bounds[1].copy()
-                has_bounds = bounds[2]
-                # The chunk's own bounds are the bounds of its pages, so the
-                # values are never scanned a second time.
-                if has_bounds:
-                    if not have_chunk_bounds:
-                        chunk_lo = page_lo.copy()
-                        chunk_hi = page_hi.copy()
-                        have_chunk_bounds = True
-                    else:
-                        if _stat_less(leaf, Span(page_lo), Span(chunk_lo)):
-                            chunk_lo = page_lo.copy()
-                        if _stat_less(leaf, Span(chunk_hi), Span(page_hi)):
-                            chunk_hi = page_hi.copy()
-            ci.null_pages.append(not has_bounds)
-            ci.min_values.append(page_lo^)
-            ci.max_values.append(page_hi^)
-            page_nulls.append(Int64(s1 - s0 - page_values))
-            total_uncompressed += Int64(len(body))
-            total_compressed += Int64(header_len + len(compressed))
-            first_row += Int64(rec_end - rec)
-            rec = rec_end
+            # The chunk's own bounds are the bounds of its pages, so the
+            # values are never scanned a second time.
+            if ep.has_bounds:
+                if not have_chunk_bounds:
+                    chunk_lo = ep.lo.copy()
+                    chunk_hi = ep.hi.copy()
+                    have_chunk_bounds = True
+                else:
+                    if _stat_less(leaf, Span(ep.lo), Span(chunk_lo)):
+                        chunk_lo = ep.lo.copy()
+                    if _stat_less(leaf, Span(chunk_hi), Span(ep.hi)):
+                        chunk_hi = ep.hi.copy()
+            ci.null_pages.append(not ep.has_bounds)
+            var lo = List[UInt8]()
+            var hi = List[UInt8]()
+            swap(lo, ep.lo)
+            swap(hi, ep.hi)
+            ci.min_values.append(lo^)
+            ci.max_values.append(hi^)
+            page_nulls.append(Int64(pp.s1 - pp.s0 - pp.nv))
+            total_uncompressed += Int64(ep.uncompressed)
+            total_compressed += Int64(ep.size())
+            self._push_page(ep)
+            task += 1
+            page += 1
         ci.boundary_order = BoundaryOrder.UNORDERED
         ci.null_counts = page_nulls^
 
@@ -1701,7 +2228,7 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         cm.codec = CompressionCodec(codec)
         cm.num_values = Int64(n_slots)
         cm.data_page_offset = data_offset
-        if use_dict:
+        if plan.use_dict:
             cm.dictionary_page_offset = dict_offset
             total_compressed += dict_compressed
             total_uncompressed += dict_uncompressed
@@ -1721,29 +2248,39 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         chunk.meta_data = cm^
         return (chunk^, oi^, ci^)
 
-    def finish(deinit self) raises -> List[UInt8]:
-        """Close the file and return its bytes."""
+    def finish_to[S: ByteSink](deinit self, mut sink: S) raises -> WrittenFile:
+        """Write what is left — row groups not yet flushed, the page indexes
+        and the footer — to `sink`, and return the footer that was written.
+        """
         if not self._started:
             raise Error("parquet.writer: nothing was written")
-        var out = self.out^
+        self.flush_to(sink)
+        var pos = self.flushed
         var groups = self.row_groups^
         if self.options.write_page_index:
+            var tail = List[UInt8]()
             for g in range(len(groups)):
                 for c in range(len(groups[g].columns)):
                     var w = TCompactProtocolWriter()
                     self.offset_indexes[g][c].write(w)
                     var body = w^.take()
-                    groups[g].columns[c].offset_index_offset = Int64(len(out))
+                    groups[g].columns[c].offset_index_offset = Int64(
+                        pos + len(tail)
+                    )
                     groups[g].columns[c].offset_index_length = Int32(len(body))
-                    out.extend(Span(body))
+                    tail.extend(Span(body))
             for g in range(len(groups)):
                 for c in range(len(groups[g].columns)):
                     var w = TCompactProtocolWriter()
                     self.column_indexes[g][c].write(w)
                     var body = w^.take()
-                    groups[g].columns[c].column_index_offset = Int64(len(out))
+                    groups[g].columns[c].column_index_offset = Int64(
+                        pos + len(tail)
+                    )
                     groups[g].columns[c].column_index_length = Int32(len(body))
-                    out.extend(Span(body))
+                    tail.extend(Span(body))
+            sink.write_bytes(Span(tail))
+            pos += len(tail)
         var meta = FileMetaData()
         meta.version = 2
         meta.schema = self.schema.elements.copy()
@@ -1752,9 +2289,20 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         meta.created_by = self.options.created_by.copy()
         if len(self.kv):
             meta.key_value_metadata = self.kv.copy()
-        var body = write_footer(meta)
-        out.extend(Span(body))
-        write_footer_trailer(out, len(body))
+        var footer = write_footer(meta)
+        var end = footer^
+        write_footer_trailer(end, len(end))
+        sink.write_bytes(Span(end))
+        pos += len(end)
+        return WrittenFile(meta^, pos)
+
+    def finish(deinit self) raises -> List[UInt8]:
+        """Close the file and return its bytes — those not already flushed."""
+        var sink = ListSink()
+        sink.bytes.reserve(self.pending_bytes + 4096)
+        _ = self^.finish_to(sink)
+        var out = List[UInt8]()
+        swap(out, sink.bytes)
         return out^
 
 
@@ -1765,18 +2313,6 @@ def _bit_width(max_value: Int) -> Int:
         w += 1
         v >>= 1
     return w
-
-
-def _write_page(
-    mut out: List[UInt8], var header: PageHeader, body: Span[UInt8, _]
-) raises -> Int:
-    """Append a page header and its body; return the header's byte length."""
-    var w = TCompactProtocolWriter()
-    header.write(w)
-    var hdr = w^.take()
-    out.extend(Span(hdr))
-    out.extend(body)
-    return len(hdr)
 
 
 def _plain_bytes(leaf: WLeaf, values: PhysBuffer) raises -> List[UInt8]:

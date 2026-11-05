@@ -29,6 +29,6 @@ jobs:
       contents: write
     with:
       args: >-
-        --skip bench_read_wide bench_write_wide
+        --skip bench_read_wide bench_write_wide bench_write_wide_w4
         bench_read_wide_w1 bench_read_wide_w2 bench_read_wide_w4
         bench_read_wide_w8 bench_read_wide_w10
