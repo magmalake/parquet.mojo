@@ -27,13 +27,12 @@ jobs:
   # release-check.yml in magmalake/.github).
   release:
     if: github.event_name == 'pull_request'
-    uses: magmalake/.github/.github/workflows/release-check.yml@release-check
+    uses: magmalake/.github/.github/workflows/release-check.yml@main
     permissions:
       contents: read
       pull-requests: read
     with:
       classify-only: true
-      tools-ref: "release-check"
 
   bench:
     needs: release
