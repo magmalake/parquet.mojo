@@ -28,18 +28,19 @@ jobs:
       contents: read
       pull-requests: read
     with:
-      # The unit tests run in the stable / ubuntu-latest job below.
+      # The test legs below are skipped on release PRs, and the consumer build
+      # is the check (the tests build against sibling checkouts of the other tins).
       task: ""
 
   test:
     needs: release
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.release.outputs.release_only != 'true' }}
     name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.release.outputs.release_only == 'true' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+        os: [ubuntu-latest, macos-latest]
         env: [default, stable]
     steps:
       # Sibling magmalake tins are consumed by source path (`-I ../x.mojo/src`),
