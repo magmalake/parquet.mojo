@@ -17,6 +17,7 @@ from parity import check_fixture, check_path, check_table
 from parquet import ParquetReader, ParquetWriter, WriterOptions
 from thrift import CompressionCodec
 from parquet_full import AllCodecs
+import zstd
 from std.testing import TestSuite, assert_equal, assert_true
 
 
@@ -67,6 +68,53 @@ def test_write_and_read_back_with_ffi_codecs() raises:
         var doc = load_oracle("tests/fixtures/nested.parquet.oracle.json")
         total += check_table(doc, t2, "nested", List[String]())
     assert_true(total > 100, String("only ", total, " values round-tripped"))
+
+
+def test_zstd_compression_level_is_honoured() raises:
+    """`compress_level` reaches libzstd: a higher level makes a smaller frame
+    of compressible data, every level decodes to the same bytes, and level 0 is
+    the plain `compress`."""
+    var data = List[UInt8]()
+    var x = UInt32(12345)
+    for _ in range(40000):
+        x = x * 1664525 + 1013904223
+        var word = Int((x >> 16) % 61)
+        for k in range(6):
+            data.append(UInt8(97 + (word + k) % 26))
+        data.append(UInt8(32))
+    var z = CompressionCodec.ZSTD.value
+    var fast = AllCodecs.compress_level(z, Span(data), 1)
+    var slow = AllCodecs.compress_level(z, Span(data), 19)
+    var dflt = AllCodecs.compress_level(z, Span(data), 0)
+    assert_true(len(slow) < len(fast), String(len(slow), " vs ", len(fast)))
+    assert_equal(len(dflt), len(AllCodecs.compress(z, Span(data))))
+    for frame in [fast.copy(), slow.copy(), dflt.copy()]:
+        var back = zstd.decompress(Span(frame))
+        assert_equal(len(back), len(data))
+        for i in range(0, len(data), 997):
+            assert_equal(Int(back[i]), Int(data[i]))
+
+
+def test_writer_compression_level_round_trips() raises:
+    """`WriterOptions.compression_level` changes the file and not the data."""
+    var sizes = List[Int]()
+    var total = 0
+    for level in [1, 19]:
+        var r = ParquetReader[AllCodecs].open("tests/fixtures/nested.parquet")
+        var t = r.read_table()
+        var opts = WriterOptions()
+        opts.codec = CompressionCodec.ZSTD.value
+        opts.compression_level = level
+        var w = ParquetWriter[AllCodecs](opts^)
+        for b in t.batches:
+            w.write_batch(b.arena, b.roots)
+        var bytes = w^.finish()
+        sizes.append(len(bytes))
+        var back = ParquetReader[AllCodecs](bytes^)
+        var doc = load_oracle("tests/fixtures/nested.parquet.oracle.json")
+        total += check_table(doc, back.read_table(), "nested", List[String]())
+    assert_true(total > 100, String("only ", total, " values round-tripped"))
+    assert_true(sizes[1] <= sizes[0], String(sizes[1], " vs ", sizes[0]))
 
 
 def test_iceberg_zstd_data_files() raises:
