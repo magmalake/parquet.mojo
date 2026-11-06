@@ -10,6 +10,14 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+### Added
+
+- `WriterOptions.compression_level`: the codec's compression level, `0` (the
+  default) meaning the codec's own. `parquet_full.AllCodecs` passes it to
+  ZSTD (1 to 22); other codecs ignore it. It reaches the codec through a new
+  `CodecSet.compress_level`, which has a default that calls `compress`, so an
+  existing `CodecSet` needs no change.
+
 ## [0.12.1] - 2026-11-05
 
 Released together with parquet-full-mojo 0.1.10, from the same commit.

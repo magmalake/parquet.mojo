@@ -120,6 +120,12 @@ struct AllCodecs(CodecSet):
 
     @staticmethod
     def compress(codec: Int32, data: Span[UInt8, _]) raises -> List[UInt8]:
+        return Self.compress_level(codec, data, 0)
+
+    @staticmethod
+    def compress_level(
+        codec: Int32, data: Span[UInt8, _], level: Int
+    ) raises -> List[UInt8]:
         match codec:
             case == CompressionCodec.UNCOMPRESSED.value:
                 return copy_of(data)
@@ -128,6 +134,8 @@ struct AllCodecs(CodecSet):
             case == CompressionCodec.GZIP.value:
                 return gzip_wrap(data)
             case == CompressionCodec.ZSTD.value:
+                if level > 0:
+                    return zstd.compress(data, level=level)
                 return zstd.compress(data)
             case == CompressionCodec.BROTLI.value:
                 # Quality 5, not libbrotli's default of 11: at 11 the encoder runs

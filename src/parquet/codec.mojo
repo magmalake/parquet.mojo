@@ -91,6 +91,16 @@ trait CodecSet:
         """Compress one page body. Used by `parquet.writer`."""
         ...
 
+    @staticmethod
+    def compress_level(
+        codec: Int32, data: Span[UInt8, _], level: Int
+    ) raises -> List[UInt8]:
+        """`compress` at an explicit compression level, which is what
+        `WriterOptions.compression_level` asks for. `0` means the codec's
+        default. A set that has no notion of levels needs nothing: this
+        default ignores `level` and calls `compress`."""
+        return Self.compress(codec, data)
+
 
 def copy_of(data: Span[UInt8, _]) -> List[UInt8]:
     var out = List[UInt8](capacity=len(data))

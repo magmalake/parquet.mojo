@@ -150,6 +150,11 @@ struct WriterOptions(Copyable, Defaultable, Movable):
     var data_page_size: Int
     """Target *uncompressed* bytes of values per data page."""
     var use_dictionary: Bool
+    var compression_level: Int
+    """The codec's compression level, where the codec has one (ZSTD: 1 to 22).
+    `0`, the default, is the codec's own default. A higher level is slower to
+    write and smaller; reading is unaffected. Ignored by codecs without
+    levels."""
     var write_statistics: Bool
     var write_page_index: Bool
     var created_by: String
@@ -168,6 +173,7 @@ struct WriterOptions(Copyable, Defaultable, Movable):
         self.row_group_size = 1 << 20
         self.data_page_size = 1 << 20
         self.use_dictionary = True
+        self.compression_level = 0
         self.write_statistics = True
         self.write_page_index = True
         self.created_by = String(CREATED_BY)
@@ -178,6 +184,7 @@ struct WriterOptions(Copyable, Defaultable, Movable):
         self.row_group_size = copy.row_group_size
         self.data_page_size = copy.data_page_size
         self.use_dictionary = copy.use_dictionary
+        self.compression_level = copy.compression_level
         self.write_statistics = copy.write_statistics
         self.write_page_index = copy.write_page_index
         self.created_by = copy.created_by.copy()
@@ -188,6 +195,7 @@ struct WriterOptions(Copyable, Defaultable, Movable):
         self.row_group_size = move.row_group_size
         self.data_page_size = move.data_page_size
         self.use_dictionary = move.use_dictionary
+        self.compression_level = move.compression_level
         self.write_statistics = move.write_statistics
         self.write_page_index = move.write_page_index
         self.created_by = move.created_by^
@@ -1723,7 +1731,9 @@ def _encode_dict_page[
     """Step 2 for the dictionary page."""
     var out = _EncodedPage()
     var body = _plain_bytes(leaf, plan.dict)
-    var compressed = Codecs.compress(options.codec, Span(body))
+    var compressed = Codecs.compress_level(
+        options.codec, Span(body), options.compression_level
+    )
     var ph = PageHeader()
     ph.type_ = PageType.DICTIONARY_PAGE
     ph.uncompressed_page_size = Int32(len(body))
@@ -1774,7 +1784,9 @@ def _encode_page[
         )
     else:
         _plain_into(body, leaf, buf.values, p.v0, p.nv)
-    var compressed = Codecs.compress(options.codec, Span(body))
+    var compressed = Codecs.compress_level(
+        options.codec, Span(body), options.compression_level
+    )
     var ph = PageHeader()
     ph.type_ = PageType.DATA_PAGE
     ph.uncompressed_page_size = Int32(len(body))
