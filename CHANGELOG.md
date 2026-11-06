@@ -10,6 +10,8 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-06
+
 ### Added
 
 - `WriterOptions.compression_level`: the codec's compression level, `0` (the
