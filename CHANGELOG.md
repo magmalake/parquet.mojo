@@ -10,6 +10,8 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-14
+
 ### Changed
 
 - **arrow-mlake-mojo 0.3.0.** `ImportedArray.into_batch`/`into_arena` (re-exported
