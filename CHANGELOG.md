@@ -10,6 +10,12 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+### Changed
+
+- **arrow-mlake-mojo 0.3.0.** `ImportedArray.into_batch`/`into_arena` (re-exported
+  here) now consume the array and import without copying; imported arrays are
+  read-only. Exports carry `PARQUET:field_id`. See arrow-mlake's README.
+
 ## [0.13.0] - 2026-11-06
 
 ### Added

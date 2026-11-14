@@ -79,10 +79,8 @@ def assert_same_array(
 ) raises:
     """Two array trees, compared on everything the C interface carries.
 
-    `field_id` is deliberately not compared: the export writes no
-    `PARQUET:field_id` metadata, so a round trip through our own exporter
-    drops it. The importer reads the key when a foreign producer writes it,
-    which is asserted separately.
+    `field_id` is not compared: arrow-mlake's own tests cover the
+    `PARQUET:field_id` round trip.
     """
     var stack_l: List[Int] = [lroot]
     var stack_r: List[Int] = [rroot]
