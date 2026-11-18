@@ -11,7 +11,7 @@ $ parquet-mojo cat tests/fixtures/nested.parquet --json --limit 2
 from parquet import ParquetReader, ParquetSchema
 from parquet.display import json_escape, value_json, value_text
 from std.sys import argv
-from thrift import CompressionCodec, Encoding, Type
+from thrift import Type
 
 comptime USAGE = """usage: parquet-mojo <command> [options] <file.parquet>
 

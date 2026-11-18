@@ -4,7 +4,7 @@ from avro.json import JsonDoc
 from hashes import crc32
 from oracle import canon_value, load_oracle, match_value
 from parquet import CodecSet, ParquetReader, Table
-from std.testing import assert_equal, assert_true
+from std.testing import assert_equal
 
 
 def _column_index(t: Table, name: StringSlice) -> Int:

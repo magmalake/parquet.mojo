@@ -87,7 +87,7 @@ from parquet.encoding import (
     physical_kind,
     physical_width,
 )
-from parquet.rle_encode import encode_hybrid, encode_levels, write_uleb128
+from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.stats import compare_bytes
 from std.memory import bitcast
 from std.sys import size_of

@@ -66,7 +66,6 @@ from parquet import (
 )
 from parquet.arrow import ArrayArena
 from parquet.bitio import HYBRID_BLOCK
-from parquet.codec import CodecSet
 from parquet.encoding import (
     PK_BOOL,
     PhysBuffer,
@@ -82,7 +81,6 @@ from parquet.page import (
     _read_levels,
     _take_defs,
     chunk_start,
-    read_column_chunk,
 )
 from parquet.rle_encode import encode_hybrid, encode_levels
 from parquet.schema import LeafColumn, build_schema

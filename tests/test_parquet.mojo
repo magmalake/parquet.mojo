@@ -5,12 +5,10 @@ decoder and every value of every column is compared with what pyarrow reads
 from the same file, both one value at a time and as a CRC32 over the lot.
 """
 
-from avro.json import JsonDoc
 from fixtures_list import (
     core_fixtures,
     default_codec_columns,
     iceberg_fixtures,
-    iceberg_zstd_fixtures,
 )
 from fingerprint import (
     permuted_arenas,
@@ -33,7 +31,6 @@ from oracle import canon_value, decimal_string, double_bits, hex_of, load_oracle
 from parity import check_fixture, check_path, check_table
 from parquet import (
     AT_BINARY,
-    AT_BOOL,
     AT_DATE32,
     AT_DECIMAL128,
     AT_FIXED_SIZE_BINARY,
@@ -44,12 +41,8 @@ from parquet import (
     AT_INT32,
     AT_INT64,
     AT_INT8,
-    AT_LARGE_BINARY,
-    AT_LARGE_LIST,
-    AT_LARGE_UTF8,
     AT_LIST,
     AT_MAP,
-    AT_NULL,
     AT_STRUCT,
     AT_TIME32,
     AT_TIME64,
@@ -64,15 +57,11 @@ from parquet import (
     OP_GT,
     OP_LE,
     OP_LT,
-    OP_NE,
     SV_BYTES,
     SV_FLOAT,
-    SV_INT,
-    SV_UINT,
     TU_MICRO,
     TU_MILLI,
     TU_NANO,
-    TU_SECOND,
     ArrayArena,
     ArrayData,
     ArrowType,
