@@ -20,7 +20,6 @@ from std.memory import bitcast
 
 from hashes import crc32
 from parquet.bitio import (
-    HybridDecoder,
     bit_width,
     decode_levels_into,
     levels_all_equal,
@@ -30,7 +29,6 @@ from parquet.bitio import (
 from parquet.alp import decode_alp
 from parquet.codec import CodecSet
 from parquet.encoding import (
-    PK_BOOL,
     PK_FIXED,
     PK_VAR,
     PhysBuffer,
@@ -49,10 +47,8 @@ from parquet.encoding import (
 )
 from parquet.schema import LeafColumn
 from thrift import (
-    ColumnChunk,
     ColumnMetaData,
     Encoding,
-    PageHeader,
     PageType,
     Type,
     read_page_header,

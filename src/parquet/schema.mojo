@@ -21,8 +21,6 @@ from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
     AT_DATE32,
-    AT_DECIMAL128,
-    AT_FIXED_SIZE_BINARY,
     AT_FLOAT16,
     AT_FLOAT32,
     AT_FLOAT64,
@@ -35,7 +33,6 @@ from arrow_mlake.arrow import (
     AT_STRUCT,
     AT_TIME32,
     AT_TIME64,
-    AT_TIMESTAMP,
     AT_UINT16,
     AT_UINT32,
     AT_UINT64,
@@ -50,7 +47,7 @@ from arrow_mlake.arrow import (
     at_fixed,
     at_timestamp,
 )
-from thrift import ConvertedType, FieldRepetitionType, SchemaElement, Type
+from thrift import ConvertedType, SchemaElement, Type
 
 comptime REP_REQUIRED = 0
 comptime REP_OPTIONAL = 1

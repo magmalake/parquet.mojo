@@ -50,7 +50,7 @@ from parquet.encoding import (
 from thrift import read_parquet_file
 
 from dictpages import DictChunk, find_dict_chunks
-from gather_shared import BLOCK, U32, U8, gather_fixed_kernel
+from gather_shared import BLOCK, U8, gather_fixed_kernel
 from gpu_gather import (
     DeviceDict,
     gpu_gather_into,

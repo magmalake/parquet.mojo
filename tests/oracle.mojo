@@ -21,29 +21,20 @@ serialisation of every value instead, and the first 200 rows explicitly.
 """
 
 from avro.json import JsonDoc, parse_json
-from hashes import crc32
 from parquet import (
     AT_BINARY,
     AT_BOOL,
-    AT_DATE32,
     AT_DECIMAL128,
     AT_FIXED_SIZE_BINARY,
     AT_FLOAT16,
     AT_FLOAT32,
     AT_FLOAT64,
-    AT_INT16,
-    AT_INT32,
-    AT_INT64,
-    AT_INT8,
     AT_LARGE_BINARY,
     AT_LARGE_LIST,
     AT_LARGE_UTF8,
     AT_LIST,
     AT_MAP,
     AT_STRUCT,
-    AT_TIME32,
-    AT_TIME64,
-    AT_TIMESTAMP,
     AT_UINT16,
     AT_UINT32,
     AT_UINT64,
@@ -51,12 +42,10 @@ from parquet import (
     AT_UTF8,
     ArrayArena,
     ArrayData,
-    ParquetReader,
-    Table,
     bit_get,
 )
 from std.memory import bitcast
-from std.testing import assert_equal, assert_true
+from std.testing import assert_equal
 
 comptime HEX = "0123456789abcdef"
 

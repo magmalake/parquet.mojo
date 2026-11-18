@@ -43,7 +43,6 @@ from parquet.encoding import (
     PK_BOOL,
     PK_FIXED,
     PK_VAR,
-    PhysBuffer,
 )
 from parquet.page import ColumnData, copy_mask_bits
 from parquet.schema import LeafColumn, ParquetSchema

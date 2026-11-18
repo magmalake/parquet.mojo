@@ -3,7 +3,6 @@
 from arrow_mlake.arrow import (
     AT_BINARY,
     AT_BOOL,
-    AT_DATE32,
     AT_DECIMAL128,
     AT_FIXED_SIZE_BINARY,
     AT_FLOAT16,

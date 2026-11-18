@@ -19,13 +19,10 @@ from parquet.bitio import (
     HYBRID_BLOCK,
     HybridDecoder,
     HybridRuns,
-    bit_width,
     decode_hybrid_into,
     read_uleb128,
     read_zigzag,
     unpack_lsb,
-    unpack_lsb_into,
-    zigzag_decode,
 )
 from thrift import Type
 

@@ -19,16 +19,9 @@ from their statistics against simple `column op literal` predicates.
 """
 
 from arrow_mlake.arrow import (
-    AT_BINARY,
-    AT_BOOL,
     AT_MAP,
-    AT_UTF8,
     ArrayArena,
-    ArrayData,
     ArrowType,
-    bit_get,
-    load_i32,
-    load_i64,
 )
 
 # `RecordBatch` and the `array_*` kernels are Arrow, not Parquet, and live in
@@ -37,16 +30,12 @@ from arrow_mlake.arrow import (
 # path consumers already write, iceberg-mojo among them.
 from arrow_mlake.batch import (
     RecordBatch,
-    array_bool,
     array_bool_into,
-    array_f64,
     array_f64_into,
-    array_i64,
     array_i64_into,
-    array_str,
     array_str_into,
 )
-from parquet.assemble import LeafSlice, build_field, first_leaf
+from parquet.assemble import LeafSlice, build_field
 from parquet.codec import CodecSet, DefaultCodecs
 from parquet.encoding import MAX_ARROW_VAR_BYTES, PK_VAR
 from parquet.page import (
@@ -55,10 +44,8 @@ from parquet.page import (
     chunk_start,
     read_column_chunk,
 )
-from parquet.schema import ArrowField, LeafColumn, ParquetSchema, build_schema
+from parquet.schema import LeafColumn, ParquetSchema, build_schema
 from parquet.stats import (
-    SV_BYTES,
-    SV_NONE,
     ScalarValue,
     TypedStats,
     compare_scalars,
@@ -74,7 +61,6 @@ from thrift import (
     ColumnMetaData,
     FileMetaData,
     OffsetIndex,
-    RowGroup,
     TCompactProtocolReader,
     read_footer,
     read_parquet_file,
