@@ -276,7 +276,6 @@ def decode_hybrid_into[
         raise Error("parquet.rle: hybrid destination is too small")
     var pos = 0
     var done = 0
-    var dst = out.unsafe_ptr()
     while done < count:
         if pos >= len(data):
             raise Error("parquet.rle: ran out of runs before all values")
@@ -307,6 +306,9 @@ def decode_hybrid_into[
                 v |= UInt64(data[pos + k]) << UInt64(8 * k)
             pos += nbytes
             var sv = v.cast[dt]()
+            # Taken per run: a bit-packed run hands `out` to
+            # `unpack_lsb_into` mutably, which ends any pointer taken before.
+            var dst = out.unsafe_ptr()
             for i in range(at + done, at + done + n):
                 dst.unsafe_store(i, sv)
             done += n

@@ -395,7 +395,7 @@ def main() raises:
     print("DeviceContext() creation, p50 ns:", _median(ctxs^))
 
     var ctx = DeviceContext()
-    print("device:", ctx.name(), "/", ctx.api())
+    print("device:", ctx.device().get_name(), "/", ctx.api())
     print()
     probe_zero_copy(ctx)
     probe_primitives(ctx)

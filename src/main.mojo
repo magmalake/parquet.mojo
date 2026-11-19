@@ -29,7 +29,7 @@ options:
 """
 
 
-def _split(text: StringSlice, sep: StringSlice) -> List[String]:
+def _split(text: StringSpan, sep: StringSpan) -> List[String]:
     var out = List[String]()
     for part in text.split(sep):
         if part:

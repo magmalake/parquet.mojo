@@ -132,7 +132,7 @@ def _gbs(bytes: Int, ns: Int) -> String:
 
 
 def _row(
-    name: StringSlice, ns: Int, total: Int, bytes: Int, note: StringSlice
+    name: StringSpan, ns: Int, total: Int, bytes: Int, note: StringSpan
 ) -> String:
     var pct = 0
     if total > 0:

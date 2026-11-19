@@ -65,16 +65,16 @@ Working with a coding agent? `npx skills add mojoshelf/mojoshelf --skill mojoshe
 
 That resolves the tin from [mojoshelf](https://mojoshelf.org) and adds it — along with the tins it depends on — as **pixi git source dependencies**. magmalake tins are not published to a conda channel, so `pixi add parquet-mojo` will not find them.
 
-As a dependency declaration, or for a nightly consumer:
+As a dependency declaration:
 
 ```toml
 [dependencies]
 parquet-mojo = { git = "https://github.com/magmalake/parquet.mojo" }
 ```
 
-The compiled package `.mojoc` is built with stable Mojo 1.2.0 and the nightly
-compiler will not load it, so a nightly consumer should put the source on the
-include path instead and check the sibling tins out next to it:
+The compiled package `.mojoc` is built with Mojo 1.3.0.dev2026111805 and loads
+only in that compiler. A consumer on any other Mojo should put the source on
+the include path instead and check the sibling tins out next to it:
 
 ```console
 mojo build app.mojo \
@@ -413,8 +413,8 @@ is decoded whole rather than from a seam that cannot be trusted.
 
 ## Tests
 
-`pixi run test` runs the suite on `default` (nightly) and `stable` (Mojo
-1.2.0), Linux and macOS. `pixi run -e codecs test-codecs` adds tests for ZSTD,
+`pixi run test` runs the suite on the pinned Mojo nightly (1.3.0.dev2026111805),
+Linux and macOS. `pixi run -e codecs test-codecs` adds tests for ZSTD,
 BROTLI and LZ4, including a write/read round trip through each and the
 ZSTD-compressed Iceberg fixtures.
 
@@ -791,7 +791,7 @@ longer the answer for the rest. pyarrow keeps a tighter p90 on both.
   values are identical, only the Arrow type differs.
 * **`marrow`** — kszucs/marrow is the Arrow-in-Mojo library this would
   otherwise build on, but it pins `mojo == 0.26.3.0.dev2026032105`, far older
-  than Mojo 1.2.0, so it does not compile on either supported toolchain. The
+  than the Mojo this tin builds with, so it does not compile here. The
   Arrow buffers here are in-repo (`parquet.arrow`) and the C Data Interface is
   the interoperability boundary instead.
 * **Writer** — see below.
@@ -879,7 +879,7 @@ result against the *original* pyarrow oracle, value by value.
 
 | task | what it does |
 |---|---|
-| `pixi run test` | the test suite (`-e stable` for Mojo 1.2.0) |
+| `pixi run test` | the test suite |
 | `pixi run check` | the tests plus a build of the CLI |
 | `pixi run -e codecs test-codecs` | the ZSTD / LZ4 tests |
 | `pixi run bench` | the decode and encode benchmarks |

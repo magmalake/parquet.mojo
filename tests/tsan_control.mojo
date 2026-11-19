@@ -72,7 +72,7 @@ def _allocate(i: Int, mut s: Slots) -> None:
     s.sink[i] = total
 
 
-def _run(mode: StringSlice, rounds: Int) raises:
+def _run(mode: StringSpan, rounds: Int) raises:
     var s = Slots(10)
     for _ in range(rounds):
         if mode == "read":

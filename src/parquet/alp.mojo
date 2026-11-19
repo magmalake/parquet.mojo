@@ -115,7 +115,7 @@ def _pow10_f32(i: Int) raises -> Float32:
     raise Error(String("parquet.alp: power of ten ", i, " out of range"))
 
 
-def _need(data: Span[UInt8, _], at: Int, want: Int, what: StringSlice) raises:
+def _need(data: Span[UInt8, _], at: Int, want: Int, what: StringSpan) raises:
     if at < 0 or at + want > len(data):
         raise Error(
             String(

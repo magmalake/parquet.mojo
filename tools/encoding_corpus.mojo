@@ -24,14 +24,14 @@ from std.os.path import exists
 from std.sys import argv
 
 
-def write_bytes(path: StringSlice, data: Span[UInt8, _]) raises:
+def write_bytes(path: StringSpan, data: Span[UInt8, _]) raises:
     var f = open(String(path), "w")
     f.write_bytes(data)
-    f.close()
+    f^.close()
 
 
 def round_trip(
-    source: StringSlice, out_dir: StringSlice, name: StringSlice
+    source: StringSpan, out_dir: StringSpan, name: StringSpan
 ) raises:
     var r = ParquetReader[AllCodecs].open(String(source))
     var t = r.read_table()

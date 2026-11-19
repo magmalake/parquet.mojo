@@ -7,7 +7,7 @@ from parquet import CodecSet, ParquetReader, Table
 from std.testing import assert_equal
 
 
-def _column_index(t: Table, name: StringSlice) -> Int:
+def _column_index(t: Table, name: StringSpan) -> Int:
     for i in range(t.num_columns()):
         if t.name(i) == name:
             return i
@@ -16,7 +16,7 @@ def _column_index(t: Table, name: StringSlice) -> Int:
 
 def check_fixture[
     Codecs: CodecSet
-](name: StringSlice, columns: List[String], batch_size: Int) raises -> Int:
+](name: StringSpan, columns: List[String], batch_size: Int) raises -> Int:
     """Read `<name>.parquet` and assert every value matches the oracle.
 
     Returns the number of values checked. `columns` empty means "all of them".
@@ -29,7 +29,7 @@ def check_fixture[
 def check_path[
     Codecs: CodecSet
 ](
-    stem: StringSlice, name: StringSlice, columns: List[String], batch_size: Int
+    stem: StringSpan, name: StringSpan, columns: List[String], batch_size: Int
 ) raises -> Int:
     """The same, for a fixture that is not directly under `tests/fixtures`."""
     var path = String(stem, ".parquet")
@@ -43,7 +43,7 @@ def check_path[
 
 
 def check_table(
-    doc: JsonDoc, t: Table, name: StringSlice, columns: List[String]
+    doc: JsonDoc, t: Table, name: StringSpan, columns: List[String]
 ) raises -> Int:
     """Assert a decoded table matches an oracle document, value by value."""
     var root = doc.root

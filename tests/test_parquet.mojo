@@ -147,7 +147,7 @@ from std.benchmark.compiler import keep
 comptime FIXTURES = "tests/fixtures/"
 
 
-def fixture_bytes(name: StringSlice) raises -> List[UInt8]:
+def fixture_bytes(name: StringSpan) raises -> List[UInt8]:
     return read_parquet_file(String(FIXTURES, name, ".parquet"))
 
 
@@ -345,7 +345,7 @@ def test_iceberg_field_ids() raises:
 # ── schema ─────────────────────────────────────────────────────────────────
 
 
-def _reader(name: StringSlice) raises -> ParquetReader[DefaultCodecs]:
+def _reader(name: StringSpan) raises -> ParquetReader[DefaultCodecs]:
     return ParquetReader.open(String(FIXTURES, name, ".parquet"))
 
 
@@ -483,7 +483,7 @@ def test_nested_shapes_and_levels() raises:
 
 
 def _canon_rows(
-    fixture: StringSlice, column: StringSlice, batch_size: Int
+    fixture: StringSpan, column: StringSpan, batch_size: Int
 ) raises -> List[String]:
     """One column, one rendered string per row, in the oracle's own notation.
 
@@ -507,7 +507,7 @@ def _canon_rows(
 
 
 def _assert_rows(
-    fixture: StringSlice, column: StringSlice, want: List[String]
+    fixture: StringSpan, column: StringSpan, want: List[String]
 ) raises:
     """Assert every row of `column`, at batch sizes that put the row-group
     boundary, the batch boundary and the byte boundary of the validity bitmap
@@ -997,7 +997,7 @@ def test_open_projected_reads_what_a_whole_file_read_reads() raises:
 
 
 def _assert_covered(
-    ranges: List[Tuple[Int, Int]], at: Int, n: Int, what: StringSlice
+    ranges: List[Tuple[Int, Int]], at: Int, n: Int, what: StringSpan
 ) raises:
     for k in range(len(ranges)):
         if ranges[k][0] <= at and at + n <= ranges[k][0] + ranges[k][1]:
@@ -2112,7 +2112,7 @@ def test_c_data_interface_release_is_idempotent() raises:
 # ── Arrow C Data Interface, inbound ────────────────────────────────────────
 
 
-def _round_trip(arena: ArrayArena, root: Int, label: StringSlice) raises:
+def _round_trip(arena: ArrayArena, root: Int, label: StringSpan) raises:
     """Export one array, import it back, and compare both halves.
 
     Values *and* layout: `assert_same_array` walks the two trees together, and
@@ -2637,7 +2637,7 @@ def test_fused_dict_gather_raises_the_same_error() raises:
             except e:
                 want = String(e)
             assert_true(
-                want.find("out of range") >= 0,
+                "out of range" in want,
                 String(tag, ": the unfused path did not raise"),
             )
 
@@ -2728,7 +2728,7 @@ def test_corrupt_page_is_caught() raises:
         _ = r2.read_table()
     except e:
         caught = True
-        assert_true(String(e).find("CRC32") >= 0 or True)
+        assert_true("CRC32" in String(e) or True)
     assert_true(caught, "a flipped byte in a checksummed page must be caught")
     # …and with checksums off, it fails somewhere else or gives wrong data,
     # but it must never crash or read out of bounds.
@@ -2778,7 +2778,7 @@ def test_level_overflow_is_caught() raises:
 
 
 def _round_trip(
-    name: StringSlice, columns: List[String], var options: WriterOptions
+    name: StringSpan, columns: List[String], var options: WriterOptions
 ) raises -> Int:
     """Read a fixture, write it back out, read that, and check it still
     matches pyarrow's values for the original file."""
@@ -2865,7 +2865,7 @@ def test_write_round_trip_options() raises:
 
 
 def _write_fixture(
-    name: StringSlice, var options: WriterOptions
+    name: StringSpan, var options: WriterOptions
 ) raises -> List[UInt8]:
     """A fixture read and written back out with `options`, in memory."""
     var r = _reader(name)
@@ -3017,7 +3017,7 @@ def test_file_sink_writes_the_same_file() raises:
     assert_equal(written.file_size, len(whole))
     var fh = open(path, "r")
     var on_disk = fh.read_bytes()
-    fh.close()
+    fh^.close()
     _same_bytes(on_disk, whole, "FileSink")
     remove(path)
 
@@ -3433,7 +3433,7 @@ def test_written_metadata() raises:
     var back = ParquetReader(bytes^)
     assert_equal(back.num_rows(), 5)
     assert_equal(back.num_row_groups(), 3)
-    assert_true(back.created_by().find("parquet.mojo") >= 0)
+    assert_true("parquet.mojo" in back.created_by())
     var kv = back.key_value_metadata()
     assert_equal(len(kv), 1)
     assert_equal(kv[0][0], "k")
@@ -3629,7 +3629,7 @@ def test_value_index_before_the_first_null_page() raises:
 # aimed at, and by invariant across the corpus.
 
 
-def _validity_shapes(name: StringSlice) raises -> List[String]:
+def _validity_shapes(name: StringSpan) raises -> List[String]:
     """Per leaf of `name`'s first row group, `path=shape`.
 
     `mask` is the packed path, `all-present` is the chunk that had no nulls at
@@ -3992,7 +3992,7 @@ def test_corrupt_file_error_does_not_depend_on_the_winner() raises:
 
 
 def _read_workers(
-    path: StringSlice, workers: Int, batch_size: Int
+    path: StringSpan, workers: Int, batch_size: Int
 ) raises -> Table:
     var r = ParquetReader[DefaultCodecs].open(path)
     r.num_workers = workers

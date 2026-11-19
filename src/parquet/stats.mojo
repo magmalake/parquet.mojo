@@ -93,11 +93,11 @@ struct ScalarValue(Copyable, Defaultable, Movable, Writable):
         return s^
 
     @staticmethod
-    def of_string(text: StringSlice) -> Self:
+    def of_string(text: StringSpan) -> Self:
         return ScalarValue.of_bytes(text.as_bytes())
 
     def as_string(self) -> String:
-        return String(StringSlice(unsafe_from_utf8=Span(self.b)))
+        return String(StringSpan(unsafe_from_utf8=Span(self.b)))
 
     def write_to(self, mut writer: Some[Writer]):
         if self.kind == SV_NONE:

@@ -1,8 +1,7 @@
 # Contributing
 
 1. Branch off `main`.
-2. `pixi run test` and `pixi run -e stable test`. Codec tests:
-   `pixi run -e codecs-stable test-codecs`.
+2. `pixi run test`. Codec tests: `pixi run -e codecs test-codecs`.
 3. `pixi run -e fmt format-check`.
 4. Open a PR. A performance change should include before/after numbers,
    measured as below.
@@ -74,8 +73,8 @@ pixi run profile
 Per-stage times for one read and one write.
 
 ```sh
-pixi run -e codecs-stable profile-scan
-pixi run -e codecs-stable ./build/profile-scan build/bench-wide.parquet --select a,b
+pixi run -e codecs profile-scan
+pixi run -e codecs ./build/profile-scan build/bench-wide.parquet --select a,b
 ```
 
 Per-stage times and bandwidth for reading some columns of a large file.

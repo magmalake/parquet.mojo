@@ -182,7 +182,7 @@ def _us(ns: Int) -> String:
     return String(us // 1000, ".", (us % 1000) // 100, (us % 100) // 10)
 
 
-def _row(name: StringSlice, ns: Int, total: Int) -> String:
+def _row(name: StringSpan, ns: Int, total: Int) -> String:
     var pct = 0
     if total > 0:
         pct = (ns * 1000) // total
@@ -414,7 +414,7 @@ def _profile_values(
     st.values += t2 - t0
 
 
-def _profile(path: StringSlice, label: StringSlice, repeats: Int) raises:
+def _profile(path: StringSpan, label: StringSpan, repeats: Int) raises:
     var bytes = read_parquet_file(String(path))
     var best = Stages()
     var rows = 0
@@ -840,7 +840,7 @@ def _write_replay(
     st.schema += perf_counter_ns() - t0
 
     var out = List[UInt8]()
-    out.extend(StringSlice("PAR1").as_bytes())
+    out.extend(StringSpan("PAR1").as_bytes())
     var all_offs = List[List[OffsetIndex]]()
     var all_cidx = List[List[ColumnIndex]]()
     var rows = arena.nodes[roots[0]].length
@@ -918,7 +918,7 @@ def _write_replay(
 
 
 def _profile_write(
-    table: Table, label: StringSlice, repeats: Int, col: Int
+    table: Table, label: StringSpan, repeats: Int, col: Int
 ) raises:
     """Profile writing `col` (or every column, when `col < 0`) of a table.
 
@@ -1041,7 +1041,7 @@ def _time_writer(table: Table, col: Int, repeats: Int, knob: Int) raises -> Int:
     return best
 
 
-def _read_table(path: StringSlice) raises -> Table:
+def _read_table(path: StringSpan) raises -> Table:
     """Decode a fixture into Arrow, outside every timer."""
     var raw = read_parquet_file(String(path))
     var r = ParquetReader[DefaultCodecs](raw^)

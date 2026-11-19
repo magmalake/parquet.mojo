@@ -97,7 +97,7 @@ struct BloomFilter(Copyable, Defaultable, Movable):
     def might_contain_bytes(self, data: Span[UInt8, _]) raises -> Bool:
         return self.might_contain_hash(xxh64(data))
 
-    def might_contain_string(self, text: StringSlice) raises -> Bool:
+    def might_contain_string(self, text: StringSpan) raises -> Bool:
         return self.might_contain_bytes(text.as_bytes())
 
     def might_contain_i32(self, v: Int32) raises -> Bool:

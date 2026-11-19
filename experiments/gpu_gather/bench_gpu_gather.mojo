@@ -758,7 +758,7 @@ def main() raises:
     if not has_accelerator():
         raise Error("experiments.gpu_gather: no GPU — this bench needs Metal")
     var ctx = DeviceContext()
-    print("device:", ctx.name(), "/", ctx.api())
+    print("device:", ctx.device().get_name(), "/", ctx.api())
     print(
         "note: DeviceContext creation is outside every timer; see"
         " `gpu-memory` for what it costs."

@@ -34,7 +34,7 @@ comptime FIXTURES = "tests/fixtures/"
 comptime WIDE = "build/bench-wide.parquet"
 
 
-def _read_file(path: StringSlice) raises -> List[UInt8]:
+def _read_file(path: StringSpan) raises -> List[UInt8]:
     return read_parquet_file(String(path))
 
 
@@ -140,7 +140,7 @@ def bench_read_wide(mut b: Benchmark) raises:
 
 
 def _bench_read_workers(
-    mut b: Benchmark, path: StringSlice, workers: Int
+    mut b: Benchmark, path: StringSpan, workers: Int
 ) raises:
     var data = _read_file(String(path))
     b.throughput(Metric.elements(), _rows_in(data))
@@ -227,7 +227,7 @@ def bench_read_big_w10(mut b: Benchmark) raises:
 # bytes and nothing else.
 
 
-def _bench_write(mut b: Benchmark, path: StringSlice, workers: Int) raises:
+def _bench_write(mut b: Benchmark, path: StringSpan, workers: Int) raises:
     var data = _read_file(path)
     var r = ParquetReader[DefaultCodecs].from_span(Span(data))
     r.verify_crc = False

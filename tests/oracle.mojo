@@ -58,14 +58,14 @@ def hex_of(data: Span[UInt8, _]) -> String:
     return out^
 
 
-def read_text(path: StringSlice) raises -> String:
+def read_text(path: StringSpan) raises -> String:
     var f = open(String(path), "r")
     var text = f.read()
-    f.close()
+    f^.close()
     return text^
 
 
-def load_oracle(path: StringSlice) raises -> JsonDoc:
+def load_oracle(path: StringSpan) raises -> JsonDoc:
     return parse_json(read_text(path))
 
 
@@ -145,7 +145,7 @@ def render_scalar(a: ArrayData, i: Int) raises -> String:
     if id == AT_UTF8 or id == AT_LARGE_UTF8:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
-        return String(StringSlice(unsafe_from_utf8=Span(a.values)[lo:hi]))
+        return String(StringSpan(unsafe_from_utf8=Span(a.values)[lo:hi]))
     if id == AT_BINARY or id == AT_LARGE_BINARY:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])

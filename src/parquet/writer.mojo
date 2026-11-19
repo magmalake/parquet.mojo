@@ -1440,19 +1440,23 @@ struct ListSink(ByteSink, Defaultable, Movable):
 struct FileSink(ByteSink, Movable):
     """Writes the output to a local file as it is produced."""
 
-    var handle: FileHandle
+    # Empty once `close` has run: closing a `FileHandle` consumes it.
+    var handle: Optional[FileHandle]
 
-    def __init__(out self, path: StringSlice) raises:
+    def __init__(out self, path: StringSpan) raises:
         self.handle = open(String(path), "w")
 
     def __init__(out self, *, deinit move: Self):
         self.handle = move.handle^
 
     def write_bytes(mut self, data: Span[UInt8, _]) raises:
-        self.handle.write_bytes(data)
+        if not self.handle:
+            raise Error("FileSink: write after close")
+        self.handle.value().write_bytes(data)
 
     def close(mut self) raises:
-        self.handle.close()
+        if self.handle:
+            self.handle.take().close()
 
 
 struct WrittenFile(Movable):
@@ -1972,7 +1976,7 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         self.kv = move.kv^
         self._started = move._started
 
-    def add_metadata(mut self, key: StringSlice, value: StringSlice):
+    def add_metadata(mut self, key: StringSpan, value: StringSpan):
         var e = KeyValue()
         e.key = String(key)
         e.value = String(value)
@@ -2019,7 +2023,7 @@ struct ParquetWriter[Codecs: CodecSet = DefaultCodecs](Movable):
         if not self._started:
             self.schema = build_write_schema(arena, roots)
             var magic = List[UInt8]()
-            magic.extend(StringSlice("PAR1").as_bytes())
+            magic.extend(StringSpan("PAR1").as_bytes())
             self._push(magic^)
             self._started = True
         var rows = arena.nodes[roots[0]].length

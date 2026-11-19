@@ -540,7 +540,7 @@ def _fill_leaf[
     return True
 
 
-def _short_levels(s: ParquetSchema, fi: Int, which: StringSlice) -> String:
+def _short_levels(s: ParquetSchema, fi: Int, which: StringSpan) -> String:
     return String(
         "parquet.assemble: list '",
         s.fields[fi].name,

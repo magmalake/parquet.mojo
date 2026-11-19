@@ -168,7 +168,7 @@ struct PhysBuffer(Copyable, Defaultable, Movable):
         return Span(self.bytes)[i * self.width : (i + 1) * self.width]
 
 
-def _need(data: Span[UInt8, _], want: Int, what: StringSlice) raises:
+def _need(data: Span[UInt8, _], want: Int, what: StringSpan) raises:
     if want > len(data):
         raise Error(
             String(
