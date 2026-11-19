@@ -460,14 +460,14 @@ struct ParquetSchema(Copyable, Defaultable, Movable):
     def num_leaves(self) -> Int:
         return len(self.leaves)
 
-    def leaf_by_path(self, path: StringSlice) -> Int:
+    def leaf_by_path(self, path: StringSpan) -> Int:
         """The leaf whose dotted path is `path`, or -1."""
         for i in range(len(self.leaves)):
             if self.leaves[i].dotted() == path:
                 return i
         return -1
 
-    def field_by_name(self, name: StringSlice) -> Int:
+    def field_by_name(self, name: StringSpan) -> Int:
         for i in range(len(self.roots)):
             if self.fields[self.roots[i]].name == name:
                 return self.roots[i]

@@ -36,7 +36,7 @@ def hex_string(data: Span[UInt8, _]) -> String:
     return out^
 
 
-def json_escape(s: StringSlice) -> String:
+def json_escape(s: StringSpan) -> String:
     var out = String('"')
     for i in range(s.byte_length()):
         var c = s.as_bytes()[i]
@@ -55,7 +55,7 @@ def json_escape(s: StringSlice) -> String:
             out += HEXDIGITS[byte=Int(c >> 4)]
             out += HEXDIGITS[byte=Int(c & 15)]
         else:
-            out += String(StringSlice(unsafe_from_utf8=s.as_bytes()[i : i + 1]))
+            out += String(StringSpan(unsafe_from_utf8=s.as_bytes()[i : i + 1]))
     out += '"'
     return out^
 
@@ -133,7 +133,7 @@ def scalar_json(a: ArrayData, i: Int) raises -> String:
     if id == AT_UTF8 or id == AT_LARGE_UTF8:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
-        return json_escape(StringSlice(unsafe_from_utf8=Span(a.values)[lo:hi]))
+        return json_escape(StringSpan(unsafe_from_utf8=Span(a.values)[lo:hi]))
     if id == AT_BINARY or id == AT_LARGE_BINARY:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
@@ -219,5 +219,5 @@ def value_text(arena: ArrayArena, node: Int, i: Int) raises -> String:
     if a.type.id == AT_UTF8 or a.type.id == AT_LARGE_UTF8:
         var lo = Int(a.offsets[i])
         var hi = Int(a.offsets[i + 1])
-        return String(StringSlice(unsafe_from_utf8=Span(a.values)[lo:hi]))
+        return String(StringSpan(unsafe_from_utf8=Span(a.values)[lo:hi]))
     return scalar_json(a, i)

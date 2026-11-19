@@ -37,17 +37,17 @@ jobs:
       # The test legs below are skipped on release PRs, and the consumer build
       # is the check (the tests build against sibling checkouts of the other tins).
       task: ""
+      mojo-compiler: "==1.3.0.dev2026111805"
 
   test:
     needs: release
     if: ${{ !cancelled() && needs.release.outputs.release_only != 'true' }}
-    name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-        env: [default, stable]
     steps:
       # Sibling magmalake tins are consumed by source path (`-I ../x.mojo/src`),
       # so CI has to lay them out next to this repository.
@@ -103,7 +103,6 @@ jobs:
           # rejects the committed lock with "lock file not up-to-date".
           pixi-version: v0.78.0
           manifest-path: parquet.mojo/pixi.toml
-          environments: ${{ matrix.env }}
 
       - name: Unit tests, CLI build, and lint (mojolint --lsp)
         working-directory: parquet.mojo
@@ -113,32 +112,22 @@ jobs:
         # to text mode on `tests/test_codecs.mojo`, which imports them.
         # `lint-codecs` in the codecs job below resolves that and `full/`
         # fully, with the sibling checkouts for it.
-        run: pixi run -e ${{ matrix.env }} check
+        run: pixi run check
 
-      # `mojo format` runs in its own environment, on one leg. The 1.0.0 formatter aborts
-      # with `'_python_symbols' object has no attribute
-      # 'old_comptime_assert_stmt'` on thirteen of this repo's files — a
-      # toolchain defect, not a formatting one: the same files come back
-      # unchanged from a nightly at or after 26.6.0.dev2026090705, which is
-      # what the `fmt` environment resolves. It is a separate environment on
-      # purpose: the build environments are capped below dev2026090105 because
-      # threads.mojo does not compile above it, and `mojo format` only parses,
-      # so the formatter can move ahead of the compiler that has to agree with
-      # the siblings. Stable 1.2.0 no longer carries the bug: it leaves all 31 files unchanged too.
+      # `mojo format` runs in its own environment (`fmt`: the `mojo` package
+      # alone, at the same pinned version), since it only parses and needs
+      # none of the build environment.
       - name: Format check
-        if: matrix.env == 'default'
         working-directory: parquet.mojo
         run: pixi run -e fmt format-check
 
       # The threaded read path under load: the same fixtures read over and
       # over at 2, 4, 8 and 10 workers, with a watchdog, so a hung join or an
       # answer that depends on which worker won fails here rather than in
-      # somebody's pipeline. Stable only — it is a property of the code, not
-      # of the compiler, and running it twice per OS buys nothing.
+      # somebody's pipeline.
       - name: Threaded read stress
-        if: matrix.env == 'stable'
         working-directory: parquet.mojo
-        run: pixi run -e stable stress
+        run: pixi run stress
 
       - name: CLI smoke
         working-directory: parquet.mojo
@@ -153,17 +142,13 @@ jobs:
     if: ${{ !cancelled() && needs.release.outputs.release_only != 'true' }}
     # ZSTD, BROTLI and LZ4 are FFI tins: the pixi git source dependencies
     # install libzstd / libbrotli / liblz4 and their dlopen shims, while the
-    # Mojo sources come from the checkouts next door. Stable only: the source
-    # build also drops a `.mojoc` compiled with 1.2.0 into the environment,
-    # and a nightly compiler refuses to load it (`codecs` stays in pixi.toml
-    # for local use with a matching compiler).
-    name: codecs stable / ${{ matrix.os }}
+    # Mojo sources come from the checkouts next door.
+    name: codecs / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-        env: [codecs-stable]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -221,15 +206,15 @@ jobs:
         with:
           pixi-version: v0.78.0
           manifest-path: parquet.mojo/pixi.toml
-          environments: ${{ matrix.env }}
+          environments: codecs
 
       - name: Codec tests
         working-directory: parquet.mojo
-        run: pixi run -e ${{ matrix.env }} test-codecs
+        run: pixi run -e codecs test-codecs
 
       - name: Codec lint (mojolint --lsp)
         working-directory: parquet.mojo
-        run: pixi run -e ${{ matrix.env }} lint-codecs
+        run: pixi run -e codecs lint-codecs
 
   lint-bench:
     needs: release

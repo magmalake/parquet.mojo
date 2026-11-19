@@ -15,14 +15,14 @@ from parquet import ParquetReader, ParquetWriter, WriterOptions
 from thrift import CompressionCodec
 
 
-def write_bytes(path: StringSlice, data: Span[UInt8, _]) raises:
+def write_bytes(path: StringSpan, data: Span[UInt8, _]) raises:
     var f = open(String(path), "w")
     f.write_bytes(data)
-    f.close()
+    f^.close()
 
 
 def round_trip(
-    name: StringSlice, var options: WriterOptions, suffix: StringSlice
+    name: StringSpan, var options: WriterOptions, suffix: StringSpan
 ) raises:
     var r = ParquetReader.open(String("tests/fixtures/", name, ".parquet"))
     var t = r.read_table()

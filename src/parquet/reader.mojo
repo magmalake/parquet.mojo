@@ -296,7 +296,7 @@ def _bad_chunk_count(rg: Int, got: Int, nleaves: Int) -> String:
     )
 
 
-def _short_levels(leaf: LeafColumn, which: StringSlice) -> String:
+def _short_levels(leaf: LeafColumn, which: StringSpan) -> String:
     return String(
         "parquet: column '",
         leaf.dotted(),
@@ -1209,11 +1209,11 @@ struct ParquetReader[Codecs: CodecSet = DefaultCodecs](Movable):
         self._pages_read = move._pages_read
 
     @staticmethod
-    def open(path: StringSlice) raises -> Self:
+    def open(path: StringSpan) raises -> Self:
         return Self(read_parquet_file(String(path)))
 
     @staticmethod
-    def open_projected(path: StringSlice, columns: List[String]) raises -> Self:
+    def open_projected(path: StringSpan, columns: List[String]) raises -> Self:
         """Open `path`, fetching only the bytes `columns` actually needs.
 
         `open` slurps the whole file. That is the right default when a caller

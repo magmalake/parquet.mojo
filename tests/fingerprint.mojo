@@ -169,7 +169,7 @@ def permuted_arenas(t: Table) raises -> Table:
 
 def read_fingerprint[
     Codecs: CodecSet
-](path: StringSlice, workers: Int, batch_size: Int) raises -> UInt32:
+](path: StringSpan, workers: Int, batch_size: Int) raises -> UInt32:
     """Read `path` with `workers` workers and fingerprint what came out."""
     var r = ParquetReader[Codecs].open(path)
     r.num_workers = workers

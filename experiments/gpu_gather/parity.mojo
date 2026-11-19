@@ -568,7 +568,7 @@ def main() raises:
     if not has_accelerator():
         raise Error("experiments.gpu_gather: no GPU — this gate needs Metal")
     var ctx = DeviceContext()
-    print("device:", ctx.name(), "/", ctx.api())
+    print("device:", ctx.device().get_name(), "/", ctx.api())
     print()
 
     var tally = run_gate[False](ctx)

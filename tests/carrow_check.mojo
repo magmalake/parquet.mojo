@@ -45,7 +45,7 @@ from parquet.arrow import bit_get
 # ── the round-trip comparator ──────────────────────────────────────────────
 
 
-def _fail(label: StringSlice, what: StringSlice) raises:
+def _fail(label: StringSpan, what: StringSpan) raises:
     raise Error(String("carrow round trip at ", label, ": ", what))
 
 
@@ -75,7 +75,7 @@ def assert_same_array(
     lroot: Int,
     right: ArrayArena,
     rroot: Int,
-    label: StringSlice,
+    label: StringSpan,
 ) raises:
     """Two array trees, compared on everything the C interface carries.
 
@@ -151,7 +151,7 @@ def preorder_size(arena: ArrayArena, root: Int) raises -> Int:
     return n
 
 
-def assert_preorder(arena: ArrayArena, root: Int, label: StringSlice) raises:
+def assert_preorder(arena: ArrayArena, root: Int, label: StringSpan) raises:
     """The tree at `root` occupies `root, root + 1, …` in DFS pre-order.
 
     This is the property `import_c` promises and the one a walk from the root

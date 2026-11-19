@@ -20,5 +20,5 @@ def main() raises:
             "experiments.gpu_gather: no GPU accelerator — the spike needs Metal"
         )
     var ctx = DeviceContext()
-    print("device:", ctx.name())
+    print("device:", ctx.device().get_name())
     print("api:", ctx.api())
