@@ -584,6 +584,20 @@ def _short_values(leaf: LeafColumn) -> String:
     )
 
 
+# `_build_struct` and `_build_list` are inlined into `build_field`, so the only
+# recursion left is `build_field` calling itself. This works around a code
+# generation bug in Mojo 1.3.0.dev2026111805: in a build with two or more
+# `@export` functions (morca's liblake, iceberg's carrow-scan-lib) at -O1 and
+# above, a function that several exports reach is compiled in a module of its
+# own, and if it is there in a cycle of two or more functions that nothing
+# else in that module calls (build_field -> _build_list -> build_field), and
+# the cycle uses a constant LLVM keeps private (a switch table, say), no
+# function of the cycle is emitted. The library then fails to link (macOS) or
+# to load (Linux) with `build_field` undefined. A function that calls only
+# itself is emitted. Remove both `@always_inline`s once the pinned compiler
+# emits such a cycle; iceberg's carrow-scan-lib linking without them is the
+# check.
+@always_inline
 def _build_struct(
     s: ParquetSchema,
     fi: Int,
@@ -634,6 +648,8 @@ def _build_struct(
     return arena.add(out^)
 
 
+# Inlined for the reason given above `_build_struct`.
+@always_inline
 def _build_list(
     s: ParquetSchema,
     fi: Int,
