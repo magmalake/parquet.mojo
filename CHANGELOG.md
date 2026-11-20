@@ -10,6 +10,12 @@ Releases before 0.8.0 predate this file; their contents are in the commit log
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-20
+
+### Changed
+
+- Pins arrow-mlake-mojo 0.4.0, brotli-mojo 0.2.0, deflate-mojo 0.3.0, hashes-mojo 0.2.0, lint-mojo 0.2.0, lz4-mojo 0.2.0, snappy-mojo 0.2.0, threads-mojo 0.7.0, thrift-mojo 0.2.0, zstd-mojo 0.2.0.
+
 ## [0.14.0] - 2026-11-14
 
 ### Changed
