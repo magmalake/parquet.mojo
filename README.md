@@ -1,6 +1,6 @@
 # parquet.mojo
 
-[![mojoshelf](https://mojoshelf.org/badge/parquet-mojo.svg)](https://mojoshelf.org/tins/parquet-mojo) [![mojo nightly](https://mojoshelf.org/badge/parquet-mojo/nightly.svg)](https://mojoshelf.org/tins/parquet-mojo)
+[![mojoshelf](https://mojoshelf.org/badge/parquet-mojo.svg)](https://mojoshelf.org/tins/parquet-mojo) [![mojo nightly](https://mojoshelf.org/badge/parquet-mojo/nightly.svg)](https://mojoshelf.org/tins/parquet-mojo) [![Used by](https://mojourney.dev/badge/magmalake/parquet.mojo/used-by.svg)](https://mojourney.dev/repos/magmalake/parquet.mojo#used-by) [![Mojo version](https://mojourney.dev/badge/magmalake/parquet.mojo/mojo.svg)](https://mojourney.dev/repos/magmalake/parquet.mojo)
 
 [![CI](https://github.com/magmalake/parquet.mojo/actions/workflows/ci.yml/badge.svg)](https://github.com/magmalake/parquet.mojo/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
