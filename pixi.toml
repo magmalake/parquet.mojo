@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "parquet.mojo"
-version = "0.15.0"
+version = "0.15.1"
 description = "Native pure-Mojo Apache Parquet — footer, pages, every encoding, and Arrow output over the C Data Interface."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -115,7 +115,7 @@ lint-codecs = { cmd = "mojolint --lsp -I src -I tests -I ../arrow-mlake.mojo/src
 # Conda package name is parquet-mojo; the Mojo import stays `from parquet import …`.
 [package]
 name = "parquet-mojo"
-version = "0.15.0"
+version = "0.15.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -129,24 +129,24 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.3.0.dev2026112505"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "be75dc08cd3e3ab38cca5b1f2e7f6b7fcd5a4377" }
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "11f3241ff4233a15a0fd7c56b22102b26aa5cf00" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "a8f68811eadb454645696f8566972e9197113660" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "09ae3fc45c6158949f5cd787f9d355f7b3d524e3" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "4c3d35773100b609d658042bacbc7550edc6b2a0" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "22ccbfeb35b20f6d0e1b33b32bed3a1e18e4fc00" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "bff8b8231956c09e86e71dbe8029ede578f63bd3" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "30ce84d8afd556768f21fb162acc57aa5bad2180" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "e9a8d00714e768d1e4bb29f788b826712800484e" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "97bd98c1141329b158bf67b19a17ac228e727d10" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "ed181e29e5c4417e1b7489fa3f0b39968e80d53e" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.3.0.dev2026112505"
 
 [package.run-dependencies]
 mojo-compiler = "==1.3.0.dev2026112505"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "be75dc08cd3e3ab38cca5b1f2e7f6b7fcd5a4377" }
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "11f3241ff4233a15a0fd7c56b22102b26aa5cf00" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "a8f68811eadb454645696f8566972e9197113660" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "09ae3fc45c6158949f5cd787f9d355f7b3d524e3" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "4c3d35773100b609d658042bacbc7550edc6b2a0" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "22ccbfeb35b20f6d0e1b33b32bed3a1e18e4fc00" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "bff8b8231956c09e86e71dbe8029ede578f63bd3" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "30ce84d8afd556768f21fb162acc57aa5bad2180" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "e9a8d00714e768d1e4bb29f788b826712800484e" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "97bd98c1141329b158bf67b19a17ac228e727d10" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "ed181e29e5c4417e1b7489fa3f0b39968e80d53e" }
 
 # threads.mojo keeps the declarations that toolchains spell differently in
 # `compat/`, and single-sources everything else. The `-I` is set once here
@@ -178,9 +178,9 @@ format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- s
 # for a bare clone, since pixi solves every environment even when it installs
 # one.
 [feature.codecs.dependencies]
-zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "be5185ad766f66962ad7bd271d748fb0d6dc8e90" }
-lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "3cbbc12289fef72a53c56e5cdabe832812da3ea3" }
-brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "1c827642f3794427dd56902f101038fb15c0c115" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "d0752506a54990d23500a601f6ca46933c4afc93" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "87496d73b94638dd36755a9b32caf1545675e8f8" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "7bf6f50aad8d591195182cbf95df3331049b9a12" }
 
 [target.osx-arm64.activation.env]
 SHLIB_EXT = ".dylib"
@@ -198,12 +198,12 @@ SHLIB_EXT = ".so"
 # — see the note at the top of this file.
 [feature.bench.dependencies]
 bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "3c5bfdb78bf5fa3082482a200f3ba01ad6466069" }
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "be75dc08cd3e3ab38cca5b1f2e7f6b7fcd5a4377" }
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "11f3241ff4233a15a0fd7c56b22102b26aa5cf00" }
-thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "a8f68811eadb454645696f8566972e9197113660" }
-hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "09ae3fc45c6158949f5cd787f9d355f7b3d524e3" }
-snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "4c3d35773100b609d658042bacbc7550edc6b2a0" }
-deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "22ccbfeb35b20f6d0e1b33b32bed3a1e18e4fc00" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "bff8b8231956c09e86e71dbe8029ede578f63bd3" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
+thrift-mojo = { git = "https://github.com/magmalake/thrift.mojo", rev = "30ce84d8afd556768f21fb162acc57aa5bad2180" }
+hashes-mojo = { git = "https://github.com/magmalake/hashes.mojo", rev = "e9a8d00714e768d1e4bb29f788b826712800484e" }
+snappy-mojo = { git = "https://github.com/magmalake/snappy.mojo", rev = "97bd98c1141329b158bf67b19a17ac228e727d10" }
+deflate-mojo = { git = "https://github.com/magmalake/deflate.mojo", rev = "ed181e29e5c4417e1b7489fa3f0b39968e80d53e" }
 
 [feature.bench.tasks]
 bench = "mkdir -p build && mojo build -I src -I $CONDA_PREFIX/lib/mojo bench/bench_parquet.mojo -o build/bench-parquet && ./build/bench-parquet"
@@ -263,4 +263,4 @@ mojo = "==1.3.0.dev2026112505"
 # Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi
 # source dependency pinned at the revision mojoshelf published, and builds
 # the `mojolint` executable into every environment next to mojo-lsp-server.
-lint-mojo = { git = "https://github.com/magmalake/lint.mojo.git", rev = "b73d03bbfa458417cf9eed56f4e3b7a092d73969" }
+lint-mojo = { git = "https://github.com/magmalake/lint.mojo.git", rev = "503a9c6d8fc5114f24a9e3355680a0024167bdb3" }
