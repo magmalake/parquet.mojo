@@ -72,7 +72,7 @@ As a dependency declaration:
 parquet-mojo = { git = "https://github.com/magmalake/parquet.mojo" }
 ```
 
-The compiled package `.mojoc` is built with Mojo 1.3.0.dev2026111805 and loads
+The compiled package `.mojoc` is built with Mojo 1.3.0.dev2026112505 and loads
 only in that compiler. A consumer on any other Mojo should put the source on
 the include path instead and check the sibling tins out next to it:
 
@@ -413,7 +413,7 @@ is decoded whole rather than from a seam that cannot be trusted.
 
 ## Tests
 
-`pixi run test` runs the suite on the pinned Mojo nightly (1.3.0.dev2026111805),
+`pixi run test` runs the suite on the pinned Mojo nightly (1.3.0.dev2026112505),
 Linux and macOS. `pixi run -e codecs test-codecs` adds tests for ZSTD,
 BROTLI and LZ4, including a write/read round trip through each and the
 ZSTD-compressed Iceberg fixtures.
